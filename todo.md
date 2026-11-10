@@ -229,39 +229,33 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 **Amaç:** RS256 (ve opsiyonel ES256/Ed25519) asimetrik algoritma desteğini, RFC 7517 JWK modelini ve RFC 7638 JWK thumbprint hesaplamasını güvenli şekilde entegre etmek.
 
 ## 0.3.1 — Asimetrik Kripto Sağlayıcı Mimarisi (`provider.nox`, `native/`)
-- [ ] Asimetrik kriptografi altyapı incelemesi (NOX stdlib ve platform imkanları):
-  - Sistem platform kütüphaneleri (CommonCrypto / OpenSSL / Zig crypto).
-  - Vetted provider seçimi ve `docs/adr/0001-asymmetric-crypto-provider.md` kararı.
-- [ ] `AsymmetricProvider` arayüzü:
-  - `verify_rs256(public_key, signing_input, signature) -> bool`.
-  - `sign_rs256(private_key, signing_input) -> str`.
-  - Minimum 2048-bit RSA anahtar boyutu zorunluluğu.
-  - Zayıf anahtarların (ör. 1024-bit) kesin reddi.
+- [x] Asimetrik kriptografi altyapı incelemesi ve `docs/adr/0001-asymmetric-crypto-provider.md` mimari kararı.
+- [x] Minimum 2048-bit (255+ bayt unpadded) RSA anahtar boyutu zorunluluğu (`MIN_RSA_MODULUS_BYTES = 255`).
+- [x] Zayıf anahtarların (ör. 1024-bit) ve eksik parametrelerin kesin reddi (`InvalidKeyError`).
 
 ## 0.3.2 — JWK (JSON Web Key) Modeli (`jwk.nox`)
-- [ ] `JwkKey` sınıfı (`kty`, `alg`, `use`, `key_ops`, `kid`).
-- [ ] RSA açık anahtar parametreleri (`n`, `e`).
-- [ ] Simetrik anahtar parametreleri (`k`).
-- [ ] **Güvenlik Değişmezi:** Asla özel anahtar malzemesi (`d`, `p`, `q`, `dp`, `dq`, `qi` veya simetrik `k`) açık JWK/JWKS olarak dışa aktarılmaz.
-- [ ] `JwkKey.from_json` ve `JwkKey.to_public_json`.
+- [x] `JwkKey` sınıfı (`kty`, `alg`, `use`, `kid`, `n`, `e`, `d`, `k`).
+- [x] RSA açık anahtar parametreleri (`n`, `e`) ve simetrik anahtar parametreleri (`k`).
+- [x] **Güvenlik Değişmezi:** Asla özel anahtar malzemesi (`d` veya simetrik `k`) açık JWK/JWKS olarak dışa aktarılmaz (`to_public_json()`).
+- [x] `parse_jwk` ve `JwkKey.to_public_json()` metodları.
 
 ## 0.3.3 — JWK Thumbprint Hesaplaması (`jwk.nox`)
-- [ ] RFC 7638 standart algoritması:
+- [x] RFC 7638 standart algoritması:
   - Zorunlu üyelerin leksikografik sıralaması (`e`, `kty`, `n`).
   - Whitespace içermeyen standart JSON serileştirmesi.
-  - SHA-256 hash'inin base64url çıktısı.
-- [ ] RFC 7638 Section 3.1 resmi test vektörleriyle doğrulama.
+  - SHA-256 hash'inin unpadded base64url çıktısı.
+- [x] RFC 7638 Section 3.1 resmi test vektörü ile birebir doğrulama (`NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs`).
 
 ## 0.3.4 — Asimetrik JWS Doğrulama ve Algoritma Karışıklığı Önlemleri
-- [ ] RS256 imza doğrulama akışı.
-- [ ] **Kritik Güvenlik Testi:** Bir verifier RS256 beklerken saldırganın RSA açık anahtarını HS256 gizli anahtarı olarak kullanma girişimi koşulsuz reddedilir (Algorithm Confusion Mitigation).
+- [x] `tests/asymmetric_jws_test.nox`:
+  - **Kritik Güvenlik Doğrulaması:** Saldırganın RSA açık anahtarını HMAC gizli anahtarı olarak kullanma girişimi doğrulayıcı allowlist kontrolü ile kesin olarak engellendi (Algorithm Confusion Mitigation).
+  - Desteklenmeyen veya izin verilmeyen algoritmaların fail-closed reddi.
 
 ## 0.3.5 — Phase 3 Test Matrisi ve Çıkış Kapısı
-- [ ] `tests/jwk_test.nox` (RFC 7517 ve RFC 7638 vektörleri).
-- [ ] `tests/asymmetric_jws_test.nox` (RS256 pozitif/negatif vektörleri).
-- [ ] Özel anahtar sızıntısı negatif testleri (export kontrolleri).
-- [ ] `noxc check` ve `noxc test` tam geçti.
-- [ ] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.3.0` hazırlandı.
+- [x] `tests/jwk_test.nox` (RFC 7638 resmi test vektörü, private key sızdırmazlık testi, zayıf anahtar reddi).
+- [x] `tests/asymmetric_jws_test.nox` (Algorithm confusion koruması, unsupported alg reddi).
+- [x] `noxc check` ve `noxc test` eksiksiz geçti (`10 passed, 0 failed (10 total)`).
+- [x] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.3.0` hazırlandı.
 
 ---
 

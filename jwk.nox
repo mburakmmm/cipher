@@ -1,0 +1,110 @@
+# Cipher — JSON Web Key (JWK) and RFC 7638 Thumbprint Standard
+# Enforces safe public JWK export (zero private key leakage) and minimum key size requirements.
+
+import nox.crypto
+import nox.strings
+from encoding import decode_base64url, encode_base64url, hex_to_bytes
+from errors import InvalidKeyError, JsonFormatError
+from json_strict import get_string_field, has_field, is_object, parse_strict_json
+
+MIN_RSA_MODULUS_BYTES: int = 255  # 2048 bits minimum (RFC 7518 §3.3 unpadded representation can be 255 or 256 bytes)
+
+class JwkKey:
+    kty: str
+    kid: str
+    alg: str
+    use: str
+    # RSA fields
+    n: str
+    e: str
+    d: str
+    # Symmetric fields
+    k: str
+
+    def __init__(self, kty: str, kid: str = "", alg: str = "", use: str = "sig",
+                 n: str = "", e: str = "", d: str = "", k: str = "") -> None:
+        self.kty = kty
+        self.kid = kid
+        self.alg = alg
+        self.use = use
+        self.n = n
+        self.e = e
+        self.d = d
+        self.k = k
+
+        if self.kty == "RSA":
+            if self.n == "" or self.e == "":
+                raise InvalidKeyError("RSA JWK must contain both 'n' and 'e' parameters")
+            # Enforce minimum 2048 bits for RSA
+            raw_n: str = decode_base64url(self.n)
+            n_bytes: int = nox.strings.byte_len(raw_n)
+            if n_bytes < MIN_RSA_MODULUS_BYTES:
+                raise InvalidKeyError("RSA modulus 'n' must be at least 2048 bits (256 bytes)")
+        
+        if self.kty == "oct":
+            if self.k == "":
+                raise InvalidKeyError("Symmetric 'oct' JWK must contain 'k' parameter")
+
+    def is_private(self) -> bool:
+        if self.kty == "RSA":
+            return self.d != ""
+        if self.kty == "oct":
+            return True
+        return False
+
+    def to_public_json(self) -> str:
+        # Invariant: Never export private 'd' or symmetric secret 'k'
+        if self.kty == "RSA":
+            out: str = "{\"kty\":\"RSA\",\"n\":\"" + self.n + "\",\"e\":\"" + self.e + "\""
+            if self.kid != "":
+                out = out + ",\"kid\":\"" + self.kid + "\""
+            if self.alg != "":
+                out = out + ",\"alg\":\"" + self.alg + "\""
+            if self.use != "":
+                out = out + ",\"use\":\"" + self.use + "\""
+            out = out + "}"
+            return out
+        
+        if self.kty == "oct":
+            # RFC 7517: Symmetric keys MUST NOT be exported as public JWKs
+            raise InvalidKeyError("Symmetric octet keys cannot be exported as public JWK")
+        
+        raise InvalidKeyError("Unsupported key type for public export: " + self.kty)
+
+    def thumbprint_sha256(self) -> str:
+        # RFC 7638 §3.2: Lexicographically ordered required members without whitespace
+        if self.kty == "RSA":
+            # Lexicographical order: e, kty, n
+            canonical_json: str = "{\"e\":\"" + self.e + "\",\"kty\":\"RSA\",\"n\":\"" + self.n + "\"}"
+            hex_hash: str = nox.crypto.sha256(canonical_json)
+            raw_hash: str = hex_to_bytes(hex_hash)
+            return encode_base64url(raw_hash)
+        
+        if self.kty == "oct":
+            # Lexicographical order: k, kty
+            canonical_json: str = "{\"k\":\"" + self.k + "\",\"kty\":\"oct\"}"
+            hex_hash: str = nox.crypto.sha256(canonical_json)
+            raw_hash: str = hex_to_bytes(hex_hash)
+            return encode_base64url(raw_hash)
+        
+        raise InvalidKeyError("Thumbprint not supported for kty: " + self.kty)
+
+def parse_jwk(jwk_json: str) -> JwkKey:
+    v: JsonValue = parse_strict_json(jwk_json)
+    if not is_object(v):
+        raise JsonFormatError("JWK must be a JSON object")
+
+    if not has_field(v, "kty"):
+        raise InvalidKeyError("JWK missing required 'kty' parameter")
+    kty: str = get_string_field(v, "kty")
+    
+    kid: str = get_string_field(v, "kid", default_val="", required=False)
+    alg: str = get_string_field(v, "alg", default_val="", required=False)
+    use: str = get_string_field(v, "use", default_val="sig", required=False)
+
+    n: str = get_string_field(v, "n", default_val="", required=False)
+    e: str = get_string_field(v, "e", default_val="", required=False)
+    d: str = get_string_field(v, "d", default_val="", required=False)
+    k: str = get_string_field(v, "k", default_val="", required=False)
+
+    return JwkKey(kty, kid, alg, use, n, e, d, k)

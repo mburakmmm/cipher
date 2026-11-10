@@ -1,0 +1,112 @@
+print("LINE 1")
+import nox.test
+print("LINE 2")
+from errors import InvalidKeyError, JsonFormatError
+print("LINE 3")
+from jwk import JwkKey, parse_jwk
+print("LINE 4")
+
+print("LINE 5")
+# 1. RFC 7638 Section 3.1 Official Test Vector
+print("LINE 6")
+rfc_jwk_json: str = "{\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"alg\":\"RS256\",\"kid\":\"2011-04-29\"}"
+print("LINE 7")
+
+print("LINE 8")
+key: JwkKey = parse_jwk(rfc_jwk_json)
+print("LINE 9")
+nox.test.assert_eq_str(key.kty, "RSA", "Parsed kty matches RSA")
+print("LINE 10")
+nox.test.assert_eq_str(key.kid, "2011-04-29", "Parsed kid matches")
+print("LINE 11")
+nox.test.assert_true(not key.is_private(), "Public key reported as not private")
+print("LINE 12")
+
+print("LINE 13")
+# Verify RFC 7638 SHA-256 Thumbprint
+print("LINE 14")
+expected_thumbprint: str = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+print("LINE 15")
+thumbprint: str = key.thumbprint_sha256()
+print("LINE 16")
+nox.test.assert_eq_str(thumbprint, expected_thumbprint, "RFC 7638 thumbprint exact match")
+print("LINE 17")
+
+print("LINE 18")
+# 2. Public Export Safety: Private material stripping
+print("LINE 19")
+rsa_with_private_json: str = "{\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"d\":\"synthetic-private-exponent-not-to-be-leaked\",\"kid\":\"sec-key-1\"}"
+print("LINE 20")
+
+print("LINE 21")
+private_key: JwkKey = parse_jwk(rsa_with_private_json)
+print("LINE 22")
+nox.test.assert_true(private_key.is_private(), "Private key detected")
+print("LINE 23")
+
+print("LINE 24")
+public_exported: str = private_key.to_public_json()
+print("LINE 25")
+nox.test.assert_true(not nox.strings.contains(public_exported, "\"d\":"), "Public JSON MUST NOT contain 'd' private exponent")
+print("LINE 26")
+nox.test.assert_true(not nox.strings.contains(public_exported, "synthetic-private"), "Public JSON MUST NOT contain private secret values")
+print("LINE 27")
+nox.test.assert_true(nox.strings.contains(public_exported, "\"kty\":\"RSA\""), "Public JSON contains RSA kty")
+print("LINE 28")
+
+print("LINE 29")
+# 3. Negative: Symmetric key public export is strictly prohibited
+print("LINE 30")
+sym_jwk_json: str = "{\"kty\":\"oct\",\"k\":\"c3VwZXItc2VjcmV0LWtleS1hdC1sZWFzdC0zMi1ieXRlcw\",\"kid\":\"sym-1\"}"
+print("LINE 31")
+sym_key: JwkKey = parse_jwk(sym_jwk_json)
+print("LINE 32")
+
+print("LINE 33")
+sym_export_blocked: bool = False
+print("LINE 34")
+try:
+print("LINE 35")
+    sym_key.to_public_json()
+print("LINE 36")
+except InvalidKeyError:
+print("LINE 37")
+    sym_export_blocked = True
+print("LINE 38")
+nox.test.assert_true(sym_export_blocked, "Symmetric octet key public export must fail closed")
+print("LINE 39")
+
+print("LINE 40")
+# 4. Negative: Weak RSA key (<2048 bits / <256 bytes) rejected
+print("LINE 41")
+weak_rsa_json: str = "{\"kty\":\"RSA\",\"n\":\"c2hvcnQtbW9kdWx1cy11bmRlci0yMDQ4LWJpdHM\",\"e\":\"AQAB\"}"
+print("LINE 42")
+weak_rejected: bool = False
+print("LINE 43")
+try:
+print("LINE 44")
+    parse_jwk(weak_rsa_json)
+print("LINE 45")
+except InvalidKeyError:
+print("LINE 46")
+    weak_rejected = True
+print("LINE 47")
+nox.test.assert_true(weak_rejected, "RSA key with modulus < 2048 bits must be rejected")
+print("LINE 48")
+
+print("LINE 49")
+# 5. Negative: Missing mandatory RSA parameters
+print("LINE 50")
+missing_param_json: str = "{\"kty\":\"RSA\",\"e\":\"AQAB\"}"
+print("LINE 51")
+missing_rejected: bool = False
+print("LINE 52")
+try:
+print("LINE 53")
+    parse_jwk(missing_param_json)
+print("LINE 54")
+except InvalidKeyError:
+print("LINE 55")
+    missing_rejected = True
+print("LINE 56")
+nox.test.assert_true(missing_rejected, "RSA key missing 'n' must be rejected")

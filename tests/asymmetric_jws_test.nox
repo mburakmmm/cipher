@@ -1,0 +1,39 @@
+import nox.test
+from encoding import decode_base64url, encode_base64url
+from errors import DisallowedAlgorithmError, InvalidKeyError, UnsupportedAlgorithmError
+from jws import VerificationProfile, verify_hs256
+from provider import DefaultCryptoProvider
+
+# 1. Algorithm Confusion Attack Simulation (RFC 8725 §3.2)
+# Attacker takes the server's RSA public key modulus 'n' and uses it as an HMAC-SHA256 symmetric secret.
+rsa_public_n: str = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+forged_header_b64: str = encode_base64url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}")
+forged_payload_b64: str = encode_base64url("{\"sub\":\"admin\",\"role\":\"superuser\"}")
+forged_signing_input: str = forged_header_b64 + "." + forged_payload_b64
+
+# Attacker signs with HMAC using the public RSA modulus as HMAC key
+crypto_prov: DefaultCryptoProvider = DefaultCryptoProvider()
+forged_sig_raw: str = crypto_prov.sign_hmac_sha256(rsa_public_n, forged_signing_input)
+forged_token: str = forged_signing_input + "." + encode_base64url(forged_sig_raw)
+
+# The server expects RS256 for this trust path!
+rs256_only_profile: VerificationProfile = VerificationProfile(["RS256"], "")
+
+confusion_prevented: bool = False
+try:
+    verify_hs256(forged_token, rsa_public_n, rs256_only_profile)
+except DisallowedAlgorithmError:
+    confusion_prevented = True
+nox.test.assert_true(confusion_prevented, "Algorithm confusion attack must be strictly prevented by verifier allowlist")
+
+# 2. Unsupported algorithm rejection
+unsupported_header_b64: str = encode_base64url("{\"alg\":\"ES384\",\"typ\":\"JWT\"}")
+unsupported_token: str = unsupported_header_b64 + "." + forged_payload_b64 + ".fake_sig"
+unsupported_profile: VerificationProfile = VerificationProfile(["ES384"], "")
+
+unsupported_prevented: bool = False
+try:
+    verify_hs256(unsupported_token, "dummy-secret-at-least-32-bytes-long", unsupported_profile)
+except UnsupportedAlgorithmError:
+    unsupported_prevented = True
+nox.test.assert_true(unsupported_prevented, "Unsupported algorithm correctly rejected with UnsupportedAlgorithmError")
