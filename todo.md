@@ -364,3 +364,7 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 *(Her sürüm ve adım tamamlandığında çalıştırılan terminal komutları, test çıktıları ve commit referansları buraya işlenecektir.)*
 
 - **2026-11-10:** `AGENTS.md` analiz edildi, sürüm takip planı (`todo.md`) oluşturuldu. Platform gereksinimleri ve NOX 2.1.0 compiler doğrulamaları kaydedildi.
+- **2026-11-10 (Faz 0 - Faz 6 Tamamlanması):** Tüm fazlar eksiksiz tamamlandı. 13/13 test suite (`noxc test`) yeşil geçti.
+- **2026-11-10 (Yayın & Tagleme):** 
+  - Git tag `v1.0.0` oluşturuldu ve GitHub `origin`'e push edildi (`git push origin v1.0.0`).
+  - `noxc publish https://github.com/mburakmmm/cipher` çalıştırıldı: Paket merkezi (`noxpkg.noxlang.com`) tarafından başarıyla alındı (`submitted: cipher (id=009c7147-e46a-4b23-bb18-427052b31629) as @mburakmmm — awaiting approval`).
