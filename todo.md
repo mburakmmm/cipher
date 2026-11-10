@@ -547,5 +547,5 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `./scripts/test-isolated-consumer.sh` çalıştır ve doğrula.
 - [x] `nox.json` versiyonunu `1.0.3` yap.
 - [x] `CHANGELOG.md` dosyasına `v1.0.3` sürüm notlarını ekle.
-- [~] Git commit, `v1.0.3` git tag push ve `noxc publish` çalıştır.
-- [ ] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+- [x] Git commit, `v1.0.3` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
