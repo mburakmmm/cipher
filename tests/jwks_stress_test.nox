@@ -1,0 +1,79 @@
+import nox.test
+from errors import KeyUnavailableError, UnknownKeyError
+from jwk import JwkKey
+from jwks import JwksKeySource, MAX_NEGATIVE_CACHE_ENTRIES
+
+# ==============================================================================
+# JWKS Source Cache & Negative-Cache Bounded Stress Tests
+# ==============================================================================
+
+rsa_jwks: str = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k-prod-active\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"alg\":\"RS256\"}]}"
+
+source: JwksKeySource = JwksKeySource(
+    "https://auth.company.org/jwks",
+    cache_ttl_sec=300,
+    stale_grace_sec=1200
+)
+source.feed_jwks(rsa_jwks, timestamp_sec=1700000000)
+
+# 1. Stress: 1,000+ sequential unknown kid queries to test memory bounding
+total_queries: int = 1050
+q_idx: int = 1
+while q_idx <= total_queries:
+    fake_kid: str = "ghost-kid-" + str(q_idx)
+    caught: bool = False
+    try:
+        source.get_key(fake_kid, current_time_sec=1700000010)
+    except UnknownKeyError:
+        caught = True
+    nox.test.assert_true(caught, "Unknown kid must be rejected")
+    
+    # Invariant: Negative cache must NEVER exceed MAX_NEGATIVE_CACHE_ENTRIES (256)
+    cache_len: int = len(source.negative_cache_kids)
+    nox.test.assert_true(cache_len <= MAX_NEGATIVE_CACHE_ENTRIES, "Cache size bounded by 256")
+    q_idx = q_idx + 1
+
+# Verify final bounded size is exactly 256
+nox.test.assert_eq_int(len(source.negative_cache_kids), 256, "Negative cache stays strictly bounded at 256")
+
+# Verify FIFO eviction:
+# ghost-kid-1 was evicted long ago
+nox.test.assert_true(not source.is_in_negative_cache("ghost-kid-1"), "Oldest unknown kid was evicted")
+# ghost-kid-1050 is fresh in negative cache
+nox.test.assert_true(source.is_in_negative_cache("ghost-kid-1050"), "Recent unknown kid is cached")
+
+# Repeated lookup of cached negative key immediately fails without searching keys
+cached_negative_caught: bool = False
+try:
+    source.get_key("ghost-kid-1050", current_time_sec=1700000020)
+except UnknownKeyError:
+    cached_negative_caught = True
+nox.test.assert_true(cached_negative_caught, "Cached negative kid rejected immediately")
+
+# 2. TTL & Stale Grace Window under load
+# Fresh lookup (within 300s TTL)
+k_fresh: JwkKey = source.get_key("k-prod-active", current_time_sec=1700000200)
+nox.test.assert_eq_str(k_fresh.kid, "k-prod-active", "Key retrieved during fresh cache window")
+
+# Stale lookup (past 300s TTL, within 1200s stale grace)
+k_stale: JwkKey = source.get_key("k-prod-active", current_time_sec=1700001000)
+nox.test.assert_eq_str(k_stale.kid, "k-prod-active", "Key retrieved during stale grace window")
+
+# Expired lookup (past 1500s: 300 + 1200)
+expired_caught: bool = False
+try:
+    source.get_key("k-prod-active", current_time_sec=1700001600)
+except KeyUnavailableError:
+    expired_caught = True
+nox.test.assert_true(expired_caught, "Expired cache past grace period rejected with KeyUnavailableError")
+
+# 3. Cache Refresh Clears Negative Cache
+source.feed_jwks(rsa_jwks, timestamp_sec=1700001700)
+nox.test.assert_eq_int(len(source.negative_cache_kids), 0, "Negative cache emptied on fresh feed")
+nox.test.assert_true(not source.is_in_negative_cache("ghost-kid-1050"), "Negative cache purged after feed")
+
+# Key available again
+k_reloaded: JwkKey = source.get_key("k-prod-active", current_time_sec=1700001710)
+nox.test.assert_eq_str(k_reloaded.kid, "k-prod-active", "Key retrieved after feed")
+
+print("jwks_stress_test passed!")

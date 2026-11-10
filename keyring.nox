@@ -37,23 +37,32 @@ class KeyRing:
                     raise ConfigurationError("Keyring already has an active signing key for algorithm: " + key.algorithm)
                 j = j + 1
         
-        self.keys.append(key)
+        # Immutable RCU publish
+        new_snap: list[KeyRef] = []
+        k_idx: int = 0
+        while k_idx < n:
+            new_snap.append(self.keys[k_idx])
+            k_idx = k_idx + 1
+        new_snap.append(key.clone())
+        self.keys = new_snap
 
     def get_signing_key(self, algorithm: str) -> KeyRef:
+        snap: list[KeyRef] = self.keys
         i: int = 0
-        n: int = len(self.keys)
+        n: int = len(snap)
         while i < n:
-            k: KeyRef = self.keys[i]
+            k: KeyRef = snap[i]
             if k.algorithm == algorithm and k.can_sign():
                 return k
             i = i + 1
         raise KeyUnavailableError("No active signing key available for algorithm: " + algorithm)
 
     def get_verification_key(self, kid: str, current_time_sec: int = 0) -> KeyRef:
+        snap: list[KeyRef] = self.keys
         i: int = 0
-        n: int = len(self.keys)
+        n: int = len(snap)
         while i < n:
-            k: KeyRef = self.keys[i]
+            k: KeyRef = snap[i]
             if k.kid == kid:
                 if k.state == STATE_REVOKED:
                     raise KeyUnavailableError("Key has been revoked: " + kid)
@@ -97,26 +106,45 @@ class KeyRing:
                 break
             j = j + 1
         
-        # 2. Atomic commit phase (all checks succeeded)
-        if existing_idx >= 0:
-            curr_active: KeyRef = self.keys[existing_idx]
-            curr_active.transition_to(STATE_VERIFY_ONLY)
-            curr_active.retire_at = now + overlap_seconds
+        # 2. Immutable RCU Snapshot Commit phase
+        new_snap: list[KeyRef] = []
+        k_i: int = 0
+        while k_i < n:
+            curr: KeyRef = self.keys[k_i]
+            if k_i == existing_idx:
+                demoted: KeyRef = curr.clone()
+                demoted.transition_to(STATE_VERIFY_ONLY)
+                demoted.retire_at = now + overlap_seconds
+                new_snap.append(demoted)
+            else:
+                new_snap.append(curr.clone())
+            k_i = k_i + 1
         
-        if new_key.state == STATE_PREPARED:
-            new_key.transition_to(STATE_ACTIVE_SIGNING)
-        new_key.activated_at = now
-        
-        self.keys.append(new_key)
+        activated_new: KeyRef = new_key.clone()
+        if activated_new.state == STATE_PREPARED:
+            activated_new.transition_to(STATE_ACTIVE_SIGNING)
+        activated_new.activated_at = now
+        new_snap.append(activated_new)
+
+        # Single-step atomic reference publication
+        self.keys = new_snap
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
     def revoke(self, kid: str) -> None:
-        i: int = 0
+        found: bool = False
+        new_snap: list[KeyRef] = []
+        k_i: int = 0
         n: int = len(self.keys)
-        while i < n:
-            k: KeyRef = self.keys[i]
-            if k.kid == kid:
-                k.transition_to(STATE_REVOKED)
-                return
-            i = i + 1
-        raise UnknownKeyError("Cannot revoke unknown key: " + kid)
+        while k_i < n:
+            curr: KeyRef = self.keys[k_i]
+            if curr.kid == kid:
+                found = True
+                revoked_k: KeyRef = curr.clone()
+                revoked_k.transition_to(STATE_REVOKED)
+                new_snap.append(revoked_k)
+            else:
+                new_snap.append(curr.clone())
+            k_i = k_i + 1
+        if not found:
+            raise UnknownKeyError("Cannot revoke unknown key: " + kid)
+        self.keys = new_snap

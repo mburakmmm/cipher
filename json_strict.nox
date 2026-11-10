@@ -65,6 +65,16 @@ def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool =
     val: JsonValue = get_field_value(v, key)
     if val.kind != 2:
         raise JsonFormatError("Field '" + key + "' must be a numeric integer")
+    
+    # Check raw text representation if available
+    if len(val.s) > 0:
+        if nox.strings.contains(val.s, "."):
+            raise JsonFormatError("Field '" + key + "' must be a strict non-fractional integer")
+        try:
+            return int(val.s)
+        except ValueError:
+            raise JsonFormatError("Field '" + key + "' has invalid integer representation")
+
     i: int = int(val.n)
     if float(i) != val.n:
         raise JsonFormatError("Field '" + key + "' must be a strict non-fractional integer")

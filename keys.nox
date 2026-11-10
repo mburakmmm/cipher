@@ -42,6 +42,12 @@ class KeyRef:
         self.activated_at = activated_at
         self.retire_at = retire_at
 
+    def clone(self) -> KeyRef:
+        return KeyRef(self.kid, self.algorithm, self.secret_material,
+                      trust_domain=self.trust_domain, use=self.use,
+                      state=self.state, activated_at=self.activated_at,
+                      retire_at=self.retire_at)
+
     def can_sign(self) -> bool:
         return self.state == STATE_ACTIVE_SIGNING and self.use == "sig"
 

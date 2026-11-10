@@ -3,11 +3,46 @@
 
 import nox.crypto
 import nox.strings
-from encoding import decode_base64url, encode_base64url, hex_to_bytes
-from errors import InvalidKeyError, JsonFormatError
+from encoding import decode_base64url, encode_base64url, hex_to_bytes, validate_base64url_syntax
+from errors import EncodingError, InvalidKeyError, JsonFormatError
 from json_strict import get_string_field, has_field, is_object, parse_strict_json
 
 MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
+
+def _b64_char_to_val(code: int) -> int:
+    if code >= 65 and code <= 90:
+        return code - 65
+    if code >= 97 and code <= 122:
+        return code - 71
+    if code >= 48 and code <= 57:
+        return code + 4
+    if code == 45:
+        return 62
+    if code == 95:
+        return 63
+    return -1
+
+def _b64url_to_uint(s: str) -> int:
+    n: int = len(s)
+    rem: int = n % 4
+    if n == 0 or rem == 1:
+        raise InvalidKeyError("Invalid Base64URL integer length")
+    
+    val: int = 0
+    i: int = 0
+    while i < n:
+        code: int = ord(s[i])
+        c_val: int = _b64_char_to_val(code)
+        if c_val < 0:
+            raise InvalidKeyError("Invalid character in Base64URL integer")
+        val = (val << 6) | c_val
+        i = i + 1
+    
+    if rem == 2:
+        return val >> 4
+    if rem == 3:
+        return val >> 2
+    return val
 
 class JwkKey:
     kty: str
@@ -35,11 +70,45 @@ class JwkKey:
         if self.kty == "RSA":
             if self.n == "" or self.e == "":
                 raise InvalidKeyError("RSA JWK must contain both 'n' and 'e' parameters")
+            
+            # 1. Base64URL syntax validation
+            try:
+                validate_base64url_syntax(self.n)
+            except EncodingError:
+                raise InvalidKeyError("RSA modulus 'n' has invalid Base64URL syntax")
+            try:
+                validate_base64url_syntax(self.e)
+            except EncodingError:
+                raise InvalidKeyError("RSA public exponent 'e' has invalid Base64URL syntax")
+
+            # 2. Modulus 'n' size and structural validation
             # Enforce minimum 2048 bits (256 bytes) for RSA
             # In Base64URL (RFC 7518 §3.3), a 256-byte modulus encodes to 342 unpadded characters.
-            # Any modulus with fewer than 2048 bits (e.g. 2040 bits / 255 bytes = 340 chars, 1024 bits = 171 chars) is strictly rejected.
             if len(self.n) < MIN_RSA_MODULUS_CHARS:
                 raise InvalidKeyError("RSA modulus 'n' must be at least 2048 bits (256 bytes, 342 Base64URL chars)")
+            
+            n_c0: int = _b64_char_to_val(ord(self.n[0]))
+            n_c1: int = _b64_char_to_val(ord(self.n[1]))
+            n_first_byte: int = (n_c0 << 2) | (n_c1 >> 4)
+            if n_first_byte == 0:
+                raise InvalidKeyError("RSA modulus 'n' must not contain leading zero octets (RFC 7518 §6.3.1.1)")
+            if len(self.n) == MIN_RSA_MODULUS_CHARS and (n_first_byte & 128) == 0:
+                raise InvalidKeyError("RSA modulus 'n' has MSB equal to zero (fewer than 2048 bits)")
+
+            # 3. Public exponent 'e' validation (RFC 7518 §6.3.1.2)
+            if len(self.e) == 0 or len(self.e) % 4 == 1:
+                raise InvalidKeyError("RSA public exponent 'e' has invalid Base64URL length")
+            e_c0: int = _b64_char_to_val(ord(self.e[0]))
+            e_c1: int = _b64_char_to_val(ord(self.e[1]))
+            e_first_byte: int = (e_c0 << 2) | (e_c1 >> 4)
+            if e_first_byte == 0:
+                raise InvalidKeyError("RSA exponent 'e' must not contain leading zero octets (RFC 7518 §6.3.1.2)")
+            
+            e_val: int = _b64url_to_uint(self.e)
+            if e_val <= 1:
+                raise InvalidKeyError("RSA public exponent 'e' must be greater than 1")
+            if e_val % 2 == 0:
+                raise InvalidKeyError("RSA public exponent 'e' must be an odd positive integer")
         
         if self.kty == "oct":
             if self.k == "":

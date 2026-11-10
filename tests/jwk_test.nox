@@ -54,3 +54,51 @@ try:
 except InvalidKeyError:
     missing_rejected = True
 nox.test.assert_true(missing_rejected, "RSA key missing 'n' must be rejected")
+
+# 6. Negative: 342-char modulus with invalid Base64URL syntax rejected
+bad_syntax_n: str = "0vx7+goebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+bad_syntax_json: str = "{\"kty\":\"RSA\",\"n\":\"" + bad_syntax_n + "\",\"e\":\"AQAB\"}"
+bad_syntax_rejected: bool = False
+try:
+    parse_jwk(bad_syntax_json)
+except InvalidKeyError:
+    bad_syntax_rejected = True
+nox.test.assert_true(bad_syntax_rejected, "RSA modulus with '+' must be rejected")
+
+# 7. Negative: 342-char modulus with leading zero octet rejected
+zero_octet_n: str = "AAAAagoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+zero_octet_json: str = "{\"kty\":\"RSA\",\"n\":\"" + zero_octet_n + "\",\"e\":\"AQAB\"}"
+zero_octet_rejected: bool = False
+try:
+    parse_jwk(zero_octet_json)
+except InvalidKeyError:
+    zero_octet_rejected = True
+nox.test.assert_true(zero_octet_rejected, "RSA modulus with leading zero octet must be rejected")
+
+# 8. Negative: 342-char modulus with MSB = 0 rejected (fewer than 2048 bits)
+msb_zero_n: str = "Avx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+msb_zero_json: str = "{\"kty\":\"RSA\",\"n\":\"" + msb_zero_n + "\",\"e\":\"AQAB\"}"
+msb_zero_rejected: bool = False
+try:
+    parse_jwk(msb_zero_json)
+except InvalidKeyError:
+    msb_zero_rejected = True
+nox.test.assert_true(msb_zero_rejected, "RSA modulus with MSB=0 (fewer than 2048 bits) must be rejected")
+
+# 9. Negative: Even RSA public exponent rejected
+even_e_json: str = "{\"kty\":\"RSA\",\"n\":\"" + key.n + "\",\"e\":\"Ag\"}"
+even_e_rejected: bool = False
+try:
+    parse_jwk(even_e_json)
+except InvalidKeyError:
+    even_e_rejected = True
+nox.test.assert_true(even_e_rejected, "Even RSA public exponent must be rejected")
+
+# 10. Negative: RSA public exponent <= 1 rejected
+small_e_json: str = "{\"kty\":\"RSA\",\"n\":\"" + key.n + "\",\"e\":\"AQ\"}"
+small_e_rejected: bool = False
+try:
+    parse_jwk(small_e_json)
+except InvalidKeyError:
+    small_e_rejected = True
+nox.test.assert_true(small_e_rejected, "RSA public exponent <= 1 must be rejected")

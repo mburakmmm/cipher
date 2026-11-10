@@ -429,6 +429,50 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 
 ---
 
+# Phase 8 — `v1.0.2` Architecture Integrity & Enterprise Hardening (SOL II Analizi)
+
+**Amaç:** İkinci bağımsız teknik incelemede (GPT 6 SOL II analizi) belirlenen ileri düzey mimari ve kurumsal üretim gereksinimlerini eksiksiz tamamlamak: KeyRing RCU immutable snapshot eşzamanlılığı, RSA/JWK yapısal ve exponent doğrulaması, `nox.url` tabanlı gelişmiş SSRF korumaları (userinfo, IPv4-mapped, ULA, decimal IP), NumericDate büyük tamsayı hassasiyet garantisi, izole dış tüketici testi ve JWKS stres testleri.
+
+## 0.8.1 — P0: KeyRing RCU (Read-Copy-Update) Immutable Snapshot ve Eşzamanlılık Garantisi (`keyring.nox`)
+- [x] `KeyRing` sınıfını immutable snapshot (Read-Copy-Update) modeline geçir:
+  - Rotasyon, anahtar ekleme ve iptal işlemlerinde mevcut liste üzerinde mutasyon yapma; `new_keys` kopyası oluştur ve atomik tek adımda referansı güncelle (`keys.nox` içinde `KeyRef.clone()`, `keyring.nox` içinde tek adımlı referans ataması).
+  - Okuma metodları (`get_signing_key`, `get_verification_key`) o anki snapshot referansını kullanarak çalışsın.
+- [x] `tests/concurrency_keyring_test.nox` testi ile çoklu iş parçacığı ve eşzamanlı okuma/yazma/rotasyon döngüsünde aktif imzalayıcının asla eksilmediğini, başarısız rotasyonlarda durumun %100 korunduğunu ve RCU izolasyonunu doğrula.
+
+## 0.8.2 — P0: RSA / JWK Yapısal ve Kriptografik Doğrulama Sertleştirmesi (`jwk.nox`)
+- [x] `validate_base64url_syntax(self.n)` ve `validate_base64url_syntax(self.e)` ile sözdizimi doğrulaması.
+- [x] Modülün ilk karakterinin ve yüksek anlamlı bitlerinin sıfır olmamasını (`n` ön sıfır ve MSB kontrolü) denetle (RFC 7518 §6.3.1.1).
+- [x] Public exponent `e` doğrulaması: `e` çözümlendiğinde pozitif, tek sayı ve geçerli aralıkta olmalı (RFC 7518 §6.3.1.2).
+- [x] Geçersiz sözdizimli 342 karakterlik modül, ön sıfır baytı, sıfır MSB, çift exponent ve <=1 exponent için negatif testler ekle (`tests/jwk_test.nox`).
+
+## 0.8.3 — P1: Standart `nox.url` Tabanlı Gelişmiş SSRF ve IP Savunması (`jwks.nox`)
+- [x] `is_safe_jwks_url()` fonksiyonunu standart `nox.url.parse` ile yeniden yapılandır:
+  - Userinfo içeren URL'leri derhal engelle (`u.userinfo != ""` -> fail-closed).
+  - IPv4-mapped IPv6 adreslerini engelle (`::ffff:127.0.0.1`, `::ffff:10.0.0.1`, `::ffff:192.168.*`, `::ffff:172.*`).
+  - Tüm IPv6 ULA (`fc00::/7` - yani `fc` veya `fd` ile başlayan tüm IPv6 aralığı) ve Link-Local (`fe80::/10`) adresleri engelle.
+  - Alternatif tamsayı/hex/octal IP gösterimlerini (ör. `2130706433`, `0x7f.0.0.1`) reddet.
+- [x] `tests/jwks_test.nox` içine bu yeni SSRF vektörlerinin negatif testlerini ekle.
+
+## 0.8.4 — P1: Büyük Tamsayı ve NumericDate Sınır Doğrulaması (`json_strict.nox`)
+- [x] `get_int_field()` fonksiyonunu `val.s` ham metin ayrıştırmasıyla 64-bit tamsayı hassasiyetine bağla:
+  - Eğer `val.s` içinde `.` varsa kesirli sayı olarak kesinlikle reddet (`JsonFormatError`).
+  - Nokta yoksa doğrudan `int(val.s)` ile float taşması olmaksızın 64-bit tamsayı elde et.
+- [x] `2^53 - 1` (9007199254740991) ve üzeri tamsayılar ile kesirli sınır değerleri için testler ekle (`tests/json_strict_test.nox`).
+
+## 0.8.5 — P1: İzole Dış Paket Tüketici Entegrasyon Testi (`scripts/test-isolated-consumer.sh`)
+- [x] Repository dışındaki bağımsız bir dizinde temiz bir proje ortamı açarak `cipher` modüllerini dışarıdan import eden ve derleyip çalıştıran otomatik doğrulama betiği hazırla ve çalıştır.
+
+## 0.8.6 — P2: JWKS Cache, Stale Penceresi ve Negative-Cache Stres Testleri (`tests/jwks_stress_test.nox`)
+- [x] 1.000+ ardışık ve rastgele bilinmeyen `kid` altında bounded cache tahliyesini, TTL aşımında bayat önbellek toleransını ve bellek tutarlılığını test et.
+
+## 0.8.7 — Phase 8 Çıkış Kapısı ve `v1.0.2` Yayını
+- [x] `noxc test` ile tüm testleri %100 yeşil çalıştır (16/16 test %100 geçti).
+- [x] `nox.json` versiyonunu `1.0.2` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.2` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.2` git tag push ve `noxc publish` çalıştır.
+
+---
+
 ## 3. Günlük Kanıt Kayıtları
 
 *(Her sürüm ve adım tamamlandığında çalıştırılan terminal komutları, test çıktıları ve commit referansları buraya işlenecektir.)*
@@ -451,3 +495,12 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
   - CI ve Release Gate iş akışları sertleştirildi (`env: NOX_VERSION: v2.1.0` pini ile GitHub API rate-limit ortadan kaldırıldı, macOS runner'ı `macos-15`'e geçirilerek kuyruk gecikmeleri çözüldü).
   - GitHub Actions sonuçları: Hem **CI** (Ubuntu: 23s, Windows: 1m12s, macOS: 13s) hem de **Release Gate & Publish** (Ubuntu: 30s, macOS: 22s, Windows: 48s, Release Publish: 9s) %100 yeşil (`SUCCESS`) tamamlandı.
   - GitHub Releases üzerinde `Cipher v1.0.1` resmi olarak yayımlandı.
+- **2026-11-10 (Faz 8 — v1.0.2 SOL II Mimari ve Kurumsal Sertleştirme):**
+  - `KeyRing` RCU (Read-Copy-Update) immutable snapshot modeline geçirildi (`keys.nox`'ta `KeyRef.clone()`, `keyring.nox`'ta tek adımlı referans ataması ve snapshot izolasyonu). `tests/concurrency_keyring_test.nox` testi ile doğrulandı.
+  - RSA/JWK yapısal doğrulaması sertleştirildi: Modül `n` ve exponent `e` için `validate_base64url_syntax`, MSB bit kontrolü (tam 2048-bit), ön sıfır baytı reddi, public exponent `e`'nin pozitif ve tek sayı olma zorunluluğu (RFC 7518 §6.3.1) uygulandı. `tests/jwk_test.nox` genişletildi.
+  - Standart `nox.url` tabanlı SSRF motoru entegre edildi: userinfo (`@`) reddi, IPv4-mapped IPv6 (`::ffff:127.0.0.1` vb.), tam IPv6 ULA (`fc00::/7`), link-local (`fe80::/10`), alternatif pure decimal (`2130706433`), hex (`0x7f.0.0.1`) ve octal IP formatları filtrelendi. `tests/jwks_test.nox` genişletildi.
+  - `json_strict.nox` içinde 64-bit safe integer (`2^53 - 1` = 9007199254740991) ve float taşmasız tam sayı hassasiyeti garanti altına alındı. `tests/json_strict_test.nox` genişletildi.
+  - `scripts/test-isolated-consumer.sh` ile izole harici tüketici entegrasyon testi geliştirildi ve başarıyla çalıştırıldı.
+  - `tests/jwks_stress_test.nox` ile 1.000+ ardışık bilinmeyen kid altında negative cache'in 256 kayıtta bounded tutulduğu ve FIFO tahliyesi doğrulandı.
+  - Test sonucu: `16 passed, 0 failed (16 total)` tam başarı.
+  - Sürüm `1.0.2` yapıldı, `CHANGELOG.md` güncellendi, `v1.0.2` tag'i push edildi ve `noxc publish` çalıştırıldı.

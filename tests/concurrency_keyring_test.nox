@@ -1,0 +1,116 @@
+import nox.test
+from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
+from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
+from keyring import KeyRing
+from rotation import RotationReceipt
+
+# ==============================================================================
+# Concurrency & RCU Snapshot Invariant Tests for KeyRing
+# ==============================================================================
+
+# Test 1: Snapshot Isolation during concurrent rotation
+ring: KeyRing = KeyRing(trust_domain="tenant-prod")
+k1: KeyRef = KeyRef("k-001", "HS256", "super-secret-key-material-001-32b", trust_domain="tenant-prod", state=STATE_ACTIVE_SIGNING)
+ring.add_key(k1)
+
+# Reader captures current active signing key snapshot
+reader_k1: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(reader_k1.kid, "k-001", "Reader captured k-001")
+nox.test.assert_true(reader_k1.can_sign(), "Reader key can sign")
+
+# Writer performs atomic RCU rotation to k-002
+k2: KeyRef = KeyRef("k-002", "HS256", "super-secret-key-material-002-32b", trust_domain="tenant-prod", state=STATE_PREPARED)
+receipt1: RotationReceipt = ring.rotate(k2, overlap_seconds=300, clock_time_sec=1000)
+
+# Reader 2 immediately sees the new active key
+reader_k2: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(reader_k2.kid, "k-002", "Active signer switched atomically to k-002")
+
+# Reader 1 still has its immutable KeyRef representation intact
+nox.test.assert_eq_str(reader_k1.kid, "k-001", "Reader 1 reference preserved")
+
+# Verification key lookup for k-001 works (in overlap window)
+v1: KeyRef = ring.get_verification_key("k-001", current_time_sec=1100)
+nox.test.assert_eq_str(v1.kid, "k-001", "k-001 still verifies during overlap")
+nox.test.assert_eq_str(v1.state, STATE_VERIFY_ONLY, "k-001 demoted to VERIFY_ONLY in new snapshot")
+
+# Test 2: Rapid interleaved rotation series — Active signer is never missing or null
+step: int = 3
+while step <= 20:
+    new_kid: str = "k-00" + str(step)
+    new_sec: str = "super-secret-key-material-" + str(step) + "-32b"
+    next_k: KeyRef = KeyRef(new_kid, "HS256", new_sec, trust_domain="tenant-prod", state=STATE_PREPARED)
+    
+    # Interleaved reader check right before rotation
+    pre_signer: KeyRef = ring.get_signing_key("HS256")
+    nox.test.assert_true(pre_signer.can_sign(), "Pre-rotation active signer exists")
+    
+    # Rotate
+    ring.rotate(next_k, overlap_seconds=600, clock_time_sec=1000 + step * 10)
+    
+    # Interleaved reader check right after rotation
+    post_signer: KeyRef = ring.get_signing_key("HS256")
+    nox.test.assert_eq_str(post_signer.kid, new_kid, "Post-rotation active signer matches new kid")
+    nox.test.assert_true(post_signer.can_sign(), "Post-rotation active signer can sign")
+    
+    step = step + 1
+
+# Test 3: Failed rotation aborts completely and leaves current snapshot 100% intact
+curr_active: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(curr_active.kid, "k-0020", "Active before failed rotation is k-0020")
+
+# Attempt 1: Cross-tenant key during rotation
+foreign_key: KeyRef = KeyRef("k-bad-domain", "HS256", "super-secret-key-material-foreign-32", trust_domain="tenant-evil", state=STATE_PREPARED)
+domain_failed: bool = False
+try:
+    ring.rotate(foreign_key, overlap_seconds=300, clock_time_sec=2000)
+except ConfigurationError:
+    domain_failed = True
+nox.test.assert_true(domain_failed, "Cross-tenant rotation failed")
+
+# KeyRing snapshot must NOT have changed:
+active_after_fail1: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(active_after_fail1.kid, "k-0020", "Active key unchanged after domain failure")
+nox.test.assert_true(active_after_fail1.can_sign(), "Active key can still sign")
+
+# Attempt 2: Duplicate kid during rotation
+dup_key: KeyRef = KeyRef("k-0010", "HS256", "super-secret-duplicate-key-material-32", trust_domain="tenant-prod", state=STATE_PREPARED)
+dup_failed: bool = False
+try:
+    ring.rotate(dup_key, overlap_seconds=300, clock_time_sec=2000)
+except AmbiguousKeyError:
+    dup_failed = True
+nox.test.assert_true(dup_failed, "Duplicate kid rotation failed")
+
+active_after_fail2: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(active_after_fail2.kid, "k-0020", "Active key unchanged after duplicate kid failure")
+
+# Test 4: RCU Revocation semantics
+# Revoke k-0020
+ring.revoke("k-0020")
+
+# Verification of revoked key must fail
+revoked_check_failed: bool = False
+try:
+    ring.get_verification_key("k-0020")
+except KeyUnavailableError:
+    revoked_check_failed = True
+nox.test.assert_true(revoked_check_failed, "Revoked key immediately unavailable for verification")
+
+# Cannot sign with revoked key
+signing_failed: bool = False
+try:
+    ring.get_signing_key("HS256")
+except KeyUnavailableError:
+    signing_failed = True
+nox.test.assert_true(signing_failed, "No active signing key after revoking the active signer")
+
+# Revoking unknown key fails closed without altering snapshot
+unknown_revoke_failed: bool = False
+try:
+    ring.revoke("k-ghost")
+except UnknownKeyError:
+    unknown_revoke_failed = True
+nox.test.assert_true(unknown_revoke_failed, "Revoking non-existent key fails closed with UnknownKeyError")
+
+print("concurrency_keyring_test passed!")

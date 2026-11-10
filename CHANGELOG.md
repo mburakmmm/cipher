@@ -4,6 +4,27 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL II Architecture Audit)
+- **KeyRing RCU (Read-Copy-Update) Immutable Snapshot Concurrency (`keyring.nox`, `keys.nox`):** Migrated `KeyRing` state transitions to an immutable snapshot publication pattern. Key additions, rotations, and revocations construct fresh snapshot clones and atomically publish via single-reference assignment (`self.keys = new_snap`). Reader lookups capture local snapshot references, ensuring readers never observe intermediate mutation states and an active signer is never absent. Added `KeyRef.clone()` and `tests/concurrency_keyring_test.nox`.
+- **Structural RSA JWK & Public Exponent Validation (`jwk.nox`):** Enhanced RSA parameter verification in RFC 7518 §6.3.1 compliance without relying on C-string binary conversions:
+  - Base64URL syntax verification on modulus `n` and exponent `e`.
+  - Leading zero octet rejection on `n` and `e` (RFC 7518 §6.3.1.1 & §6.3.1.2).
+  - Modulus MSB bit verification (ensuring full 2048-bit magnitude, rejecting zero MSBs).
+  - Public exponent `e` decoding and validation: enforces positive, odd integer > 1 (e.g., 65537, 3), strictly rejecting even or <= 1 exponents.
+  - Added comprehensive negative test vectors in `tests/jwk_test.nox`.
+- **Standard `nox.url` SSRF Defense & IP Filtering (`jwks.nox`):**
+  - Replaced manual string splitting with RFC 3986 standard parsing via `nox.url.parse()`.
+  - Fail-closed rejection of URLs containing userinfo (`u.userinfo != ""` prevents credential hiding and authority spoofing).
+  - Full IPv4-mapped IPv6 address rejection (`::ffff:127.0.0.1`, `::ffff:10.0.0.0/8`, `::ffff:192.168.0.0/16`, `::ffff:169.254.0.0/16`, `::ffff:172.16-31`).
+  - Complete IPv6 ULA coverage (`fc00::/7` covering both `fc` and `fd` prefixes) and Link-Local (`fe80::/10`).
+  - Alternative IP representations (pure decimal integer IPs e.g. `2130706433`, hexadecimal `0x7f.0.0.1`, octal dotted-decimal notations).
+  - Negative tests in `tests/jwks_test.nox`.
+- **64-bit Large Safe Integer & Fractional Precision (`json_strict.nox`):** Updated `get_int_field()` to guarantee 64-bit safe integer parsing (up to `2^53 - 1` = `9007199254740991`) and negative integers, strictly rejecting any fractional numbers with `JsonFormatError`. Added boundary tests in `tests/json_strict_test.nox`.
+- **Isolated External Consumer Verification (`scripts/test-isolated-consumer.sh`):** Added automated validation script that creates a temporary isolated project outside the repository, imports `cipher` as an external package, and executes full JWT, Signed Token, and KeyRing workflows end-to-end.
+- **JWKS Cache, Grace Window & Negative-Cache Bounded Stress Suite (`tests/jwks_stress_test.nox`):** Added stress test executing 1,000+ sequential unknown `kid` lookups verifying that negative cache remains strictly bounded at 256 entries with FIFO eviction, cached negative keys reject immediately, and TTL stale grace windows function reliably under load.
+
 ## [1.0.1] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL Audit)

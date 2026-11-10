@@ -3,6 +3,8 @@
 
 import nox.strings
 import nox.time
+from nox.url import URL, UrlError
+import nox.url
 from errors import ConfigurationError, KeyUnavailableError, ResourceLimitExceededError, UnknownKeyError
 from jwk import JwkKey, parse_jwk
 from json_strict import get_field_value, has_field, is_object, parse_strict_json
@@ -11,48 +13,81 @@ MAX_JWKS_RESPONSE_BYTES: int = 1048576  # 1 MB maximum JWKS payload
 MAX_NEGATIVE_CACHE_ENTRIES: int = 256    # Maximum negative cache capacity to prevent memory exhaustion
 
 def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
-    # 1. Mandatory HTTPS scheme
-    if not nox.strings.starts_with(url, "https://"):
+    # 1. Standard RFC 3986 URL parsing via nox.url
+    u: URL = URL("", "", "", 0, "", {}, "")
+    try:
+        u = nox.url.parse(url)
+    except UrlError:
         return False
     
-    # Extract host part after https://
-    without_scheme: str = nox.strings.replace(url, "https://", "")
-    parts: list[str] = nox.strings.split(without_scheme, "/")
-    host_port: str = parts[0]
+    # 2. Mandatory HTTPS scheme
+    if u.scheme != "https":
+        return False
     
-    host: str = ""
-    # Handle IPv6 bracket format [::1] or [::1]:443
-    if nox.strings.starts_with(host_port, "["):
-        ipv6_parts: list[str] = nox.strings.split(host_port, "]")
-        bracketed: str = ipv6_parts[0]
-        host = nox.strings.replace(bracketed, "[", "")
-    else:
-        host_parts: list[str] = nox.strings.split(host_port, ":")
-        host = host_parts[0]
-
-    # Normalize host to lowercase
+    # 3. Userinfo (@) in URL is forbidden (prevents credential hiding and SSRF confusion)
+    if u.userinfo != "":
+        return False
+    
+    host: str = u.host
+    if nox.strings.starts_with(host, "[") and nox.strings.ends_with(host, "]"):
+        host = nox.strings.replace(nox.strings.replace(host, "[", ""), "]", "")
+    
     host = nox.strings.lower(host)
+    if host == "":
+        return False
 
-    # 2. Reject localhost and all IPv4/IPv6 loopback addresses
-    if host == "localhost" or host == "0.0.0.0" or host == "::1" or host == "0:0:0:0:0:0:0:1":
+    # 4. Reject localhost, 0.0.0.0, and loopback
+    if host == "localhost" or host == "0.0.0.0" or host == "::1" or host == "::" or host == "0:0:0:0:0:0:0:1":
         return False
     if nox.strings.starts_with(host, "127."):
         return False
-    
-    # 3. Reject cloud metadata and link-local endpoints (RFC 3927)
+
+    # 5. Reject cloud metadata and link-local endpoints (RFC 3927)
     if host == "metadata.google.internal":
         return False
     if nox.strings.starts_with(host, "169.254."):
         return False
+
+    # 6. Reject alternative hexadecimal or octal IP representations
+    if nox.strings.contains(host, "0x") or nox.strings.contains(host, "0x"):
+        return False
     
-    # 4. Reject RFC 1918 Private IPv4 ranges
-    # 10.0.0.0/8
+    # Reject pure decimal integer IP addresses (e.g. 2130706433)
+    is_pure_digits: bool = True
+    d_i: int = 0
+    h_len: int = len(host)
+    if h_len > 0:
+        while d_i < h_len:
+            c: int = ord(host[d_i])
+            if c < 48 or c > 57:
+                is_pure_digits = False
+                break
+            d_i = d_i + 1
+        if is_pure_digits:
+            return False
+
+    # 7. Reject IPv4-mapped IPv6 addresses (RFC 4291 §2.5.5.2)
+    if nox.strings.starts_with(host, "::ffff:") or nox.strings.starts_with(host, "0:0:0:0:0:ffff:"):
+        mapped: str = nox.strings.replace(host, "::ffff:", "")
+        mapped = nox.strings.replace(mapped, "0:0:0:0:0:ffff:", "")
+        if mapped == "localhost" or mapped == "0.0.0.0" or nox.strings.starts_with(mapped, "127."):
+            return False
+        if nox.strings.starts_with(mapped, "10.") or nox.strings.starts_with(mapped, "192.168.") or nox.strings.starts_with(mapped, "169.254."):
+            return False
+        if nox.strings.starts_with(mapped, "172."):
+            return False
+
+    # 8. Reject entire IPv6 ULA (fc00::/7 -> fc or fd) and Link-Local (fe80::/10 -> fe8, fe9, fea, feb)
+    if (nox.strings.starts_with(host, "fc") or nox.strings.starts_with(host, "fd")) and nox.strings.contains(host, ":"):
+        return False
+    if (nox.strings.starts_with(host, "fe8") or nox.strings.starts_with(host, "fe9") or nox.strings.starts_with(host, "fea") or nox.strings.starts_with(host, "feb")) and nox.strings.contains(host, ":"):
+        return False
+
+    # 9. Reject RFC 1918 Private IPv4 ranges
     if nox.strings.starts_with(host, "10."):
         return False
-    # 192.168.0.0/16
     if nox.strings.starts_with(host, "192.168."):
         return False
-    # 172.16.0.0/12 (all 16 subnets: 172.16. through 172.31.)
     if nox.strings.starts_with(host, "172."):
         octets: list[str] = nox.strings.split(host, ".")
         if len(octets) >= 2:
@@ -62,12 +97,19 @@ def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
                     return False
             except ValueError:
                 return False
+    
+    # Reject dotted-decimal with leading-zero octets (octal IP representation)
+    if nox.strings.contains(host, "."):
+        all_octets: list[str] = nox.strings.split(host, ".")
+        if len(all_octets) == 4:
+            oct_idx: int = 0
+            while oct_idx < 4:
+                seg: str = all_octets[oct_idx]
+                if len(seg) > 1 and nox.strings.starts_with(seg, "0"):
+                    return False
+                oct_idx = oct_idx + 1
 
-    # 5. Reject IPv6 link-local and unique local addresses (ULA)
-    if nox.strings.starts_with(host, "fe80:") or nox.strings.starts_with(host, "fc00:") or nox.strings.starts_with(host, "fd00:"):
-        return False
-
-    # 6. Whitelisted host matching (if configured)
+    # 10. Whitelisted host matching (if configured)
     if allowed_host != "":
         if host != allowed_host:
             return False

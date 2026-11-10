@@ -59,3 +59,10 @@ try:
 except JsonFormatError:
     float_rejected = True
 nox.test.assert_true(float_rejected, "Fractional numeric field must be rejected with JsonFormatError")
+
+# 7. 64-bit Large Safe Integer Support (2^53 - 1 = 9007199254740991)
+big_json: str = "{\"large_id\":9007199254740991,\"negative_val\":-42}"
+v_big: JsonValue = parse_strict_json(big_json)
+nox.test.assert_eq_int(get_int_field(v_big, "large_id"), 9007199254740991, "2^53 - 1 safe integer matches exactly")
+nox.test.assert_eq_int(get_int_field(v_big, "negative_val"), -42, "Negative integer matches exactly")
+nox.test.assert_true(float_rejected, "Fractional numeric field must be rejected with JsonFormatError")
