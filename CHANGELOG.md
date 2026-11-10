@@ -4,6 +4,28 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL VII Architecture Audit)
+- **Hardware Acquire-Release RMW Memory Ordering in Seqlock (`keyring.nox`, `docs/architecture.md`):**
+  - Disassembled `noxrt.o` and verified that `nox_atomic_cas` (`casal` on ARM64, `lock cmpxchg` on x86_64) and `nox_atomic_add` (`ldaddal` on ARM64, `lock xadd` on x86_64) issue full hardware **Acquire-Release (`AL` / `seq_cst`) RMW barriers**, whereas `nox_atomic_load` (`ldar`) and `nox_atomic_store` (`stlr`) are one-way barriers.
+  - Upgraded `_read_consistent_state()` to use `self._seq.add(0)` for both `s1` and `s2` so normal memory loads (`st = self._state`) cannot float above `s1` or sink below `s2` on weakly-ordered architectures (ARM64).
+  - Upgraded `_commit_state()` to use `self._seq.compare_and_swap(base_ver * 2, odd_seq)` and `self._seq.compare_and_swap(odd_seq, even_next_seq)` (`casal` / `lock cmpxchg`) for full Acquire-Release barriers on both entry and exit of the Seqlock write section.
+  - Documented the single-call `st = ring.get_state()` consistency rule in `docs/architecture.md`.
+- **Cross-OS-Thread Shared `KeyRingState` Synchronization & Visibility Proof (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added `export_shared_handle() -> str`, `attach_shared_handle(handle_str: str)`, and `free_shared_handle()` to `KeyRing`, backed by 512 process-wide `nox.atomic.AtomicInt` cells (`SHARED_ATOMIC_WORDS = 512`, 3,072 bytes capacity).
+  - Pre-packs canonical state words in Phase A before entering the odd Seqlock state, and copies raw `int` words (`_read_shared_words_raw`) between `s1` and `s2` before unpacking/deserializing only after `s1 == s2`.
+  - Added **Test 12 (Cross-OS-Thread Shared `KeyRingState` Identity & Visibility Proof)** in `tests/concurrency_keyring_test.nox`, proving that when 4 parallel OS worker threads compete on `expected_version=1`, both the **Main Thread** and an independent **5th OS Reader Thread** observe `version == 2`, the winning worker's active signing `kid`, the old key demoted to `VERIFY_ONLY`, and the exact same canonical SHA-256 state seal hash.
+- **Prefix-Free Length-Prefixed Canonical Serialization & Per-Instance HMAC Seal (`keyring.nox`, `docs/threat-model.md`):**
+  - Replaced `:` and `|` delimiter concatenation in `_compute_state_seal` with an unambiguous length-prefixed canonical serializer (`_serialize_state_canonical` / `_deserialize_state_canonical` using `<decimal_byte_len>#<exact_bytes>`), eliminating delimiter injection collisions (`:`, `|`, `#`). Verified in **Test 9b**.
+  - Added per-instance `KeyRing._state_mac` (`nox.crypto.hmac_sha256` keyed with `_seal_key`) to detect full `KeyRingState` object replacement, and documented the exact in-process tamper-evident security boundary in `docs/threat-model.md`.
+- **Explicit Two-Phase Commit Linearization Point (`keyring.nox`, `docs/architecture.md`):**
+  - Separated `_commit_state()` into **Phase A (Pre-Linearization Validation & Staging — Rollback Permitted)** and **Phase B (The Linearization Point — `self._seq.compare_and_swap(odd_seq, even_next_seq)`)**. Once `committed = True`, rollback is strictly forbidden (`if not committed:`).
+- **Generative PRNG Differential IP Fuzzing (`tests/ip_fuzz_property_test.nox`):**
+  - Added **Property 5**: 1,000+ deterministic PRNG-generated IPv4, IPv6, IPv4-mapped IPv6, and CIDR boundary test cases evaluated differentially against an independent 32-bit/128-bit bitmask reference oracle (`_oracle_ipv4_restricted_u32`, `_oracle_ipv6_restricted`) and `nox.url.parse` with zero divergences.
+- **Snapshot Read & Rotation Performance Benchmark Suite (`tests/benchmark_keyring_test.nox`):**
+  - Added `tests/benchmark_keyring_test.nox` measuring 500 Seqlock `get_signing_key()` reads (~1–2 ms), 500 `get_verification_key()` lookups (~1–2 ms), 30 sequential `rotate()` commits (~2–3 ms), and 10 cross-thread shared atomic state round-trips (~1–2 ms).
+
 ## [1.0.6] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL VI Architecture Audit)

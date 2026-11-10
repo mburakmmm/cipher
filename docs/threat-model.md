@@ -66,7 +66,12 @@
 
 ---
 
-## 3. Residual Risks & Exclusions
+## 3. Residual Risks, Trust Boundaries & Exclusions
 
+- **In-Process Tamper-Evident Sealing vs. Hardware/Process Isolation:**
+  - Because NOX 2.1 does not provide a language-level `private` or `readonly` access modifier on class fields, Cipher protects `KeyRingState` and `KeyRing` with a two-layer **tamper-evident integrity check**:
+    1. `KeyRingState._integrity_hash`: A SHA-256 digest computed over an unambiguous, prefix-free length-prefixed canonical serialization (`_serialize_state_canonical` using `<decimal_byte_len>#<exact_bytes>`, immune to `:`, `|`, or `#` delimiter injection).
+    2. `KeyRing._state_mac`: A per-instance HMAC-SHA256 authentication tag (`nox.crypto.hmac_sha256(self._seal_key, st.get_seal_hash())`) verified in constant time (`nox.crypto.constant_time_eq`) on state reads.
+  - **Explicit Security Boundary:** This mechanism guarantees immediate fail-closed detection (`ConfigurationError`) of accidental or partial direct field mutations (e.g., `ring._state.version = 99`, `ring._state._keys[0].state = STATE_REVOKED`, or replacing `ring._state` with an externally constructed `KeyRingState`). However, it is a **tamper-evident integrity check**, *not* a cryptographic access-control boundary against arbitrary malicious code executing within the same OS process and address space (which could read `ring._seal_key` and overwrite both `ring._state` and `ring._state_mac`). True isolation against untrusted code requires OS process separation, WASM capability sandboxes (`--deny-capability`), or external HSM/KMS key custody.
 - **Bearer Token Theft in Transit:** Cipher cannot prevent token interception if TLS is broken or terminated insecurely by the host application.
 - **Replay Attacks:** Cipher validates time (`exp`, `nbf`), but replay prevention requires an application-level nonce store managed by Sentinel.

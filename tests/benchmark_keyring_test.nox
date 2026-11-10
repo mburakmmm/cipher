@@ -1,0 +1,68 @@
+# Cipher — KeyRing Seqlock Snapshot Read, Seal Verification & Rotation Benchmark Suite
+
+import nox.test
+import nox.time
+from cipher import KeyRef, KeyRing, KeyRingState, STATE_ACTIVE_SIGNING, STATE_PREPARED
+
+bench_ring: KeyRing = KeyRing(trust_domain="bench-domain")
+k0: KeyRef = KeyRef("k-bench-0", "HS256", "super-secret-benchmark-key-000000", trust_domain="bench-domain", state=STATE_ACTIVE_SIGNING)
+bench_ring.add_key(k0)
+
+# 1. Benchmark 500 Seqlock get_signing_key() reads (includes Acquire-Release RMW fence + SHA-256 + HMAC-SHA256 seal check)
+t0: nox.time.Instant = nox.time.instant_now()
+i: int = 0
+while i < 500:
+    sk: KeyRef = bench_ring.get_signing_key("HS256")
+    if sk.kid != "k-bench-0":
+        raise Exception("Benchmark signing key mismatch")
+    i = i + 1
+read_sign_ms: int = t0.elapsed_ms()
+nox.test.assert_true(read_sign_ms < 10000, "500 Seqlock get_signing_key() reads completed well within budget")
+
+# 2. Benchmark 500 Seqlock get_verification_key() lookups
+t1: nox.time.Instant = nox.time.instant_now()
+j: int = 0
+while j < 500:
+    vk: KeyRef = bench_ring.get_verification_key("k-bench-0", 1700000100)
+    if vk.kid != "k-bench-0":
+        raise Exception("Benchmark verification key mismatch")
+    j = j + 1
+read_ver_ms: int = t1.elapsed_ms()
+nox.test.assert_true(read_ver_ms < 10000, "500 Seqlock get_verification_key() reads completed well within budget")
+
+# 3. Benchmark 30 sequential hardware-atomic KeyRing.rotate() commits with canonical serialization
+t2: nox.time.Instant = nox.time.instant_now()
+r: int = 1
+while r <= 30:
+    nk: KeyRef = KeyRef("k-bench-" + str(r), "HS256", "super-secret-benchmark-key-rot-32", trust_domain="bench-domain", state=STATE_PREPARED)
+    bench_ring.rotate(nk, overlap_seconds=600, clock_time_sec=1700000000 + r, expected_version=r)
+    r = r + 1
+rot_ms: int = t2.elapsed_ms()
+nox.test.assert_eq_int(bench_ring.get_version(), 31, "30 sequential rotations reached version 31")
+nox.test.assert_true(rot_ms < 10000, "30 sequential rotations completed well within budget")
+
+# 4. Benchmark Cross-Thread Shared Atomic State Round-Trip Sync
+sh_ring: KeyRing = KeyRing(trust_domain="bench-shared")
+sh_ring.add_key(KeyRef("k-sh-0", "HS256", "super-secret-benchmark-shared-32b", trust_domain="bench-shared", state=STATE_ACTIVE_SIGNING))
+sh_handle: str = sh_ring.export_shared_handle()
+
+t3: nox.time.Instant = nox.time.instant_now()
+reader_ring: KeyRing = KeyRing(trust_domain="bench-shared")
+reader_ring.attach_shared_handle(sh_handle)
+s_idx: int = 1
+while s_idx <= 10:
+    sh_ring.rotate(
+        KeyRef("k-sh-" + str(s_idx), "HS256", "super-secret-benchmark-shared-32b", trust_domain="bench-shared", state=STATE_PREPARED),
+        overlap_seconds=300,
+        clock_time_sec=1800000000 + s_idx,
+        expected_version=s_idx
+    )
+    synced_signer: KeyRef = reader_ring.get_signing_key("HS256")
+    if synced_signer.kid != ("k-sh-" + str(s_idx)):
+        raise Exception("Shared atomic state sync mismatch")
+    s_idx = s_idx + 1
+shared_sync_ms: int = t3.elapsed_ms()
+sh_ring.free_shared_handle()
+nox.test.assert_true(shared_sync_ms < 10000, "10 cross-thread shared atomic state round-trips completed well within budget")
+
+print("benchmark_keyring_test passed! (sign_500=" + str(read_sign_ms) + "ms, verify_500=" + str(read_ver_ms) + "ms, rotate_30=" + str(rot_ms) + "ms, shared_sync_10=" + str(shared_sync_ms) + "ms)")

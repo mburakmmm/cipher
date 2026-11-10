@@ -1,5 +1,6 @@
 # Cipher — Property-Based & Adversarial Fuzz Test Suite for IPv4/IPv6 Parsers & SSRF Policy
 
+import nox.url
 from cipher import EncodingError, IPv4Address, IPv6Address, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, verify_resolved_ip
 
 def _nibble_to_hex(n: int, upper: bool) -> str:
@@ -315,5 +316,149 @@ while b_idx < len(base_octets):
     _assert_malformed_rejected(c5)
     _assert_malformed_rejected(c6)
     b_idx = b_idx + 1
+
+# ==============================================================================
+# Property 5: Generative PRNG Differential Fuzzing (1,100+ Cases) against
+# Independent 32-bit/128-bit Bitmask Reference Oracle & nox.url.parse (0.13.5)
+# ==============================================================================
+def _oracle_ipv4_restricted_u32(o0: int, o1: int, o2: int, o3: int) -> bool:
+    u32: int = ((o0 & 255) << 24) | ((o1 & 255) << 16) | ((o2 & 255) << 8) | (o3 & 255)
+    if (u32 & 4278190080) == 0:           # 0.0.0.0/8       (0xFF000000)
+        return True
+    if (u32 & 4278190080) == 167772160:   # 10.0.0.0/8      (0x0A000000)
+        return True
+    if (u32 & 4290772992) == 1681915904:  # 100.64.0.0/10   (0xFFC00000 == 0x64400000)
+        return True
+    if (u32 & 4278190080) == 2130706432:  # 127.0.0.0/8     (0x7F000000)
+        return True
+    if (u32 & 4294901760) == 2851995648:  # 169.254.0.0/16  (0xA9FE0000)
+        return True
+    if (u32 & 4293918720) == 2886729728:  # 172.16.0.0/12   (0xFFF00000 == 0xAC100000)
+        return True
+    if (u32 & 4294967040) == 3221225472:  # 192.0.0.0/24    (0xC0000000)
+        return True
+    if (u32 & 4294967040) == 3221225984:  # 192.0.2.0/24    (0xC0000200)
+        return True
+    if (u32 & 4294967040) == 3227017984:  # 192.88.99.0/24  (0xC0586300)
+        return True
+    if (u32 & 4294901760) == 3232235520:  # 192.168.0.0/16  (0xC0A80000)
+        return True
+    if (u32 & 4294836224) == 3323068416:  # 198.18.0.0/15   (0xFFFE0000 == 0xC6120000)
+        return True
+    if (u32 & 4294967040) == 3325256704:  # 198.51.100.0/24 (0xC6336400)
+        return True
+    if (u32 & 4294967040) == 3405803776:  # 203.0.113.0/24  (0xCB007100)
+        return True
+    if (u32 & 3758096384) == 3758096384:  # 224.0.0.0/3     (0xE0000000)
+        return True
+    return False
+
+def _oracle_ipv6_restricted(h0: int, h1: int, h2: int, h3: int, h4: int, h5: int, h6: int, h7: int) -> bool:
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0 and h6 == 0 and (h7 == 0 or h7 == 1):
+        return True
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 65535:
+        return _oracle_ipv4_restricted_u32((h6 >> 8) & 255, h6 & 255, (h7 >> 8) & 255, h7 & 255)
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0:
+        return True
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 65535 and h5 == 0:
+        return True
+    if h0 == 100 and h1 == 65435:
+        return True
+    if h0 == 256 and h1 == 0 and h2 == 0 and h3 == 0:
+        return True
+    if h0 == 8194:
+        return True
+    if h0 == 8193 and (h1 & 65024) == 0:
+        return True
+    if h0 == 8193 and h1 == 2 and h2 == 0:
+        return True
+    if h0 == 8193 and h1 == 3512:
+        return True
+    if h0 == 16383 and (h1 & 61440) == 0:
+        return True
+    if (h0 & 65024) == 64512:
+        return True
+    if (h0 & 65472) == 65152:
+        return True
+    if (h0 & 65472) == 65216:
+        return True
+    if (h0 & 65280) == 65280:
+        return True
+    return False
+
+prng_seed: int = 2463534242
+fuzz_i: int = 0
+while fuzz_i < 600:
+    # Deterministic LCG/xorshift step
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    o0: int = (prng_seed >> 16) & 255
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    o1: int = (prng_seed >> 16) & 255
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 1073741823
+    o2: int = (prng_seed >> 8) & 255
+    o3: int = prng_seed & 255
+
+    # Inject boundary prefixes every 4th iteration to stress CIDR edges
+    if (fuzz_i & 3) == 0:
+        edge_prefixes: list[int] = [0, 10, 100, 127, 169, 172, 192, 198, 203, 224, 240, 8]
+        o0 = edge_prefixes[fuzz_i % len(edge_prefixes)]
+
+    ip_s: str = str(o0) + "." + str(o1) + "." + str(o2) + "." + str(o3)
+    oracle_res: bool = _oracle_ipv4_restricted_u32(o0, o1, o2, o3)
+    cipher_p4: IPv4Address = parse_ipv4(ip_s)
+    cipher_res: bool = is_restricted_ipv4_addr(cipher_p4)
+
+    if cipher_res != oracle_res:
+        raise Exception("Property 5 differential mismatch on IPv4: " + ip_s)
+    if verify_resolved_ip(ip_s) == oracle_res:
+        raise Exception("Property 5 verify_resolved_ip mismatch on IPv4: " + ip_s)
+    if verify_resolved_ip("::ffff:" + ip_s) == oracle_res:
+        raise Exception("Property 5 mapped IPv6 differential mismatch on: ::ffff:" + ip_s)
+
+    # Differential check with nox.url.parse + is_safe_jwks_url
+    u_str: str = "https://" + ip_s + "/.well-known/jwks.json"
+    parsed_u: nox.url.URL = nox.url.parse(u_str)
+    if parsed_u.host != ip_s:
+        raise Exception("Property 5 nox.url.parse host mismatch on: " + ip_s)
+    if is_safe_jwks_url(u_str) == oracle_res:
+        raise Exception("Property 5 is_safe_jwks_url differential mismatch on: " + u_str)
+
+    fuzz_i = fuzz_i + 1
+
+v6_fuzz_i: int = 0
+while v6_fuzz_i < 400:
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    h0: int = prng_seed & 65535
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    h1: int = prng_seed & 65535
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    h2: int = prng_seed & 65535
+    h3: int = (prng_seed >> 8) & 65535
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    h4: int = prng_seed & 65535
+    h5: int = (prng_seed >> 7) & 65535
+    prng_seed = ((prng_seed * 1103515245) + 12345) & 2147483647
+    h6: int = prng_seed & 65535
+    h7: int = (prng_seed >> 5) & 65535
+
+    if (v6_fuzz_i & 3) == 0:
+        v6_edges: list[int] = [0, 100, 8193, 8194, 16368, 64512, 65152, 65216, 65280, 9728]
+        h0 = v6_edges[v6_fuzz_i % len(v6_edges)]
+
+    v6_s: str = _u16_to_hex4(h0, False) + ":" + _u16_to_hex4(h1, True) + ":" + _u16_to_hex4(h2, False) + ":" + _u16_to_hex4(h3, True) + ":" + _u16_to_hex4(h4, False) + ":" + _u16_to_hex4(h5, True) + ":" + _u16_to_hex4(h6, False) + ":" + _u16_to_hex4(h7, False)
+    oracle_v6: bool = _oracle_ipv6_restricted(h0, h1, h2, h3, h4, h5, h6, h7)
+    cipher_p6: IPv6Address = parse_ipv6(v6_s)
+    cipher_v6: bool = is_restricted_ipv6_addr(cipher_p6)
+
+    if cipher_v6 != oracle_v6:
+        raise Exception("Property 5 differential mismatch on IPv6: " + v6_s)
+    if verify_resolved_ip(v6_s) == oracle_v6:
+        raise Exception("Property 5 verify_resolved_ip mismatch on IPv6: " + v6_s)
+
+    v6_url: str = "https://[" + v6_s + "]/jwks.json"
+    if is_safe_jwks_url(v6_url) == oracle_v6:
+        raise Exception("Property 5 is_safe_jwks_url mismatch on IPv6 URL: " + v6_url)
+
+    v6_fuzz_i = v6_fuzz_i + 1
 
 print("ip_fuzz_property_test passed!")

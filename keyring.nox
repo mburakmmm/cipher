@@ -1,6 +1,8 @@
 # Cipher — KeyRing & Safe Key Lifecycle Management
 # Enforces trust domain isolation, unique kid indexing, zero dual-active signers,
-# tamper-evident SHA-256 snapshot sealing, Seqlock coherent reads, and exception-safe hardware atomic CAS.
+# length-prefixed canonical SHA-256 + HMAC-SHA256 tamper-evident sealing,
+# hardware Acquire-Release Seqlock coherent reads, explicit commit linearization,
+# and cross-OS-thread shared atomic state synchronization.
 
 import nox.atomic
 import nox.crypto
@@ -10,15 +12,117 @@ from cipher.errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableE
 from cipher.keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
 from cipher.rotation import RotationReceipt
 
-def _compute_state_seal(version: int, keys: list[KeyRef], created_at: int) -> str:
-    raw: str = "CIPHER-KR-SEAL-V1|" + str(version) + "|" + str(created_at) + "|" + str(len(keys))
+SHARED_ATOMIC_WORDS: int = 512      # 512 * 6 = 3072 bytes cross-thread shared atomic state capacity
+MAX_SEQLOCK_ATTEMPTS: int = 2000000 # High spin ceiling for OS thread preemption resilience
+
+def _pack_shared_words(canon: str, max_words: int) -> list[int]:
+    n: int = len(canon)
+    max_bytes: int = max_words * 6
+    if n > max_bytes:
+        raise ConfigurationError("Shared atomic state capacity exceeded (" + str(n) + " > " + str(max_bytes) + " bytes)")
+    words: list[int] = []
+    pos: int = 0
+    while pos < n:
+        word: int = 0
+        b_idx: int = 0
+        while b_idx < 6 and (pos + b_idx) < n:
+            b_val: int = ord(canon[pos + b_idx]) & 255
+            word = word | (b_val << (b_idx * 8))
+            b_idx = b_idx + 1
+        words.append(word)
+        pos = pos + 6
+    return words
+
+def _unpack_shared_words(words: list[int], byte_len: int) -> str:
+    out: str = ""
+    w_idx: int = 0
+    pos: int = 0
+    n_words: int = len(words)
+    while pos < byte_len and w_idx < n_words:
+        word: int = words[w_idx]
+        b_idx: int = 0
+        while b_idx < 6 and (pos + b_idx) < byte_len:
+            ch_code: int = (word >> (b_idx * 8)) & 255
+            out = out + chr(ch_code)
+            b_idx = b_idx + 1
+        w_idx = w_idx + 1
+        pos = pos + 6
+    return out
+
+def _lp(val: str) -> str:
+    return str(len(val)) + "#" + val
+
+def _serialize_state_canonical(version: int, keys: list[KeyRef], created_at: int) -> str:
+    # Unambiguous prefix-free length-prefixed canonical serialization (<decimal_byte_len>#<exact_bytes>).
+    # Immune to delimiter injection (':', '|', '#') across all KeyRef fields.
+    raw: str = "CIPHER-KR-CANON-V2#" + _lp(str(version)) + _lp(str(created_at)) + _lp(str(len(keys)))
     i: int = 0
     n: int = len(keys)
     while i < n:
         k: KeyRef = keys[i]
-        raw = raw + "|" + k.kid + ":" + k.algorithm + ":" + k.state + ":" + k.trust_domain + ":" + str(k.activated_at) + ":" + str(k.retire_at) + ":" + k.secret_material
+        raw = raw + _lp(k.kid) + _lp(k.algorithm) + _lp(k.secret_material) + _lp(k.trust_domain) + _lp(k.state) + _lp(str(k.activated_at)) + _lp(str(k.retire_at))
         i = i + 1
-    return nox.crypto.sha256(raw)
+    return raw
+
+def _compute_state_seal(version: int, keys: list[KeyRef], created_at: int) -> str:
+    return nox.crypto.sha256(_serialize_state_canonical(version, keys, created_at))
+
+class _CanonCursor:
+    raw: str
+    pos: int
+    n: int
+
+    def __init__(self, raw: str, start_pos: int) -> None:
+        self.raw = raw
+        self.pos = start_pos
+        self.n = len(raw)
+
+    def next_str(self) -> str:
+        if self.pos >= self.n:
+            raise ConfigurationError("Canonical state deserialization error: unexpected end of stream")
+        len_val: int = 0
+        has_digits: bool = False
+        while self.pos < self.n and self.raw[self.pos] != "#":
+            c: int = ord(self.raw[self.pos])
+            if c < 48 or c > 57:
+                raise ConfigurationError("Canonical state deserialization error: invalid length prefix")
+            len_val = len_val * 10 + (c - 48)
+            has_digits = True
+            self.pos = self.pos + 1
+        if not has_digits or self.pos >= self.n or self.raw[self.pos] != "#":
+            raise ConfigurationError("Canonical state deserialization error: missing '#' delimiter")
+        self.pos = self.pos + 1
+        if self.pos + len_val > self.n:
+            raise ConfigurationError("Canonical state deserialization error: truncated field payload")
+        out: str = ""
+        i: int = 0
+        while i < len_val:
+            out = out + self.raw[self.pos + i]
+            i = i + 1
+        self.pos = self.pos + len_val
+        return out
+
+    def next_int(self) -> int:
+        s: str = self.next_str()
+        if len(s) == 0:
+            raise ConfigurationError("Canonical state deserialization error: empty integer token")
+        val: int = 0
+        idx: int = 0
+        neg: bool = False
+        if s[0] == "-":
+            neg = True
+            idx = 1
+            if len(s) == 1:
+                raise ConfigurationError("Canonical state deserialization error: invalid negative integer")
+        while idx < len(s):
+            c: int = ord(s[idx])
+            if c < 48 or c > 57:
+                raise ConfigurationError("Canonical state deserialization error: non-digit in integer token")
+            val = val * 10 + (c - 48)
+            idx = idx + 1
+        if neg:
+            return -val
+        return val
 
 class KeyRingState:
     version: int
@@ -38,6 +142,9 @@ class KeyRingState:
         self._keys = cloned
         self.created_at = created_at
         self._integrity_hash = _compute_state_seal(self.version, self._keys, self.created_at)
+
+    def get_seal_hash(self) -> str:
+        return self._integrity_hash
 
     def verify_integrity(self) -> None:
         expected: str = _compute_state_seal(self.version, self._keys, self.created_at)
@@ -59,12 +166,60 @@ class KeyRingState:
         self.verify_integrity()
         return len(self._keys)
 
+def _deserialize_state_canonical(raw: str) -> KeyRingState:
+    if not nox.strings.starts_with(raw, "CIPHER-KR-CANON-V2#"):
+        raise ConfigurationError("Canonical state deserialization error: invalid header")
+    cur: _CanonCursor = _CanonCursor(raw, 19)
+    ver: int = cur.next_int()
+    created_at: int = cur.next_int()
+    k_count: int = cur.next_int()
+    if k_count < 0 or k_count > 1024:
+        raise ConfigurationError("Canonical state deserialization error: invalid key count")
+    k_list: list[KeyRef] = []
+    i: int = 0
+    while i < k_count:
+        kid: str = cur.next_str()
+        alg: str = cur.next_str()
+        sec: str = cur.next_str()
+        dom: str = cur.next_str()
+        st_str: str = cur.next_str()
+        act_at: int = cur.next_int()
+        ret_at: int = cur.next_int()
+        kr: KeyRef = KeyRef(kid, alg, sec, trust_domain=dom, state=st_str, activated_at=act_at, retire_at=ret_at)
+        k_list.append(kr)
+        i = i + 1
+    if cur.pos != cur.n:
+        raise ConfigurationError("Canonical state deserialization error: trailing bytes in stream")
+    res: KeyRingState = KeyRingState(ver, k_list, created_at)
+    res.verify_integrity()
+    return res
+
+def _parse_handle_int(s: str) -> int:
+    if len(s) == 0:
+        raise ConfigurationError("Invalid empty atomic handle string")
+    val: int = 0
+    i: int = 0
+    n: int = len(s)
+    while i < n:
+        c: int = ord(s[i])
+        if c < 48 or c > 57:
+            raise ConfigurationError("Non-digit character in atomic handle string")
+        val = val * 10 + (c - 48)
+        i = i + 1
+    return val
+
 class KeyRing:
     trust_domain: str
     _state: KeyRingState
+    _seal_key: str
+    _state_mac: str
     _write_lock: nox.atomic.AtomicBool
     _seq: nox.atomic.AtomicInt
     _atomic_version: nox.atomic.AtomicInt
+    _shared_attached: bool
+    _shared_synced_seq: int
+    _shared_len: nox.atomic.AtomicInt
+    _shared_cells: list[nox.atomic.AtomicInt]
 
     def __init__(self, trust_domain: str = "default") -> None:
         self.trust_domain = trust_domain
@@ -73,6 +228,15 @@ class KeyRing:
         self._write_lock = nox.atomic.new_bool(False)
         self._seq = nox.atomic.new_int(0)
         self._atomic_version = nox.atomic.new_int(0)
+        # Per-KeyRing HMAC authentication key bound to unique runtime atomic cell addresses
+        seed_material: str = "CIPHER-KR-HMAC-V2|" + trust_domain + "|" + str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle)
+        self._seal_key = nox.crypto.sha256(seed_material)
+        self._state_mac = nox.crypto.hmac_sha256(self._seal_key, self._state.get_seal_hash())
+        self._shared_attached = False
+        self._shared_synced_seq = 0
+        self._shared_len = nox.atomic.from_int_handle(0)
+        empty_cells: list[nox.atomic.AtomicInt] = []
+        self._shared_cells = empty_cells
 
     def get_lock_handle(self) -> int:
         return self._write_lock.handle
@@ -88,21 +252,131 @@ class KeyRing:
         self._seq = nox.atomic.from_int_handle(seq_handle)
         self._atomic_version = nox.atomic.from_int_handle(ver_handle)
 
+    def _write_shared_words(self, words: list[int], byte_len: int) -> None:
+        w_idx: int = 0
+        n_words: int = len(words)
+        while w_idx < n_words:
+            self._shared_cells[w_idx].store(words[w_idx])
+            w_idx = w_idx + 1
+        self._shared_len.store(byte_len)
+
+    def _read_shared_words_raw(self, byte_len: int) -> list[int]:
+        # Pure integer loads between s1 and s2: never throws on torn intermediate reads
+        words: list[int] = []
+        max_words: int = len(self._shared_cells)
+        if byte_len <= 0 or byte_len > (max_words * 6):
+            return words
+        n_words: int = (byte_len + 5) // 6
+        w_idx: int = 0
+        while w_idx < n_words:
+            words.append(self._shared_cells[w_idx].add(0))
+            w_idx = w_idx + 1
+        return words
+
+    def export_shared_handle(self) -> str:
+        # Initializes process-wide shared atomic state cells so multiple OS threads
+        # share the exact same KeyRingState under the Seqlock protocol.
+        st: KeyRingState = self._read_consistent_state()
+        if not self._shared_attached:
+            self._shared_len = nox.atomic.new_int(0)
+            cells: list[nox.atomic.AtomicInt] = []
+            i: int = 0
+            while i < SHARED_ATOMIC_WORDS:
+                cells.append(nox.atomic.new_int(0))
+                i = i + 1
+            self._shared_cells = cells
+            canon: str = _serialize_state_canonical(st.version, st.get_keys(), st.created_at)
+            packed: list[int] = _pack_shared_words(canon, len(self._shared_cells))
+            self._write_shared_words(packed, len(canon))
+            self._shared_synced_seq = st.version * 2
+            self._shared_attached = True
+
+        cell_parts: str = ""
+        idx: int = 0
+        while idx < len(self._shared_cells):
+            if idx > 0:
+                cell_parts = cell_parts + ","
+            cell_parts = cell_parts + str(self._shared_cells[idx].handle)
+            idx = idx + 1
+        return str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle) + "|" + str(self._shared_len.handle) + "|" + self._seal_key + "|" + cell_parts
+
+    def attach_shared_handle(self, handle_str: str) -> None:
+        parts: list[str] = nox.strings.split(handle_str, "|")
+        if len(parts) != 6:
+            raise ConfigurationError("Invalid shared KeyRing handle format")
+        lock_h: int = _parse_handle_int(parts[0])
+        seq_h: int = _parse_handle_int(parts[1])
+        ver_h: int = _parse_handle_int(parts[2])
+        len_h: int = _parse_handle_int(parts[3])
+        seal_k: str = parts[4]
+        cell_strs: list[str] = nox.strings.split(parts[5], ",")
+        if len(cell_strs) == 0:
+            raise ConfigurationError("Empty shared cell handle list")
+
+        cells: list[nox.atomic.AtomicInt] = []
+        i: int = 0
+        while i < len(cell_strs):
+            cells.append(nox.atomic.from_int_handle(_parse_handle_int(cell_strs[i])))
+            i = i + 1
+
+        self._write_lock = nox.atomic.from_bool_handle(lock_h)
+        self._seq = nox.atomic.from_int_handle(seq_h)
+        self._atomic_version = nox.atomic.from_int_handle(ver_h)
+        self._shared_len = nox.atomic.from_int_handle(len_h)
+        self._seal_key = seal_k
+        self._shared_cells = cells
+        self._shared_synced_seq = -1
+        self._shared_attached = True
+        # Immediately synchronize local snapshot from shared atomic cells via Seqlock
+        _synced: KeyRingState = self._read_consistent_state()
+
+    def free_shared_handle(self) -> None:
+        if self._shared_attached:
+            i: int = 0
+            while i < len(self._shared_cells):
+                self._shared_cells[i].free()
+                i = i + 1
+            self._shared_len.free()
+            self._shared_attached = False
+
     def _read_consistent_state(self) -> KeyRingState:
-        # Seqlock + Single-Truth Snapshot Reader Protocol
-        # Guarantees that version and key snapshot are always observed as a coherent atomic unit.
+        # Seqlock + Hardware Acquire-Release RMW Reader Protocol
+        # Uses self._seq.add(0) which compiles to 'ldaddal' on ARM64 and 'lock xadd' on x86_64:
+        # - Acquire semantics on s1 prevent subsequent loads of _state / _shared_cells from floating above s1.
+        # - Release semantics on s2 prevent prior loads of _state / _shared_cells from sinking below s2.
         attempts: int = 0
-        while attempts < 1024:
-            s1: int = self._seq.load()
+        while attempts < MAX_SEQLOCK_ATTEMPTS:
+            s1: int = self._seq.add(0)
             if (s1 & 1) != 0:
                 attempts = attempts + 1
                 continue
             st: KeyRingState = self._state
-            s2: int = self._seq.load()
+            need_shared_unpack: bool = False
+            raw_len: int = 0
+            raw_words: list[int] = []
+            if self._shared_attached:
+                if st.version != (s1 >> 1) or self._shared_synced_seq != s1:
+                    need_shared_unpack = True
+                    raw_len = self._shared_len.add(0)
+                    raw_words = self._read_shared_words_raw(raw_len)
+            s2: int = self._seq.add(0)
             if s1 == s2:
+                if need_shared_unpack:
+                    if raw_len <= 0 or len(raw_words) == 0:
+                        raise ConfigurationError("KeyRing shared state length invalid")
+                    canon_str: str = _unpack_shared_words(raw_words, raw_len)
+                    st = _deserialize_state_canonical(canon_str)
                 st.verify_integrity()
+                expected_mac: str = nox.crypto.hmac_sha256(self._seal_key, st.get_seal_hash())
+                if not self._shared_attached:
+                    if not nox.crypto.constant_time_eq(expected_mac, self._state_mac):
+                        raise ConfigurationError("KeyRingState integrity violation: unauthorized state replacement detected")
                 if st.version != (s1 >> 1):
                     raise ConfigurationError("KeyRing state version desynchronization detected")
+                if self._shared_attached and self._shared_synced_seq != s1:
+                    self._state = st
+                    self._state_mac = expected_mac
+                    self._shared_synced_seq = s1
                 return st
             attempts = attempts + 1
         raise ConfigurationError("KeyRing read contention timeout: writer active in critical section")
@@ -124,42 +398,81 @@ class KeyRing:
         self._write_lock.store(False)
 
     def _commit_state(self, base_ver: int, new_state: KeyRingState) -> None:
-        # 1. Hardware Atomic Writer Mutex Acquisition (nox_atomic_cas on AtomicBool)
+        # 1. Hardware Atomic Writer Mutex Acquisition (nox_atomic_cas on AtomicBool: casal / lock cmpxchg)
         if not self._write_lock.compare_and_swap(False, True):
             raise ConfigurationError("Concurrent modification in progress: writer mutex lock contention")
 
         prev_state: KeyRingState = self._state
+        prev_mac: str = self._state_mac
         cas_won: bool = False
+        seq_odd_entered: bool = False
+        committed: bool = False
+        odd_seq: int = base_ver * 2 + 1
+        even_next_seq: int = (base_ver + 1) * 2
+        packed_prev: list[int] = []
+        canon_prev_len: int = 0
         try:
-            # 2. Verify snapshot seal integrity and base version under exclusive writer lock
+            # ==================================================================
+            # PHASE A: Pre-Linearization Validation & Staging (Rollback Permitted)
+            # ==================================================================
             prev_state.verify_integrity()
             new_state.verify_integrity()
             if prev_state.version != base_ver or new_state.version != (base_ver + 1):
                 raise ConfigurationError("Concurrent modification detected: state version mismatch (expected " + str(base_ver) + ")")
 
-            # 3. Hardware Atomic Compare-And-Swap on Version (nox_atomic_cas on AtomicInt)
+            packed_new: list[int] = []
+            canon_new_len: int = 0
+            if self._shared_attached:
+                canon_new: str = _serialize_state_canonical(new_state.version, new_state.get_keys(), new_state.created_at)
+                canon_new_len = len(canon_new)
+                packed_new = _pack_shared_words(canon_new, len(self._shared_cells))
+                canon_prev: str = _serialize_state_canonical(prev_state.version, prev_state.get_keys(), prev_state.created_at)
+                canon_prev_len = len(canon_prev)
+                packed_prev = _pack_shared_words(canon_prev, len(self._shared_cells))
+
+            new_mac: str = nox.crypto.hmac_sha256(self._seal_key, new_state.get_seal_hash())
+
+            # Hardware Atomic Compare-And-Swap on Version (casal / lock cmpxchg)
             if not self._atomic_version.compare_and_swap(base_ver, base_ver + 1):
                 raise ConfigurationError("Concurrent modification detected: atomic CAS version mismatch (expected " + str(base_ver) + ")")
             cas_won = True
 
-            # 4. Enter Seqlock write section (odd sequence value signals in-flight state transition)
-            self._seq.store(base_ver * 2 + 1)
+            # Enter Seqlock write section with full Acquire-Release RMW fence (casal / lock cmpxchg)
+            if not self._seq.compare_and_swap(base_ver * 2, odd_seq):
+                raise ConfigurationError("Concurrent modification detected: Seqlock entry CAS mismatch")
+            seq_odd_entered = True
 
-            # 5. Publish new unified KeyRingState reference FIRST
+            # Stage new state while _seq is odd (invisible to Seqlock readers)
             self._state = new_state
+            self._state_mac = new_mac
+            if self._shared_attached:
+                self._write_shared_words(packed_new, canon_new_len)
+                self._shared_synced_seq = even_next_seq
 
-            # 6. Seal Seqlock write section (even sequence value = 2 * new_state.version)
-            self._seq.store((base_ver + 1) * 2)
+            # ==================================================================
+            # PHASE B: Linearization Point (Irreversible Commit)
+            # ==================================================================
+            # Single hardware Acquire-Release RMW instruction (casal / lock cmpxchg) sealing _seq to even_next_seq.
+            # Once this instruction succeeds, the commit is linearized and rollback is strictly forbidden.
+            if not self._seq.compare_and_swap(odd_seq, even_next_seq):
+                raise ConfigurationError("Seqlock linearization CAS failure")
+            committed = True
         except Exception as err:
-            # Exception-safe rollback (only if this writer won CAS) & guaranteed writer lock release
-            if cas_won:
-                self._state = prev_state
-                self._atomic_version.store(base_ver)
-                self._seq.store(base_ver * 2)
+            # Rollback is strictly permitted ONLY before the Linearization Point (committed == False)
+            if not committed:
+                if cas_won:
+                    self._state = prev_state
+                    self._state_mac = prev_mac
+                    if self._shared_attached and canon_prev_len > 0:
+                        self._write_shared_words(packed_prev, canon_prev_len)
+                        self._shared_synced_seq = base_ver * 2
+                    self._atomic_version.store(base_ver)
+                if seq_odd_entered:
+                    self._seq.store(base_ver * 2)
             self._write_lock.store(False)
             raise ConfigurationError(str(err))
 
-        # 7. Release Hardware Writer Mutex
+        # Release Hardware Writer Mutex after Linearization Point
         self._write_lock.store(False)
 
     def add_key(self, key: KeyRef, expected_version: int = -1) -> None:

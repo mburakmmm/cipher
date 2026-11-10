@@ -705,3 +705,49 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.6` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.6` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 13 — `v1.0.7` Hardware Seqlock Acquire-Release Ordering, Cross-Thread Shared State Proof, Canonical Length-Prefixed Sealing, Linearization Point & Differential IP Fuzzing (SOL VII Analizi)
+
+**Amaç:** Yedinci bağımsız teknik incelemede (GPT 6 SOL VII analizi) tespit edilen mimari sınırları, bellek sıralama garantilerini ve doğrulama kanıtlarını eksiksiz tamamlamak:
+1. **P0 — Seqlock Bellek Sıralama Garantileri (`keyring.nox`, `docs/architecture.md`):** `noxrt.o` donanım atomik talimatlarını (`casal` / `ldaddal` ARM64, `lock cmpxchg` / `lock xadd` x86_64) kullanarak Seqlock okuma ve yazma geçişlerinde tam **Acquire-Release RMW bellek bariyeri** (`_seq.add(0)` ve `_seq.compare_and_swap(...)`) uygulamak; `_state` okumalarının `s2` sonrasına veya `_state` yazmalarının tek sayılı `_seq` öncesine yeniden sıralanmasını donanım seviyesinde engellemek.
+2. **P0 — Paralel OS Thread’lerinin Aynı `KeyRing` State’ini Paylaştığını Kanıtlama (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `KeyRing` içerisine süreç-geneli paylaşılan atomik bellek hücreleri (`export_shared_handle()` / `attach_shared_handle()` / `free_shared_handle()`) ekleyerek QBE shared-nothing OS iş parçacıkları arasında yalnız kilit/versiyon değil, **gerçek kanonik `KeyRingState` verisinin** paylaşılmasını sağlamak ve bir worker thread'de yapılan `rotate()` işleminin ana thread ve bağımsız bir okuyucu thread tarafından anında gözlemlendiğini kanıtlamak.
+3. **P1 — Kanonik Uzunluk-Önekli (Length-Prefixed) State Serileştirme ve HMAC/SHA-256 Mührü (`keyring.nox`, `docs/threat-model.md`):** `:` ve `|` ayraç enjeksiyonu / çakışma riskini tamamen ortadan kaldıran `<byte_len>#<değer>` uzunluk-önekli kanonik serileştirme (`_serialize_state_canonical` / `_deserialize_state_canonical`) uygulamak; `KeyRing` düzeyinde CSPRNG anahtarlı HMAC-SHA256 doğrulaması eklemek ve SHA-256 mührünün dil içi *tamper-evident integrity check* sınırını `docs/threat-model.md` içinde netleştirmek.
+4. **P1 — Açık Commit Linearization Point Tanımı (`keyring.nox`, `docs/architecture.md`):** `_commit_state()` işlemini **Faz A (Pre-Linearization Hazırlık & Staging)** ve **Faz B (Linearization Point — `_seq.compare_and_swap(odd, even)`)** olarak ikiye ayırmak; Linearization Point geçildikten sonra (`committed = True`) rollback yapılmasını kesin olarak yasaklamak.
+5. **P1 — Bağımsız Bitmask Referans Kahini (Oracle) ve `nox.url` ile Differential IP Fuzzing (`tests/ip_fuzz_property_test.nox`):** Deterministik PRNG tabanlı 1.000+ rastgele/mutasyonlu IPv4, IPv6 ve IPv4-mapped IPv6 girdisini bağımsız 32-bit/128-bit bitmask referans kahini (oracle) ve `nox.url.parse` ile karşılaştıran differential fuzzing katmanı eklemek.
+6. **P2 — Snapshot Okuma ve Doğrulama Performans Benchmark Paketi (`tests/benchmark_keyring_test.nox`):** Seqlock snapshot okuma (`get_state`, `get_signing_key`, `get_verification_key`), kanonik mühür doğrulama ve anahtar rotasyon gecikme/verim (throughput) ölçümlerini içeren benchmark testi oluşturmak ve `v1.0.7` sürümünü yayınlamak.
+
+## 0.13.1 — P0: Seqlock Donanım Acquire-Release Bellek Sıralama Bariyerleri (`keyring.nox`, `docs/architecture.md`)
+- [x] `_read_consistent_state()` içinde tek yönlü `_seq.load()` (`ldar`) yerine tam Acquire-Release RMW bariyeri sağlayan `self._seq.add(0)` (`ldaddal` ARM64 / `lock xadd` x86_64) kullan; böylece `st = self._state` okuması ne `s1` öncesine ne de `s2` sonrasına yeniden sıralanabilsin.
+- [x] `_commit_state()` içinde Seqlock tek sayıya geçişte `self._seq.compare_and_swap(base_ver * 2, base_ver * 2 + 1)` (`casal`) ve çift sayıya geçişte `self._seq.compare_and_swap(base_ver * 2 + 1, (base_ver + 1) * 2)` (`casal`) kullanarak tam Acquire-Release donanım bariyeri uygula.
+- [x] `docs/architecture.md` içinde ARM64 (`casal`, `ldaddal`, `ldar`, `stlr`) ve x86_64 (`lock cmpxchg`, `lock xadd`) bellek sıralama garantilerini ve çoklu alan okurken tek `st = ring.get_state()` çağrısı kullanılması gerektiğini belgele.
+
+## 0.13.2 — P0: Çapraz OS Thread Paylaşımlı `KeyRingState` Senkronizasyonu ve Görünürlük Kanıtı (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `KeyRing` içerisine süreç-geneli `nox.atomic.AtomicInt` kelime dizisi tabanlı paylaşımlı durum alanı (`export_shared_handle() -> str`, `attach_shared_handle(handle_str: str) -> None`, `free_shared_handle() -> None`) ekle.
+- [x] Paylaşımlı mod aktifken `_commit_state()` içinde kanonik serileştirilmiş `KeyRingState` verisini Seqlock tek sayılı fazda paylaşımlı atomik hücrelere yaz; `_read_consistent_state()` içinde ise yerel `_state.version != (s1 >> 1)` olduğunda paylaşımlı atomik hücrelerden ham kelimeleri okuyup `s1 == s2` doğrulandıktan sonra kanonik `KeyRingState` nesnesini oluştur ve bütünlük mührünü doğrula.
+- [x] `tests/concurrency_keyring_test.nox` içerisine **Test 12 (Cross-OS-Thread Shared State Identity & Visibility Proof)** ekle: 4 paralel OS worker iş parçacığı `rotate()` için yarışsın, kazanan worker'ın ürettiği yeni `kid` ve `version == 2` durumunun hem **Ana İş Parçacığındaki `proof_ring`** hem de **5. bağımsız bir OS Okuyucu İş Parçacığı** tarafından birebir gözlemlendiğini kanıtla.
+
+## 0.13.3 — P1: Kanonik Uzunluk-Önekli (`<len>#<val>`) Serileştirme ve HMAC/SHA-256 Bütünlük Mührü (`keyring.nox`, `docs/threat-model.md`)
+- [x] `_compute_state_seal()` içindeki ayraç (`:` / `|`) birleştirmesini uzunluk-önekli kanonik serileştirme (`_serialize_state_canonical` ve `_deserialize_state_canonical`) ile değiştir (`<byte_len>#<alan>`).
+- [x] Alan değerlerinin içinde `:`, `|`, `#` gibi karakterler bulunduğunda (ör. `kid="k1:HS256"` vs `kid="k1"`) kanonik serileştirmenin ve SHA-256 mührünün asla çakışmadığını (collision-free) doğrulayan negatif test ekle (Test 9b).
+- [x] `KeyRing` içerisine örnek-bazlı (`_seal_key`) HMAC-SHA256 doğrulama katmanı (`_state_mac`) ekle ve `docs/threat-model.md` içinde SHA-256/HMAC mührünün dil içi *tamper-evident integrity check* sınırlarını açıkça belgele.
+
+## 0.13.4 — P1: Açık Commit Linearization Point Tanımı (`keyring.nox`, `docs/architecture.md`)
+- [x] `_commit_state()` içinde tüm doğrulama, kanonik serileştirme ve paylaşımlı bellek yazma işlemlerini **Faz A (Pre-Linearization)** içinde tamamla.
+- [x] **Faz B (`_seq.compare_and_swap(odd_seq, even_next_seq)`)** atomik komutunu tek **Linearization Point** olarak tanımla; `committed = True` olduktan sonra `except` bloğunda geri alma (rollback) yapılmasını kesin olarak engelle.
+
+## 0.13.5 — P1: Bağımsız Bitmask Kahini (Oracle) ve `nox.url` ile Differential IP Fuzzing (`tests/ip_fuzz_property_test.nox`)
+- [x] `tests/ip_fuzz_property_test.nox` içerisine deterministik PRNG tabanlı 1.000+ üretimsel (generative) IPv4, IPv6, IPv4-mapped IPv6 ve sınır girdisi üreteci ekle.
+- [x] Bağımsız 32-bit tam sayı bitmask IPv4 kahini (`(u32 & mask) == net`), 128-bit IPv6 kahini ve `nox.url.parse` ile Cipher'ın `parse_ipv4` / `parse_ipv6` / `verify_resolved_ip` sonuçlarını karşılaştıran **Property 5 (Differential Fuzzing)** katmanını çalıştır (0 farklılık).
+
+## 0.13.6 — P2: Snapshot Okuma ve Doğrulama Performans Benchmark Paketi (`tests/benchmark_keyring_test.nox`)
+- [x] `tests/benchmark_keyring_test.nox` dosyasını oluştur: Seqlock `get_signing_key()`, `get_verification_key()`, `rotate()` ve çapraz-thread paylaşımlı bellek senkronizasyon performansını (`nox.time.instant_now()`) ölç ve doğrula (`sign_500=1ms`, `verify_500=1ms`, `rotate_30=2ms`, `shared_sync_10=1ms`).
+
+## 0.13.7 — Phase 13 Çıkış Kapısı ve `v1.0.7` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (18 test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.7` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.7` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.7` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

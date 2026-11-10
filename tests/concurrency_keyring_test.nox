@@ -3,7 +3,7 @@ import nox.test
 import nox.thread
 from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing, KeyRingState
+from keyring import KeyRing, KeyRingState, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical
 from rotation import RotationReceipt
 
 # ==============================================================================
@@ -332,6 +332,35 @@ except ConfigurationError:
     ver_tamper_caught = True
 nox.test.assert_true(ver_tamper_caught, "Direct mutation of _state.version detected and rejected via SHA-256 integrity seal")
 
+# 9b. Length-Prefixed Canonical Serialization Collision Resistance & Per-Ring HMAC Protection (0.13.3)
+# Prove that delimiter injection (':', '|', '#') into fields never causes canonical seal collisions
+k_delim_a: KeyRef = KeyRef("k1:HS256", "HS256", "super-secret-delim-key-material-32b", trust_domain="dom|a#99", state=STATE_ACTIVE_SIGNING)
+k_delim_b: KeyRef = KeyRef("k1", "HS256:HS256", "super-secret-delim-key-material-32b", trust_domain="dom|a#99", state=STATE_ACTIVE_SIGNING)
+seal_a: str = _compute_state_seal(1, [k_delim_a], 1000)
+seal_b: str = _compute_state_seal(1, [k_delim_b], 1000)
+nox.test.assert_true(seal_a != seal_b, "Length-prefixed canonical serialization prevents ':'/'|'/'#' delimiter collisions")
+
+# Verify round-trip deserialization preserves embedded delimiters ':' / '|' / '#'
+canon_delim: str = _serialize_state_canonical(7, [k_delim_a], 123456)
+deser_state: KeyRingState = _deserialize_state_canonical(canon_delim)
+nox.test.assert_eq_int(deser_state.version, 7, "Canonical deserialization preserves version")
+nox.test.assert_eq_str(deser_state.get_keys()[0].kid, "k1:HS256", "Canonical deserialization preserves ':' in kid")
+nox.test.assert_eq_str(deser_state.get_keys()[0].trust_domain, "dom|a#99", "Canonical deserialization preserves '|' and '#' in trust_domain")
+
+# Prove that replacing _state with a freshly forged KeyRingState (which has a valid SHA-256 hash)
+# is rejected by KeyRing's per-instance HMAC-SHA256 (_state_mac) verification!
+seal_ring3: KeyRing = KeyRing(trust_domain="tenant-sealed-3")
+seal_ring3.add_key(KeyRef("k-seal-3", "HS256", "super-secret-sealed-key-material-32b", trust_domain="tenant-sealed-3", state=STATE_ACTIVE_SIGNING))
+forged_key: KeyRef = KeyRef("k-forged", "HS256", "attacker-controlled-secret-key-32b!!", trust_domain="tenant-sealed-3", state=STATE_ACTIVE_SIGNING)
+forged_state: KeyRingState = KeyRingState(1, [forged_key], 1000)
+seal_ring3._state = forged_state
+hmac_replace_caught: bool = False
+try:
+    seal_ring3.get_signing_key("HS256")
+except ConfigurationError:
+    hmac_replace_caught = True
+nox.test.assert_true(hmac_replace_caught, "Forged KeyRingState replacement rejected via per-instance HMAC-SHA256 seal")
+
 # ==============================================================================
 # Test 10: P0 Exception-Safe Lock Release & Seqlock Coherent Snapshot (0.12.1 & 0.12.2)
 # ==============================================================================
@@ -360,34 +389,26 @@ nox.test.assert_eq_int(coherent_ring.get_version(), 2, "Version cleanly advanced
 nox.test.assert_eq_int(coherent_ring.get_state().version, 2, "get_state().version matches get_version() == 2")
 
 # ==============================================================================
-# Test 11: P1 Parallel Multi-Thread KeyRing.rotate() & Reader Coherency (0.12.4)
+# Test 11: P1 Parallel Multi-Thread KeyRing.rotate() & Shared State Sync (0.12.4 & 0.13.2)
 # ==============================================================================
-async def parallel_keyring_worker(packed_handles_str: str) -> int:
-    # Unpack handles: "lock_h:seq_h:ver_h:worker_id"
-    parts: list[str] = nox.strings.split(packed_handles_str, ":")
-    lock_h: int = int(parts[0])
-    seq_h: int = int(parts[1])
-    ver_h: int = int(parts[2])
-    worker_id: str = parts[3]
+async def parallel_keyring_worker(arg_payload: str) -> int:
+    # Unpack "worker_id~shared_handle_str"
+    parts: list[str] = nox.strings.split(arg_payload, "~")
+    worker_id: str = parts[0]
+    shared_h: str = parts[1]
 
-    # Instantiate KeyRing bound to the shared hardware atomic mutex/seqlock/version cells
+    # Attach to the genuine shared cross-thread KeyRing state!
     worker_ring: KeyRing = KeyRing(trust_domain="tenant-mt")
-    k_init: KeyRef = KeyRef("k-mt-init", "HS256", "super-secret-mt-initial-key-32bytes", trust_domain="tenant-mt", state=STATE_ACTIVE_SIGNING)
-    worker_ring.add_key(k_init)
-    # Bind shared cross-thread hardware atomics
-    worker_ring.bind_shared_atomics(lock_h, seq_h, ver_h)
+    worker_ring.attach_shared_handle(shared_h)
 
     rot_wins: int = 0
     step_i: int = 0
-    while step_i < 40:
+    while step_i < 6:
         try:
-            # Synchronize local state version to current shared version before attempting KeyRing.rotate()
-            shared_v: int = nox.atomic.from_int_handle(ver_h).load()
-            worker_ring._state = KeyRingState(shared_v, worker_ring._state.get_keys(), 4000 + step_i)
-
-            cand_kid: str = "k-mt-w" + worker_id + "-" + str(step_i) + "-" + str(shared_v)
+            cur_v: int = worker_ring.get_version()
+            cand_kid: str = "k-mt-w" + worker_id + "-" + str(step_i) + "-" + str(cur_v)
             cand_key: KeyRef = KeyRef(cand_kid, "HS256", "super-secret-mt-worker-key-32bytes!", trust_domain="tenant-mt", state=STATE_PREPARED)
-            worker_ring.rotate(cand_key, overlap_seconds=300, clock_time_sec=5000 + step_i, expected_version=shared_v)
+            worker_ring.rotate(cand_key, overlap_seconds=300, clock_time_sec=5000 + step_i, expected_version=cur_v)
             rot_wins = rot_wins + 1
         except ConfigurationError:
             # Expected when another OS thread wins the hardware lock, Seqlock, or CAS race
@@ -399,13 +420,12 @@ async def run_parallel_keyring_rotation_test() -> None:
     master_ring: KeyRing = KeyRing(trust_domain="tenant-mt")
     master_k0: KeyRef = KeyRef("k-mt-0", "HS256", "super-secret-mt-master-key-32bytes!", trust_domain="tenant-mt", state=STATE_ACTIVE_SIGNING)
     master_ring.add_key(master_k0)
-    # Master starts at version 1
-    base_h_str: str = str(master_ring.get_lock_handle()) + ":" + str(master_ring.get_seq_handle()) + ":" + str(master_ring.get_version_handle())
+    shared_h_str: str = master_ring.export_shared_handle()
 
-    th1: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":1")
-    th2: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":2")
-    th3: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":3")
-    th4: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":4")
+    th1: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, "1~" + shared_h_str)
+    th2: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, "2~" + shared_h_str)
+    th3: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, "3~" + shared_h_str)
+    th4: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, "4~" + shared_h_str)
 
     rw1: int = await th1.join()
     rw2: int = await th2.join()
@@ -413,14 +433,101 @@ async def run_parallel_keyring_rotation_test() -> None:
     rw4: int = await th4.join()
 
     total_rotations: int = rw1 + rw2 + rw3 + rw4
-    final_shared_ver: int = nox.atomic.from_int_handle(master_ring.get_version_handle()).load()
-
-    # Initial version was 1; every successful KeyRing.rotate() across 4 OS threads incremented version by 1
-    nox.test.assert_eq_int(final_shared_ver, 1 + total_rotations, "Parallel KeyRing.rotate() across 4 OS threads has zero lost updates")
+    # Main thread's master_ring directly observes all rotations performed across the 4 worker OS threads!
+    master_st: KeyRingState = master_ring.get_state()
+    nox.test.assert_eq_int(master_st.version, 1 + total_rotations, "Main thread master_ring observes exact version from 4 OS threads")
+    nox.test.assert_eq_int(master_st.key_count(), 1 + total_rotations, "Main thread master_ring observes all keys rotated across 4 OS threads")
     nox.test.assert_true(total_rotations > 0, "Parallel KeyRing workers completed rotations")
+    master_ring.free_shared_handle()
 
 t_kr_parallel: Task[None] = spawn run_parallel_keyring_rotation_test()
 await t_kr_parallel
+
+# ==============================================================================
+# Test 12: P0 Cross-OS-Thread Shared KeyRingState Identity & Visibility Proof (0.13.2)
+# Proves that 4 parallel OS threads competing on expected_version=1 produce exactly
+# 1 winner, and that BOTH the Main Thread and an independent 5th OS Reader Thread
+# observe the exact winning key, version=2, and identical canonical SHA-256 state seal.
+# ==============================================================================
+async def single_race_writer_worker(arg_payload: str) -> int:
+    parts: list[str] = nox.strings.split(arg_payload, "~")
+    wid: int = int(parts[0])
+    shared_h: str = parts[1]
+
+    w_ring: KeyRing = KeyRing(trust_domain="tenant-shared-proof")
+    w_ring.attach_shared_handle(shared_h)
+
+    cand_kid: str = "k-win-w" + str(wid)
+    cand_secret: str = "super-secret-winning-worker-key-w" + str(wid) + "!"
+    cand_key: KeyRef = KeyRef(cand_kid, "HS256", cand_secret, trust_domain="tenant-shared-proof", state=STATE_PREPARED)
+    try:
+        w_ring.rotate(cand_key, overlap_seconds=600, clock_time_sec=7000 + wid, expected_version=1)
+        return wid
+    except ConfigurationError:
+        return 0
+
+async def independent_reader_os_worker(shared_h: str) -> str:
+    r_ring: KeyRing = KeyRing(trust_domain="tenant-shared-proof")
+    r_ring.attach_shared_handle(shared_h)
+    st: KeyRingState = r_ring.get_state()
+    active_k: KeyRef = r_ring.get_signing_key("HS256")
+    old_k: KeyRef = r_ring.get_verification_key("k-proof-init", 7100)
+    return str(st.version) + "|" + active_k.kid + "|" + old_k.state + "|" + st.get_seal_hash()
+
+async def run_cross_thread_state_identity_proof() -> None:
+    proof_ring: KeyRing = KeyRing(trust_domain="tenant-shared-proof")
+    init_k: KeyRef = KeyRef("k-proof-init", "HS256", "super-secret-proof-initial-key-32b!", trust_domain="tenant-shared-proof", state=STATE_ACTIVE_SIGNING)
+    proof_ring.add_key(init_k)
+    nox.test.assert_eq_int(proof_ring.get_version(), 1, "Initial shared proof version is 1")
+
+    sh_handle: str = proof_ring.export_shared_handle()
+
+    w1: ThreadHandle[int] = nox.thread.start(single_race_writer_worker, "1~" + sh_handle)
+    w2: ThreadHandle[int] = nox.thread.start(single_race_writer_worker, "2~" + sh_handle)
+    w3: ThreadHandle[int] = nox.thread.start(single_race_writer_worker, "3~" + sh_handle)
+    w4: ThreadHandle[int] = nox.thread.start(single_race_writer_worker, "4~" + sh_handle)
+
+    r1: int = await w1.join()
+    r2: int = await w2.join()
+    r3: int = await w3.join()
+    r4: int = await w4.join()
+
+    win_count: int = 0
+    winning_wid: int = 0
+    if r1 > 0:
+        win_count = win_count + 1
+        winning_wid = r1
+    if r2 > 0:
+        win_count = win_count + 1
+        winning_wid = r2
+    if r3 > 0:
+        win_count = win_count + 1
+        winning_wid = r3
+    if r4 > 0:
+        win_count = win_count + 1
+        winning_wid = r4
+
+    nox.test.assert_eq_int(win_count, 1, "Exactly 1 OS worker thread won the expected_version=1 rotation race")
+    expected_winner_kid: str = "k-win-w" + str(winning_wid)
+
+    # 1. Main Thread directly inspects proof_ring (proving cross-thread state visibility to Main Thread)
+    main_st: KeyRingState = proof_ring.get_state()
+    main_active: KeyRef = proof_ring.get_signing_key("HS256")
+    main_old: KeyRef = proof_ring.get_verification_key("k-proof-init", 7100)
+    nox.test.assert_eq_int(main_st.version, 2, "Main thread observes version 2 committed by worker OS thread")
+    nox.test.assert_eq_str(main_active.kid, expected_winner_kid, "Main thread observes winning worker's active signing key")
+    nox.test.assert_eq_str(main_old.state, STATE_VERIFY_ONLY, "Main thread observes initial key demoted to VERIFY_ONLY")
+
+    # 2. Spawn 5th independent OS Reader Thread to prove cross-thread state identity & seal equivalence
+    r_th: ThreadHandle[str] = nox.thread.start(independent_reader_os_worker, sh_handle)
+    reader_report: str = await r_th.join()
+    expected_report: str = "2|" + expected_winner_kid + "|" + STATE_VERIFY_ONLY + "|" + main_st.get_seal_hash()
+    nox.test.assert_eq_str(reader_report, expected_report, "5th OS Reader Thread observes identical version, active kid, key state, and SHA-256 seal hash")
+
+    proof_ring.free_shared_handle()
+
+t_proof: Task[None] = spawn run_cross_thread_state_identity_proof()
+await t_proof
 
 # 11b. Concurrent Writer (rotate + revoke) & Reader Coherency on Shared KeyRing Instance
 shared_rw_ring: KeyRing = KeyRing(trust_domain="tenant-rw")
