@@ -55,12 +55,21 @@ jobs:
         run: |
           noxc test
 
+      - name: Publish Benchmark Comparison Summary (Linux / macOS)
+        if: always() && runner.os != 'Windows'
+        run: |
+          if [ -f benchmark-comparison.md ]; then
+            cat benchmark-comparison.md >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Upload KeyRing Benchmark Results Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ matrix.os }}
-          path: benchmark-results.json
+          path: |
+            benchmark-results.json
+            benchmark-comparison.md
           if-no-files-found: ignore
 
       - name: Verify Native Package Manager Fetch & Consumer Integration (Linux / macOS)

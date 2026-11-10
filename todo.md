@@ -842,3 +842,48 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.9` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.9` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 16 — `v1.0.10` Single-Word Atomic CAS Reader/Closing Gate, Explicit Shared Handle Lifecycle State Machine, Owner-Controlled Teardown Contract, Exception-Safe Zeroization & Cross-Version Benchmark Diffs (SOL X Analizi)
+
+**Amaç:** Onuncu bağımsız teknik incelemede (GPT 6 SOL X analizi) tespit edilen okuyucu kaydı ile `free_shared_handle()` arasındaki iki aşamalı atomik yarış penceresini (`T1..T5`), paylaşımlı handle yaşam döngüsü durum makinesini, sahip (owner) kontrollü serbest bırakma protokolünü, istisna güvenli (exception-safe) zeroize kilit bırakma garantisini ve sürümler arası CI benchmark karşılaştırma raporunu eksiksiz tamamlamak:
+1. **P0 — Okuyucu Kaydı ile `free_shared_handle()` Arasındaki `T1..T5` Yarış Penceresini Tek Kelimelik Atomik CAS Kapısı (`_shared_gate`) ile Kapatma (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `v1.0.9` sürümünde `_shared_alive` (`AtomicBool`) ve `_shared_readers` (`AtomicInt`) iki ayrı atomik değişken olduğu için, owner thread `_shared_readers == 0` gördükten hemen sonra gecikmiş bir okuyucunun `_shared_readers.add(1)` çağırabilmesi (`T1..T5` yarışı) teorik olarak mümkündü. Bunu donanım seviyesinde imkânsız kılmak için kapanış bayrağını (`SHARED_CLOSING_BIT = 1 << 30`) ve aktif okuyucu sayacını (`SHARED_READER_MASK = (1 << 30) - 1`) **tek bir 64-bit `AtomicInt` (`_shared_gate`)** içinde birleştirmek; okuyucu girişini `compare_and_swap` döngüsüyle yalnızca `(gate & SHARED_CLOSING_BIT) == 0` iken atomik olarak kabul etmek ve `SHARED_CLOSING_BIT` set edildiği anda yeni okuyucu kaydını sayacı hiç artırmadan reddetmek.
+2. **P0 — Açık Paylaşımlı Handle Yaşam Döngüsü Durum Makinesi (`UNSHARED → ALIVE → CLOSING → DRAINING → DESTROYED`) (`keyring.nox`, `cipher.nox`):** Paylaşımlı bellek yaşam döngüsünü `SHARED_STATE_UNSHARED`, `SHARED_STATE_ALIVE`, `SHARED_STATE_CLOSING`, `SHARED_STATE_DRAINING` ve `SHARED_STATE_DESTROYED` sabitleriyle modellemek ve `KeyRing.get_shared_lifecycle_state(self) -> str` metoduyla deterministik olarak sorgulanabilir yapmak.
+3. **P1 — Owner-Controlled Teardown ve Worker `detach_shared_handle()` Sözleşmesi (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** Paylaşımlı handle'ı oluşturan (`export_shared_handle`) `KeyRing` nesnesini `_is_shared_owner = True` olarak işaretlemek; `attach_shared_handle()` çağıran worker nesnelerini `_shared_workers: nox.atomic.AtomicInt` sayacında izlemek; worker nesnelerinin yanlışlıkla `free_shared_handle()` çağırmasını `ConfigurationError` ile engellemek; worker'lar için `detach_shared_handle(self) -> None` metodu ve owner için `free_shared_handle(self, require_zero_workers: bool = False)` seçeneği sunmak.
+4. **P1 — `zeroize_shared_state()` İçinde Exception-Safe Writer Lock Bırakma Garantisi (`keyring.nox`):** `zeroize_shared_state()` kritik bölgesini `try ... except Exception as err:` bloğu içine alarak, hücre sıfırlama sırasında herhangi bir hata oluşursa Seqlock sayacını çift (even) duruma geri yükleyip `_write_lock.store(False)` kilidini her koşulda serbest bırakmak.
+5. **P1 — Eşzamanlı `attach_shared_handle()` / Okuyucu Kaydı ile `zeroize_shared_state()` / `free_shared_handle()` Yarış Testleri (`tests/concurrency_keyring_test.nox`):** Tek kelimelik CAS kapısını (`_shared_gate`), `UNSHARED → ALIVE → CLOSING → DRAINING → DESTROYED` durum geçişlerini, owner-only `free_shared_handle()` korumasını ve 4 paralel OS thread'inin eşzamanlı `attach_shared_handle()` + okuma + `detach_shared_handle()` döngüsünü `zeroize_shared_state()` ile yarıştıran **Test 17 (`17a`–`17d`)** testlerini eklemek.
+6. **P2 — Sürümler Arası Benchmark Karşılaştırma Raporu (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`):** `v1.0.9` referans metriklerini `docs/benchmark-baseline.json` dosyasında saklamak; `tests/benchmark_keyring_test.nox` içinde hem `benchmark-results.json` hem de önceki sürümle karşılaştırmalı Markdown tablosu (`benchmark-comparison.md`) üretmek ve bunu GitHub Actions `$GITHUB_STEP_SUMMARY` ile CI artifact'larına eklemek.
+
+## 0.16.1 — P0: Tek Kelimelik Atomik CAS Okuyucu/Kapanış Kapısı (`_shared_gate`) (`keyring.nox`, `cipher.nox`)
+- [x] `SHARED_CLOSING_BIT: int = 1073741824` (`1 << 30`) ve `SHARED_READER_MASK: int = 1073741823` (`(1 << 30) - 1`) sabitlerini tanımla.
+- [x] `_try_acquire_reader_gate(self) -> bool` metodunu `_shared_gate` üzerinde donanım `compare_and_swap` döngüsüyle uygula: `(cur & SHARED_CLOSING_BIT) != 0` ise sayacı hiç artırmadan `False` dön; aksi halde `compare_and_swap(cur, cur + 1)` ile okuyucuyu atomik olarak kaydet.
+- [x] `zeroize_shared_state()` içinde `_shared_gate` üzerinde CAS döngüsüyle `SHARED_CLOSING_BIT` bayrağını atomik olarak set et (`compare_and_swap(cur, cur | SHARED_CLOSING_BIT)`), böylece `T1..T5` yarış penceresini donanım seviyesinde kapat.
+
+## 0.16.2 — P0: Açık Paylaşımlı Handle Yaşam Döngüsü Durum Makinesi (`keyring.nox`, `cipher.nox`)
+- [x] `SHARED_STATE_UNSHARED`, `SHARED_STATE_ALIVE`, `SHARED_STATE_CLOSING`, `SHARED_STATE_DRAINING`, `SHARED_STATE_DESTROYED` durum sabitlerini tanımla ve `cipher.nox` üzerinden dışa aktar.
+- [x] `KeyRing.get_shared_lifecycle_state(self) -> str` metodunu ekle ve `UNSHARED → ALIVE → CLOSING → DRAINING → DESTROYED` geçişlerini deterministik olarak doğrula.
+
+## 0.16.3 — P1: Owner-Controlled Teardown ve Worker `detach_shared_handle()` Sözleşmesi (`keyring.nox`)
+- [x] `export_shared_handle()` çağıran nesneyi `_is_shared_owner = True` olarak işaretle; `attach_shared_handle()` çağıran worker nesnelerinde `_is_shared_owner = False` tut ve `_shared_workers` sayacını atomik olarak artır.
+- [x] Worker nesneleri için `detach_shared_handle(self) -> None`, `attached_shared_workers(self) -> int` ve `is_shared_owner(self) -> bool` metotlarını ekle.
+- [x] Worker nesnesi `free_shared_handle()` çağırdığında derhal `ConfigurationError` fırlat; owner için `free_shared_handle(self, require_zero_workers: bool = False)` desteği ekle.
+
+## 0.16.4 — P1: `zeroize_shared_state()` İçinde Exception-Safe Writer Lock Bırakma Garantisi (`keyring.nox`)
+- [x] `zeroize_shared_state()` içinde `_write_lock` alındıktan sonraki tüm işlemleri `try ... except Exception as err:` bloğuna al; hata durumunda Seqlock sayacını çift sayıya (`even`) tamamla ve `_write_lock.store(False)` çağrısını garanti et.
+
+## 0.16.5 — P1: Eşzamanlı `attach_shared_handle()` / Okuyucu Kaydı vs. `zeroize_shared_state()` / `free_shared_handle()` Yarış Testleri (`tests/concurrency_keyring_test.nox`)
+- [x] `tests/concurrency_keyring_test.nox` içine yaşam döngüsü durum geçişlerini (**Test 17a**), tek kelimelik CAS kapısı `_shared_gate` reddini (**Test 17b**), owner-only teardown ve worker detach sözleşmesini (**Test 17c**) ve 4 paralel OS thread ile `attach + read + detach` vs. `zeroize + free` yarışını (**Test 17d**) doğrulayan testleri ekle.
+
+## 0.16.6 — P2: Sürümler Arası Benchmark Karşılaştırma Raporu (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`)
+- [x] `docs/benchmark-baseline.json` dosyasını `v1.0.9` referans metrikleriyle oluştur.
+- [x] `tests/benchmark_keyring_test.nox` dosyasını `docs/benchmark-baseline.json` verisini okuyup `benchmark-comparison.md` Markdown karşılaştırma tablosu üretecek şekilde güncelle.
+- [x] `.github/workflows/ci.yml` ve `.github/workflows/release.yml` iş akışlarını `benchmark-comparison.md` raporunu `$GITHUB_STEP_SUMMARY` ve CI artifact olarak yayımlayacak şekilde güncelle.
+
+## 0.16.7 — Phase 16 Çıkış Kapısı ve `v1.0.10` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (18 test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.10` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.10` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.10` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

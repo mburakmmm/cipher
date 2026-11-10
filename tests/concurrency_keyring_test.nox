@@ -4,7 +4,7 @@ import nox.test
 import nox.thread
 from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing, KeyRingState, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical, redact_shared_handle
+from keyring import KeyRing, KeyRingState, SHARED_CLOSING_BIT, SHARED_READER_MASK, SHARED_STATE_ALIVE, SHARED_STATE_CLOSING, SHARED_STATE_DESTROYED, SHARED_STATE_DRAINING, SHARED_STATE_UNSHARED, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical, redact_shared_handle
 from rotation import RotationReceipt
 
 # ==============================================================================
@@ -834,5 +834,164 @@ nox.test.assert_true(high_mw_rejected, "export_shared_handle(max_words=16384) re
 nox.test.assert_true(not clean_ring.is_shared_alive(), "clean_ring remains unattached after failed handle operations")
 nox.test.assert_eq_int(clean_ring.get_version(), 1, "clean_ring version preserved at 1")
 nox.test.assert_eq_str(clean_ring.get_signing_key("HS256").kid, "k-clean-0", "clean_ring signing key preserved")
+
+# ==============================================================================
+# Test 17: P0 Single-Word CAS Gate (_shared_gate), Explicit 5-State Lifecycle
+# Machine (UNSHARED -> ALIVE -> CLOSING -> DRAINING -> DESTROYED), Owner-Only
+# Teardown Contract & Concurrent attach/read/detach vs. zeroize/free Race
+# (0.16.1, 0.16.2, 0.16.3, 0.16.4, 0.16.5)
+# ==============================================================================
+
+# 17a & 17b & 17c: Lifecycle state transitions, single-word CAS gate T1..T5 closure,
+# and owner-controlled teardown / worker detach contract:
+sm_owner: KeyRing = KeyRing(trust_domain="tenant-state-machine")
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_UNSHARED, "Initial KeyRing lifecycle state is UNSHARED")
+nox.test.assert_true(not sm_owner.is_shared_owner(), "Unshared KeyRing is not shared owner")
+
+sm_owner.add_key(KeyRef("k-sm-0", "HS256", "super-secret-state-machine-key-32b", trust_domain="tenant-state-machine", state=STATE_ACTIVE_SIGNING))
+sm_handle: str = sm_owner.export_shared_handle(max_words=256)
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_ALIVE, "Owner KeyRing transitions UNSHARED -> ALIVE on export_shared_handle()")
+nox.test.assert_true(sm_owner.is_shared_owner(), "Exporting KeyRing is marked as shared owner")
+nox.test.assert_eq_int(sm_owner.attached_shared_workers(), 0, "Zero workers attached initially")
+
+sm_worker: KeyRing = KeyRing(trust_domain="tenant-state-machine")
+nox.test.assert_eq_str(sm_worker.get_shared_lifecycle_state(), SHARED_STATE_UNSHARED, "Worker starts in UNSHARED state")
+sm_worker.attach_shared_handle(sm_handle)
+nox.test.assert_eq_str(sm_worker.get_shared_lifecycle_state(), SHARED_STATE_ALIVE, "Worker transitions UNSHARED -> ALIVE on attach_shared_handle()")
+nox.test.assert_true(not sm_worker.is_shared_owner(), "Worker KeyRing is_shared_owner() is False")
+nox.test.assert_eq_int(sm_owner.attached_shared_workers(), 1, "Owner observes 1 attached worker in _shared_gate")
+nox.test.assert_eq_int(sm_worker.attached_shared_workers(), 1, "Worker observes 1 attached worker in _shared_gate")
+
+# 17c: Non-owner worker MUST be rejected if it calls free_shared_handle(), zeroize_shared_state(), or begin_closing_shared_state():
+worker_free_rejected: bool = False
+try:
+    sm_worker.free_shared_handle()
+except ConfigurationError:
+    worker_free_rejected = True
+nox.test.assert_true(worker_free_rejected, "Non-owner worker calling free_shared_handle() is rejected with ConfigurationError")
+
+worker_zeroize_rejected: bool = False
+try:
+    sm_worker.zeroize_shared_state()
+except ConfigurationError:
+    worker_zeroize_rejected = True
+nox.test.assert_true(worker_zeroize_rejected, "Non-owner worker calling zeroize_shared_state() is rejected with ConfigurationError")
+
+worker_close_rejected: bool = False
+try:
+    sm_worker.begin_closing_shared_state()
+except ConfigurationError:
+    worker_close_rejected = True
+nox.test.assert_true(worker_close_rejected, "Non-owner worker calling begin_closing_shared_state() is rejected with ConfigurationError")
+
+owner_detach_rejected: bool = False
+try:
+    sm_owner.detach_shared_handle()
+except ConfigurationError:
+    owner_detach_rejected = True
+nox.test.assert_true(owner_detach_rejected, "Owner calling detach_shared_handle() is rejected with ConfigurationError")
+
+# Owner calling free_shared_handle(require_zero_workers=True) while sm_worker is still attached MUST fail closed:
+free_with_attached_worker_rejected: bool = False
+try:
+    sm_owner.free_shared_handle(require_zero_workers=True)
+except ConfigurationError:
+    free_with_attached_worker_rejected = True
+nox.test.assert_true(free_with_attached_worker_rejected, "free_shared_handle(require_zero_workers=True) rejected while worker is still attached")
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_ALIVE, "Owner remains ALIVE after rejected require_zero_workers check")
+
+# 17b: Transition ALIVE -> CLOSING via begin_closing_shared_state() (sets SHARED_CLOSING_BIT via CAS on _shared_gate):
+sm_owner.begin_closing_shared_state()
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_CLOSING, "Owner transitions ALIVE -> CLOSING when SHARED_CLOSING_BIT is set")
+nox.test.assert_eq_str(sm_worker.get_shared_lifecycle_state(), SHARED_STATE_CLOSING, "Attached worker immediately observes CLOSING state via _shared_gate")
+nox.test.assert_true(not sm_owner.is_shared_alive(), "is_shared_alive() returns False immediately upon entering CLOSING")
+
+# Prove single-word CAS gate (_try_acquire_reader_gate) atomically rejects reader registration without incrementing active_shared_readers():
+nox.test.assert_true(not sm_owner._try_acquire_reader_gate(), "_try_acquire_reader_gate() atomically returns False when SHARED_CLOSING_BIT is set")
+nox.test.assert_eq_int(sm_owner.active_shared_readers(), 0, "Rejected reader registration never increments active_shared_readers() (T1..T5 race closed)")
+
+closing_read_rejected: bool = False
+try:
+    sm_worker.get_signing_key("HS256")
+except ConfigurationError:
+    closing_read_rejected = True
+nox.test.assert_true(closing_read_rejected, "Worker read fails closed immediately in CLOSING state")
+nox.test.assert_eq_int(sm_owner.active_shared_readers(), 0, "active_shared_readers() remains 0 after rejected worker read")
+
+closing_attach_rejected: bool = False
+try:
+    late_sm_worker: KeyRing = KeyRing(trust_domain="tenant-state-machine")
+    late_sm_worker.attach_shared_handle(sm_handle)
+except ConfigurationError:
+    closing_attach_rejected = True
+nox.test.assert_true(closing_attach_rejected, "New worker attach_shared_handle() fails closed in CLOSING state")
+nox.test.assert_eq_int(sm_owner.attached_shared_workers(), 1, "Failed attach in CLOSING state does not increment attached_shared_workers()")
+
+# Transition CLOSING -> DRAINING via zeroize_shared_state():
+sm_owner.zeroize_shared_state()
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_DRAINING, "Owner transitions CLOSING -> DRAINING after zeroize_shared_state()")
+nox.test.assert_eq_str(sm_worker.get_shared_lifecycle_state(), SHARED_STATE_DRAINING, "Worker observes DRAINING state after zeroize_shared_state()")
+nox.test.assert_true(sm_owner.is_shared_zeroized(), "All shared key and data cells are zeroed in DRAINING state")
+
+# Worker detaches cleanly via detach_shared_handle():
+sm_worker.detach_shared_handle()
+nox.test.assert_eq_str(sm_worker.get_shared_lifecycle_state(), SHARED_STATE_UNSHARED, "Detached worker transitions back to UNSHARED")
+nox.test.assert_eq_int(sm_owner.attached_shared_workers(), 0, "Owner attached_shared_workers() drops to 0 after worker detach")
+
+# Transition DRAINING -> DESTROYED via free_shared_handle(require_zero_workers=True):
+sm_owner.free_shared_handle(require_zero_workers=True)
+nox.test.assert_eq_str(sm_owner.get_shared_lifecycle_state(), SHARED_STATE_DESTROYED, "Owner transitions DRAINING -> DESTROYED after free_shared_handle()")
+
+# 17d: Concurrent attach_shared_handle() + read + detach_shared_handle() vs. owner zeroize_shared_state() / free_shared_handle() across 4 OS threads:
+async def attach_read_detach_race_worker(shared_h: str) -> int:
+    ok_cycles: int = 0
+    cycle: int = 0
+    while cycle < 35:
+        w_ring: KeyRing = KeyRing(trust_domain="tenant-attach-race")
+        attached: bool = False
+        try:
+            w_ring.attach_shared_handle(shared_h)
+            attached = True
+            sk: KeyRef = w_ring.get_signing_key("HS256")
+            if sk.kid != "k-ar-0" and sk.kid != "k-ar-1":
+                w_ring.detach_shared_handle()
+                return -1
+            ok_cycles = ok_cycles + 1
+        except ConfigurationError:
+            # Expected once owner initiates CLOSING / DRAINING
+            if attached:
+                w_ring.detach_shared_handle()
+            break
+        if attached:
+            w_ring.detach_shared_handle()
+        cycle = cycle + 1
+    return ok_cycles
+
+async def run_attach_vs_zeroize_race_test() -> None:
+    ar_owner: KeyRing = KeyRing(trust_domain="tenant-attach-race")
+    ar_owner.add_key(KeyRef("k-ar-0", "HS256", "super-secret-attach-race-key-00-32", trust_domain="tenant-attach-race", state=STATE_ACTIVE_SIGNING))
+    ar_h: str = ar_owner.export_shared_handle(max_words=256)
+
+    at1: ThreadHandle[int] = nox.thread.start(attach_read_detach_race_worker, ar_h)
+    at2: ThreadHandle[int] = nox.thread.start(attach_read_detach_race_worker, ar_h)
+    at3: ThreadHandle[int] = nox.thread.start(attach_read_detach_race_worker, ar_h)
+    at4: ThreadHandle[int] = nox.thread.start(attach_read_detach_race_worker, ar_h)
+
+    ar_owner.rotate(KeyRef("k-ar-1", "HS256", "super-secret-attach-race-key-01-32", trust_domain="tenant-attach-race", state=STATE_PREPARED), overlap_seconds=300, clock_time_sec=5000)
+    ar_owner.zeroize_shared_state()
+
+    ac1: int = await at1.join()
+    ac2: int = await at2.join()
+    ac3: int = await at3.join()
+    ac4: int = await at4.join()
+
+    nox.test.assert_true(ac1 >= 0 and ac2 >= 0 and ac3 >= 0 and ac4 >= 0, "Zero corrupted reads during concurrent attach/read/detach vs. zeroize race across 4 OS threads")
+    nox.test.assert_eq_int(ar_owner.active_shared_readers(), 0, "All active readers drained to 0 in _shared_gate")
+    nox.test.assert_eq_int(ar_owner.attached_shared_workers(), 0, "All workers detached cleanly to 0 in _shared_gate")
+    ar_owner.free_shared_handle(require_zero_workers=True)
+    nox.test.assert_eq_str(ar_owner.get_shared_lifecycle_state(), SHARED_STATE_DESTROYED, "ar_owner transitions to DESTROYED after concurrent attach/zeroize race")
+
+t_attach_race: Task[None] = spawn run_attach_vs_zeroize_race_test()
+await t_attach_race
 
 print("concurrency_keyring_test passed!")

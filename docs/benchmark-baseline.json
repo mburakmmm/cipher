@@ -1,0 +1,21 @@
+{
+  "suite": "cipher_keyring_benchmark",
+  "version": "1.0.9",
+  "metrics": {
+    "seqlock_get_signing_key_2000_ms": 5,
+    "seqlock_get_signing_key_batch200_p50_ms": 0,
+    "seqlock_get_signing_key_batch200_p95_ms": 1,
+    "seqlock_get_verification_key_2000_ms": 4,
+    "seqlock_get_verification_key_batch200_p50_ms": 0,
+    "seqlock_get_verification_key_batch200_p95_ms": 1,
+    "atomic_rotate_50_ms": 4,
+    "atomic_rotate_batch5_p50_ms": 0,
+    "atomic_rotate_batch5_p95_ms": 1,
+    "cross_thread_shared_sync_20_ms": 3,
+    "cross_thread_shared_sync_batch2_p50_ms": 0,
+    "cross_thread_shared_sync_batch2_p95_ms": 1,
+    "scaling_200_verify_1_key_ms": 1,
+    "scaling_200_verify_16_keys_ms": 3,
+    "scaling_200_verify_64_keys_ms": 10
+  }
+}

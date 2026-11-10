@@ -8,6 +8,7 @@
 *.dSYM/
 test-results.xml
 benchmark-results.json
+benchmark-comparison.md
 zig-cache/
 .bin/
 bin/

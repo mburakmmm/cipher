@@ -16,6 +16,21 @@ SHARED_ATOMIC_WORDS: int = 512      # Default 512 * 6 = 3072 bytes cross-thread 
 SHARED_KEY_WORDS: int = 11          # 11 * 6 = 66 bytes capacity for 64-byte hex HMAC seal key
 MAX_SEQLOCK_ATTEMPTS: int = 2000000 # High spin ceiling for OS thread preemption resilience
 
+# Single-word 64-bit _shared_gate bitfield layout:
+# - Bits 0..29  (SHARED_READER_MASK): active in-flight reader count (0 .. 1,073,741,823)
+# - Bit  30     (SHARED_CLOSING_BIT): 1 when CLOSING/DRAINING (atomically blocks new readers & workers via CAS)
+# - Bits 32..61 (SHARED_WORKER_UNIT): attached worker KeyRing count (0 .. 1,073,741,823)
+SHARED_READER_MASK: int = 1073741823
+SHARED_CLOSING_BIT: int = 1073741824
+SHARED_WORKER_UNIT: int = 4294967296
+
+# Explicit shared handle lifecycle states
+SHARED_STATE_UNSHARED: str = "UNSHARED"
+SHARED_STATE_ALIVE: str = "ALIVE"
+SHARED_STATE_CLOSING: str = "CLOSING"
+SHARED_STATE_DRAINING: str = "DRAINING"
+SHARED_STATE_DESTROYED: str = "DESTROYED"
+
 def redact_shared_handle(handle_str: str) -> str:
     if nox.strings.byte_len(handle_str) == 0:
         return "KeyRingSharedHandle([EMPTY])"
@@ -223,8 +238,12 @@ class KeyRing:
     _seq: nox.atomic.AtomicInt
     _atomic_version: nox.atomic.AtomicInt
     _shared_attached: bool
+    _is_shared_owner: bool
+    _shared_worker_registered: bool
+    _shared_lifecycle_local: str
     _shared_synced_seq: int
     _shared_alive: nox.atomic.AtomicBool
+    _shared_gate: nox.atomic.AtomicInt
     _shared_readers: nox.atomic.AtomicInt
     _shared_len: nox.atomic.AtomicInt
     _shared_key_cells: list[nox.atomic.AtomicInt]
@@ -242,9 +261,13 @@ class KeyRing:
         self._seal_key = nox.crypto.sha256(seed_material)
         self._state_mac = nox.crypto.hmac_sha256(self._seal_key, self._state.get_seal_hash())
         self._shared_attached = False
+        self._is_shared_owner = False
+        self._shared_worker_registered = False
+        self._shared_lifecycle_local = SHARED_STATE_UNSHARED
         self._shared_synced_seq = 0
         self._shared_alive = nox.atomic.from_bool_handle(0)
-        self._shared_readers = nox.atomic.from_int_handle(0)
+        self._shared_gate = nox.atomic.from_int_handle(0)
+        self._shared_readers = self._shared_gate
         self._shared_len = nox.atomic.from_int_handle(0)
         empty_key_cells: list[nox.atomic.AtomicInt] = []
         self._shared_key_cells = empty_key_cells
@@ -264,6 +287,27 @@ class KeyRing:
         self._write_lock = nox.atomic.from_bool_handle(lock_handle)
         self._seq = nox.atomic.from_int_handle(seq_handle)
         self._atomic_version = nox.atomic.from_int_handle(ver_handle)
+
+    def _try_acquire_reader_gate(self) -> bool:
+        # Single-word hardware CAS gate on _shared_gate (0.16.1):
+        # Atomically verifies SHARED_CLOSING_BIT == 0 and increments active_readers (bits 0..29)
+        # in the exact same 64-bit word. Once SHARED_CLOSING_BIT is set, reader registration is
+        # atomically rejected without ever incrementing the reader count, closing the T1..T5 race.
+        if not self._shared_attached:
+            return False
+        spins: int = 0
+        while spins < MAX_SEQLOCK_ATTEMPTS:
+            cur: int = self._shared_gate.add(0)
+            if (cur & SHARED_CLOSING_BIT) != 0:
+                return False
+            if self._shared_gate.compare_and_swap(cur, cur + 1):
+                return True
+            spins = spins + 1
+        return False
+
+    def _release_reader_gate(self) -> None:
+        if self._shared_attached:
+            self._shared_gate.add(-1)
 
     def _write_shared_words(self, words: list[int], byte_len: int) -> None:
         w_idx: int = 0
@@ -286,8 +330,31 @@ class KeyRing:
             w_idx = w_idx + 1
         return words
 
+    def get_shared_lifecycle_state(self) -> str:
+        # Explicit 5-state lifecycle machine: UNSHARED -> ALIVE -> CLOSING -> DRAINING -> DESTROYED
+        if not self._shared_attached:
+            return self._shared_lifecycle_local
+        g_val: int = self._shared_gate.add(0)
+        if (g_val & SHARED_CLOSING_BIT) != 0:
+            if (self._seq.add(0) & 1) != 0 or self._shared_alive.load():
+                return SHARED_STATE_CLOSING
+            return SHARED_STATE_DRAINING
+        if not self._shared_alive.load():
+            return SHARED_STATE_DRAINING
+        return SHARED_STATE_ALIVE
+
+    def is_shared_owner(self) -> bool:
+        return self._shared_attached and self._is_shared_owner
+
+    def attached_shared_workers(self) -> int:
+        if not self._shared_attached:
+            return 0
+        return (self._shared_gate.add(0) >> 32) & SHARED_READER_MASK
+
     def is_shared_alive(self) -> bool:
         if not self._shared_attached:
+            return False
+        if (self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0:
             return False
         return self._shared_alive.load()
 
@@ -296,6 +363,8 @@ class KeyRing:
         if not self._shared_attached:
             return True
         if self._shared_alive.load():
+            return False
+        if (self._shared_gate.add(0) & SHARED_CLOSING_BIT) == 0:
             return False
         if self._shared_len.load() != 0:
             return False
@@ -317,7 +386,7 @@ class KeyRing:
         return len(self._shared_cells) * 6
 
     def shared_used_bytes(self) -> int:
-        if not self._shared_attached or not self._shared_alive.load():
+        if not self.is_shared_alive():
             return 0
         return self._shared_len.add(0)
 
@@ -338,10 +407,13 @@ class KeyRing:
         # serialized as plaintext into the handle string.
         if max_words < 64 or max_words > 8192:
             raise ConfigurationError("Shared atomic max_words must be between 64 and 8192")
+        if self._shared_attached and not self._is_shared_owner:
+            raise ConfigurationError("Worker KeyRing instance cannot export_shared_handle(); only owner may export")
         st: KeyRingState = self._read_consistent_state()
         if not self._shared_attached:
             self._shared_alive = nox.atomic.new_bool(True)
-            self._shared_readers = nox.atomic.new_int(0)
+            self._shared_gate = nox.atomic.new_int(0)
+            self._shared_readers = self._shared_gate
             self._shared_len = nox.atomic.new_int(0)
             key_cells: list[nox.atomic.AtomicInt] = []
             k_i: int = 0
@@ -366,6 +438,9 @@ class KeyRing:
             self._write_shared_words(packed, nox.strings.byte_len(canon))
             self._shared_synced_seq = st.version * 2
             self._shared_attached = True
+            self._is_shared_owner = True
+            self._shared_worker_registered = False
+            self._shared_lifecycle_local = SHARED_STATE_ALIVE
 
         key_parts: str = ""
         k_idx: int = 0
@@ -382,9 +457,11 @@ class KeyRing:
                 cell_parts = cell_parts + ","
             cell_parts = cell_parts + str(self._shared_cells[idx].handle)
             idx = idx + 1
-        return str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle) + "|" + str(self._shared_len.handle) + "|" + str(self._shared_alive.handle) + "|" + str(self._shared_readers.handle) + "|" + key_parts + "|" + cell_parts
+        return str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle) + "|" + str(self._shared_len.handle) + "|" + str(self._shared_alive.handle) + "|" + str(self._shared_gate.handle) + "|" + key_parts + "|" + cell_parts
 
     def attach_shared_handle(self, handle_str: str) -> None:
+        if self._shared_attached and self._is_shared_owner:
+            raise ConfigurationError("Cannot attach_shared_handle on an owning KeyRing instance")
         parts: list[str] = nox.strings.split(handle_str, "|")
         if len(parts) != 8:
             raise ConfigurationError("Invalid shared KeyRing handle format")
@@ -393,8 +470,8 @@ class KeyRing:
         ver_h: int = _parse_handle_int(parts[2])
         len_h: int = _parse_handle_int(parts[3])
         alive_h: int = _parse_handle_int(parts[4])
-        readers_h: int = _parse_handle_int(parts[5])
-        if lock_h <= 0 or seq_h <= 0 or ver_h <= 0 or len_h <= 0 or alive_h <= 0 or readers_h <= 0:
+        gate_h: int = _parse_handle_int(parts[5])
+        if lock_h <= 0 or seq_h <= 0 or ver_h <= 0 or len_h <= 0 or alive_h <= 0 or gate_h <= 0:
             raise ConfigurationError("Invalid zero or negative atomic handle identifier")
         key_cell_strs: list[str] = nox.strings.split(parts[6], ",")
         if len(key_cell_strs) != SHARED_KEY_WORDS:
@@ -422,49 +499,173 @@ class KeyRing:
             cell_h_list.append(ch_val)
             ch_i = ch_i + 1
 
-        alive_atom: nox.atomic.AtomicBool = nox.atomic.from_bool_handle(alive_h)
-        if not alive_atom.load():
-            raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
+        gate_atom: nox.atomic.AtomicInt = nox.atomic.from_int_handle(gate_h)
+        # Single-word CAS gate acquisition: atomically verify SHARED_CLOSING_BIT == 0
+        # and register 1 attached worker (SHARED_WORKER_UNIT) + 1 in-flight reader (+1)
+        # before reading any other shared atomic cell!
+        gate_acquired: bool = False
+        g_spins: int = 0
+        while g_spins < MAX_SEQLOCK_ATTEMPTS:
+            g_cur: int = gate_atom.add(0)
+            if (g_cur & SHARED_CLOSING_BIT) != 0:
+                raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
+            if gate_atom.compare_and_swap(g_cur, g_cur + SHARED_WORKER_UNIT + 1):
+                gate_acquired = True
+                break
+            g_spins = g_spins + 1
+        if not gate_acquired:
+            raise ConfigurationError("Shared KeyRing gate contention timeout during attach_shared_handle")
 
-        key_cells: list[nox.atomic.AtomicInt] = []
-        k_i: int = 0
-        key_words: list[int] = []
-        while k_i < len(key_h_list):
-            kc: nox.atomic.AtomicInt = nox.atomic.from_int_handle(key_h_list[k_i])
-            key_cells.append(kc)
-            key_words.append(kc.add(0))
-            k_i = k_i + 1
-        seal_k: str = _unpack_shared_words(key_words, 64)
-        if nox.strings.byte_len(seal_k) != 64:
-            raise ConfigurationError("Invalid shared KeyRing seal key length")
+        old_lock: nox.atomic.AtomicBool = self._write_lock
+        old_seq: nox.atomic.AtomicInt = self._seq
+        old_ver: nox.atomic.AtomicInt = self._atomic_version
+        old_len: nox.atomic.AtomicInt = self._shared_len
+        old_alive: nox.atomic.AtomicBool = self._shared_alive
+        old_gate: nox.atomic.AtomicInt = self._shared_gate
+        old_key_cells: list[nox.atomic.AtomicInt] = self._shared_key_cells
+        old_seal_key: str = self._seal_key
+        old_cells: list[nox.atomic.AtomicInt] = self._shared_cells
+        old_synced_seq: int = self._shared_synced_seq
+        old_attached: bool = self._shared_attached
+        old_owner: bool = self._is_shared_owner
+        old_worker_reg: bool = self._shared_worker_registered
+        old_lifecycle: str = self._shared_lifecycle_local
 
-        cells: list[nox.atomic.AtomicInt] = []
-        i: int = 0
-        while i < len(cell_h_list):
-            cells.append(nox.atomic.from_int_handle(cell_h_list[i]))
-            i = i + 1
+        try:
+            alive_atom: nox.atomic.AtomicBool = nox.atomic.from_bool_handle(alive_h)
+            if not alive_atom.load():
+                raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
 
-        self._write_lock = nox.atomic.from_bool_handle(lock_h)
-        self._seq = nox.atomic.from_int_handle(seq_h)
-        self._atomic_version = nox.atomic.from_int_handle(ver_h)
-        self._shared_len = nox.atomic.from_int_handle(len_h)
-        self._shared_alive = alive_atom
-        self._shared_readers = nox.atomic.from_int_handle(readers_h)
-        self._shared_key_cells = key_cells
-        self._seal_key = seal_k
-        self._shared_cells = cells
-        self._shared_synced_seq = -1
-        self._shared_attached = True
-        # Immediately synchronize local snapshot from shared atomic cells via Seqlock
-        _synced: KeyRingState = self._read_consistent_state()
+            key_cells: list[nox.atomic.AtomicInt] = []
+            k_i: int = 0
+            key_words: list[int] = []
+            while k_i < len(key_h_list):
+                kc: nox.atomic.AtomicInt = nox.atomic.from_int_handle(key_h_list[k_i])
+                key_cells.append(kc)
+                key_words.append(kc.add(0))
+                k_i = k_i + 1
+            seal_k: str = _unpack_shared_words(key_words, 64)
+            if nox.strings.byte_len(seal_k) != 64:
+                raise ConfigurationError("Invalid shared KeyRing seal key length")
+
+            cells: list[nox.atomic.AtomicInt] = []
+            i: int = 0
+            while i < len(cell_h_list):
+                cells.append(nox.atomic.from_int_handle(cell_h_list[i]))
+                i = i + 1
+
+            self._write_lock = nox.atomic.from_bool_handle(lock_h)
+            self._seq = nox.atomic.from_int_handle(seq_h)
+            self._atomic_version = nox.atomic.from_int_handle(ver_h)
+            self._shared_len = nox.atomic.from_int_handle(len_h)
+            self._shared_alive = alive_atom
+            self._shared_gate = gate_atom
+            self._shared_readers = gate_atom
+            self._shared_key_cells = key_cells
+            self._seal_key = seal_k
+            self._shared_cells = cells
+            self._shared_synced_seq = -1
+            self._shared_attached = True
+            self._is_shared_owner = False
+            self._shared_worker_registered = True
+            self._shared_lifecycle_local = SHARED_STATE_ALIVE
+            # Synchronize local snapshot while holding the +1 reader slot in _shared_gate
+            _synced: KeyRingState = self._read_consistent_state_inner()
+        except Exception as err:
+            self._write_lock = old_lock
+            self._seq = old_seq
+            self._atomic_version = old_ver
+            self._shared_len = old_len
+            self._shared_alive = old_alive
+            self._shared_gate = old_gate
+            self._shared_readers = old_gate
+            self._shared_key_cells = old_key_cells
+            self._seal_key = old_seal_key
+            self._shared_cells = old_cells
+            self._shared_synced_seq = old_synced_seq
+            self._shared_attached = old_attached
+            self._is_shared_owner = old_owner
+            self._shared_worker_registered = old_worker_reg
+            self._shared_lifecycle_local = old_lifecycle
+            gate_atom.add(-(SHARED_WORKER_UNIT + 1))
+            raise ConfigurationError(str(err))
+
+        if old_attached and old_worker_reg and old_gate.handle > 0 and old_gate.handle != gate_h:
+            old_gate.add(-SHARED_WORKER_UNIT)
+        # Release temporary +1 reader slot, retaining +SHARED_WORKER_UNIT for attached worker lifecycle
+        self._shared_gate.add(-1)
+
+    def detach_shared_handle(self) -> None:
+        if not self._shared_attached:
+            return
+        if self._is_shared_owner:
+            raise ConfigurationError("Owning KeyRing instance cannot call detach_shared_handle(); use free_shared_handle() instead")
+        if self._shared_worker_registered:
+            spins: int = 0
+            while spins < MAX_SEQLOCK_ATTEMPTS:
+                cur: int = self._shared_gate.add(0)
+                workers: int = (cur >> 32) & SHARED_READER_MASK
+                if workers <= 0:
+                    break
+                if self._shared_gate.compare_and_swap(cur, cur - SHARED_WORKER_UNIT):
+                    break
+                spins = spins + 1
+            self._shared_worker_registered = False
+        cur_ver: int = self._state.version
+        self._write_lock = nox.atomic.new_bool(False)
+        self._seq = nox.atomic.new_int(cur_ver * 2)
+        self._atomic_version = nox.atomic.new_int(cur_ver)
+        seed_material: str = "CIPHER-KR-HMAC-V2|" + self.trust_domain + "|" + str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle)
+        self._seal_key = nox.crypto.sha256(seed_material)
+        self._state_mac = nox.crypto.hmac_sha256(self._seal_key, self._state.get_seal_hash())
+        self._shared_attached = False
+        self._is_shared_owner = False
+        self._shared_lifecycle_local = SHARED_STATE_UNSHARED
+        self._shared_synced_seq = cur_ver * 2
+        self._shared_alive = nox.atomic.from_bool_handle(0)
+        self._shared_gate = nox.atomic.from_int_handle(0)
+        self._shared_readers = self._shared_gate
+        self._shared_len = nox.atomic.from_int_handle(0)
+        empty_key_cells: list[nox.atomic.AtomicInt] = []
+        self._shared_key_cells = empty_key_cells
+        empty_cells: list[nox.atomic.AtomicInt] = []
+        self._shared_cells = empty_cells
+
+    def begin_closing_shared_state(self) -> None:
+        # Transitions the shared handle from ALIVE -> CLOSING by atomically setting
+        # SHARED_CLOSING_BIT on _shared_gate via CAS. Once set, all new reader registrations
+        # (_try_acquire_reader_gate) and new worker attachments (attach_shared_handle)
+        # are immediately rejected at the hardware CAS gate.
+        if not self._shared_attached:
+            return
+        if not self._is_shared_owner:
+            raise ConfigurationError("Only the owning KeyRing instance may close the shared handle")
+        gate_spins: int = 0
+        gate_closed: bool = False
+        while gate_spins < MAX_SEQLOCK_ATTEMPTS:
+            g_cur: int = self._shared_gate.add(0)
+            if (g_cur & SHARED_CLOSING_BIT) != 0:
+                gate_closed = True
+                break
+            if self._shared_gate.compare_and_swap(g_cur, g_cur | SHARED_CLOSING_BIT):
+                gate_closed = True
+                break
+            gate_spins = gate_spins + 1
+        if not gate_closed:
+            raise ConfigurationError("Shared KeyRing gate contention timeout while setting SHARED_CLOSING_BIT")
+        self._shared_lifecycle_local = SHARED_STATE_CLOSING
 
     def zeroize_shared_state(self) -> None:
         # Strictly requires acquiring the hardware writer lock (_write_lock) before
         # modifying any shared cell. If another writer holds the lock and it cannot
         # be acquired within the bounded spin window, fails closed with ConfigurationError
         # without touching a single shared cell!
+        # Critical section is wrapped in try/except (0.16.4) so _write_lock is ALWAYS
+        # released and Seqlock is restored to an even value on any error.
         if not self._shared_attached:
             return
+        if not self._is_shared_owner:
+            raise ConfigurationError("Only the owning KeyRing instance may call zeroize_shared_state()")
         spins: int = 0
         locked: bool = False
         while spins < 4096:
@@ -475,42 +676,79 @@ class KeyRing:
         if not locked:
             raise ConfigurationError("Zeroization contention error: cannot zeroize shared state while writer lock is held")
 
-        # Enter Seqlock odd write phase with Acquire-Release RMW fence
-        cur_seq: int = self._seq.add(0)
-        if (cur_seq & 1) == 0:
-            self._seq.add(1)
-        self._shared_alive.store(False)
-        self._shared_len.store(0)
-        i: int = 0
-        while i < len(self._shared_cells):
-            self._shared_cells[i].store(0)
-            i = i + 1
-        k_i: int = 0
-        while k_i < len(self._shared_key_cells):
-            self._shared_key_cells[k_i].store(0)
-            k_i = k_i + 1
-        empty_keys: list[KeyRef] = []
-        self._state = KeyRingState(0, empty_keys, 0)
-        self._seal_key = ""
-        self._state_mac = ""
-        # Seal Seqlock to next even value and release writer lock
-        self._seq.add(1)
+        seq_odd_entered: bool = False
+        try:
+            # 1. Atomically set SHARED_CLOSING_BIT on single-word _shared_gate via CAS (ALIVE -> CLOSING)
+            gate_spins: int = 0
+            gate_closed: bool = False
+            while gate_spins < MAX_SEQLOCK_ATTEMPTS:
+                g_cur: int = self._shared_gate.add(0)
+                if (g_cur & SHARED_CLOSING_BIT) != 0:
+                    gate_closed = True
+                    break
+                if self._shared_gate.compare_and_swap(g_cur, g_cur | SHARED_CLOSING_BIT):
+                    gate_closed = True
+                    break
+                gate_spins = gate_spins + 1
+            if not gate_closed:
+                raise ConfigurationError("Zeroization gate contention timeout on _shared_gate")
+            self._shared_lifecycle_local = SHARED_STATE_CLOSING
+
+            # 2. Enter Seqlock odd write phase with Acquire-Release RMW fence
+            cur_seq: int = self._seq.add(0)
+            if (cur_seq & 1) == 0:
+                self._seq.add(1)
+                seq_odd_entered = True
+
+            # 3. Overwrite shared length, data cells, and HMAC key cells with zeros
+            self._shared_alive.store(False)
+            self._shared_len.store(0)
+            i: int = 0
+            while i < len(self._shared_cells):
+                self._shared_cells[i].store(0)
+                i = i + 1
+            k_i: int = 0
+            while k_i < len(self._shared_key_cells):
+                self._shared_key_cells[k_i].store(0)
+                k_i = k_i + 1
+            empty_keys: list[KeyRef] = []
+            self._state = KeyRingState(0, empty_keys, 0)
+            self._seal_key = ""
+            self._state_mac = ""
+
+            # 4. Seal Seqlock to next even value and transition to DRAINING
+            if seq_odd_entered:
+                self._seq.add(1)
+                seq_odd_entered = False
+            self._shared_lifecycle_local = SHARED_STATE_DRAINING
+        except Exception as err:
+            if seq_odd_entered:
+                self._seq.add(1)
+            self._write_lock.store(False)
+            raise ConfigurationError(str(err))
+
         self._write_lock.store(False)
 
     def active_shared_readers(self) -> int:
         if not self._shared_attached:
             return 0
-        return self._shared_readers.add(0)
+        return self._shared_gate.add(0) & SHARED_READER_MASK
 
-    def free_shared_handle(self) -> None:
+    def free_shared_handle(self, require_zero_workers: bool = False) -> None:
         if self._shared_attached:
-            if self._shared_alive.load():
+            if not self._is_shared_owner:
+                raise ConfigurationError("Only the owning KeyRing instance may call free_shared_handle(); worker instances must call detach_shared_handle()")
+            if require_zero_workers and self.attached_shared_workers() > 0:
+                raise ConfigurationError("Cannot free shared KeyRing handle while worker instances are still attached")
+            if self._shared_alive.load() or (self._shared_gate.add(0) & SHARED_CLOSING_BIT) == 0:
                 self.zeroize_shared_state()
-            # Drain all active concurrent readers before deallocating underlying atomic cells
+            # Drain all active concurrent readers via single-word _shared_gate before deallocating cells.
+            # Because SHARED_CLOSING_BIT is set in _shared_gate, no new reader can ever increment
+            # the low 30 bits; once (gate & SHARED_READER_MASK) reaches 0, it remains 0 permanently.
             drain_spins: int = 0
-            while self._shared_readers.add(0) > 0 and drain_spins < 4096:
+            while (self._shared_gate.add(0) & SHARED_READER_MASK) > 0 and drain_spins < 4096:
                 drain_spins = drain_spins + 1
-            if self._shared_readers.add(0) > 0:
+            if (self._shared_gate.add(0) & SHARED_READER_MASK) > 0:
                 raise ConfigurationError("Cannot free shared KeyRing handle while active readers are in flight")
             i: int = 0
             while i < len(self._shared_cells):
@@ -522,8 +760,11 @@ class KeyRing:
                 k_i = k_i + 1
             self._shared_len.free()
             self._shared_alive.free()
-            self._shared_readers.free()
+            self._shared_gate.free()
             self._shared_attached = False
+            self._is_shared_owner = False
+            self._shared_worker_registered = False
+            self._shared_lifecycle_local = SHARED_STATE_DESTROYED
 
     def _read_consistent_state_inner(self) -> KeyRingState:
         # Seqlock + Hardware Acquire-Release RMW Reader Protocol
@@ -532,7 +773,7 @@ class KeyRing:
         # - Release semantics on s2 prevent prior loads of _state / _shared_cells from sinking below s2.
         attempts: int = 0
         while attempts < MAX_SEQLOCK_ATTEMPTS:
-            if self._shared_attached and not self._shared_alive.load():
+            if self._shared_attached and ((self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0 or not self._shared_alive.load()):
                 raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
             s1: int = self._seq.add(0)
             if (s1 & 1) != 0:
@@ -549,7 +790,7 @@ class KeyRing:
                     raw_words = self._read_shared_words_raw(raw_len)
             s2: int = self._seq.add(0)
             if s1 == s2:
-                if self._shared_attached and not self._shared_alive.load():
+                if self._shared_attached and ((self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0 or not self._shared_alive.load()):
                     raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
                 if need_shared_unpack:
                     if raw_len <= 0 or len(raw_words) == 0:
@@ -574,19 +815,19 @@ class KeyRing:
     def _read_consistent_state(self) -> KeyRingState:
         if not self._shared_attached:
             return self._read_consistent_state_inner()
-        # Register active reader in _shared_readers before checking _shared_alive
-        # so free_shared_handle() cannot deallocate cells while a reader is in flight.
-        self._shared_readers.add(1)
-        if not self._shared_alive.load():
-            self._shared_readers.add(-1)
+        # Acquire single-word CAS reader gate (_shared_gate):
+        # Atomically checks (gate & SHARED_CLOSING_BIT) == 0 and increments active_readers
+        # in a single CAS loop. If SHARED_CLOSING_BIT is set, immediately fails closed
+        # without ever incrementing the reader count or touching any other shared cell.
+        if not self._try_acquire_reader_gate():
             raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
         res: KeyRingState = self._state
         try:
             res = self._read_consistent_state_inner()
         except Exception as err:
-            self._shared_readers.add(-1)
+            self._release_reader_gate()
             raise ConfigurationError(str(err))
-        self._shared_readers.add(-1)
+        self._release_reader_gate()
         return res
 
     def get_version(self) -> int:
@@ -606,11 +847,13 @@ class KeyRing:
         self._write_lock.store(False)
 
     def _commit_state(self, base_ver: int, new_state: KeyRingState) -> None:
+        if self._shared_attached and ((self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0 or not self._shared_alive.load()):
+            raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
         # 1. Hardware Atomic Writer Mutex Acquisition (nox_atomic_cas on AtomicBool: casal / lock cmpxchg)
         if not self._write_lock.compare_and_swap(False, True):
             raise ConfigurationError("Concurrent modification in progress: writer mutex lock contention")
 
-        if self._shared_attached and not self._shared_alive.load():
+        if self._shared_attached and ((self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0 or not self._shared_alive.load()):
             self._write_lock.store(False)
             raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
 

@@ -4,6 +4,22 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.10] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL X Architecture Audit)
+- **Single-Word 64-Bit Atomic CAS Gate (`_shared_gate`) Closing the `T1..T5` Reader-vs-Free Race (`keyring.nox`, `cipher.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Replaced the split two-variable `_shared_alive` + `_shared_readers` entry sequence with a unified 64-bit `nox.atomic.AtomicInt` gate (`_shared_gate`) encoding active in-flight readers (`SHARED_READER_MASK = 1073741823`, bits `0..29`), the closing flag (`SHARED_CLOSING_BIT = 1073741824`, bit `30`), and attached worker instances (`SHARED_WORKER_UNIT = 4294967296`, bits `32..61`) in a single hardware atomic word.
+  - Readers acquire the gate via `_try_acquire_reader_gate()` using a `compare_and_swap` loop on `_shared_gate`. Once `SHARED_CLOSING_BIT` is set (`compare_and_swap(cur, cur | SHARED_CLOSING_BIT)`), any concurrent or subsequent reader registration or `attach_shared_handle()` call is atomically rejected at the CPU cache-coherency level **without ever incrementing the reader count or dereferencing any other shared cell**, eliminating the `T1..T5` race window (**Test 17b**).
+- **Explicit 5-State Shared Handle Lifecycle State Machine (`UNSHARED → ALIVE → CLOSING → DRAINING → DESTROYED`) (`keyring.nox`, `cipher.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added and exported lifecycle constants `SHARED_STATE_UNSHARED`, `SHARED_STATE_ALIVE`, `SHARED_STATE_CLOSING`, `SHARED_STATE_DRAINING`, and `SHARED_STATE_DESTROYED`, along with `KeyRing.get_shared_lifecycle_state(self) -> str` and `KeyRing.begin_closing_shared_state(self) -> None` (**Test 17a**).
+- **Owner-Controlled Teardown & Worker `detach_shared_handle()` Contract (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Marked the `KeyRing` instance that calls `export_shared_handle()` as the exclusive owner (`is_shared_owner() == True`) and tracked attached worker instances atomically in `_shared_gate` (`attached_shared_workers() -> int`).
+  - Added `detach_shared_handle(self) -> None` for worker instances and `free_shared_handle(self, require_zero_workers: bool = False) -> None` for the owner. Non-owner worker instances calling `free_shared_handle()`, `zeroize_shared_state()`, or `begin_closing_shared_state()` fail closed immediately with `ConfigurationError` (**Test 17c**, **Test 17d**).
+- **Exception-Safe Writer Lock Release in `zeroize_shared_state()` (`keyring.nox`):**
+  - Wrapped the critical section of `zeroize_shared_state()` in a `try ... except Exception as err:` block that guarantees Seqlock even-counter restoration (`_seq.add(1)`) and unconditional `_write_lock.store(False)` release on any error.
+- **Cross-Version Benchmark Comparison Table & CI Summary (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`):**
+  - Added `docs/benchmark-baseline.json` (`v1.0.9` reference metrics) and upgraded `tests/benchmark_keyring_test.nox` to generate `benchmark-comparison.md` alongside `benchmark-results.json`, published directly to `$GITHUB_STEP_SUMMARY` and uploaded as a CI artifact.
+
 ## [1.0.9] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL IX Architecture Audit)

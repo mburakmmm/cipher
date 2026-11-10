@@ -4,6 +4,7 @@ import nox.fs
 import nox.test
 import nox.time
 from cipher import KeyRef, KeyRing, KeyRingState, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_VERIFY_ONLY
+from json_strict import get_field_value, get_int_field, get_string_field, parse_strict_json
 
 def _sort_ints(arr: list[int]) -> list[int]:
     out: list[int] = []
@@ -172,11 +173,11 @@ scale_16_ms: int = _bench_key_scaling(16)
 scale_64_ms: int = _bench_key_scaling(64)
 
 # ==============================================================================
-# 6. Export Structured JSON Benchmark Artifact for CI Tracking (0.14.6 & 0.15.6)
+# 6. Export Structured JSON Benchmark Artifact & Cross-Version Comparison Table (0.14.6, 0.15.6, 0.16.6)
 # ==============================================================================
 bench_json: str = "{\n"
 bench_json = bench_json + "  \"suite\": \"cipher_keyring_benchmark\",\n"
-bench_json = bench_json + "  \"version\": \"1.0.9\",\n"
+bench_json = bench_json + "  \"version\": \"1.0.10\",\n"
 bench_json = bench_json + "  \"metrics\": {\n"
 bench_json = bench_json + "    \"seqlock_get_signing_key_2000_ms\": " + str(read_sign_ms) + ",\n"
 bench_json = bench_json + "    \"seqlock_get_signing_key_batch200_p50_ms\": " + str(sign_p50_ms) + ",\n"
@@ -197,5 +198,41 @@ bench_json = bench_json + "  }\n"
 bench_json = bench_json + "}\n"
 nox.fs.write_string("benchmark-results.json", bench_json)
 nox.test.assert_true(nox.fs.exists("benchmark-results.json"), "benchmark-results.json artifact written")
+
+def _fmt_delta(curr: int, base: int) -> str:
+    diff: int = curr - base
+    if diff > 0:
+        return "+" + str(diff) + " ms"
+    return str(diff) + " ms"
+
+def _cmp_row(name: str, base_v: int, curr_v: int) -> str:
+    return "| `" + name + "` | " + str(base_v) + " ms | " + str(curr_v) + " ms | " + _fmt_delta(curr_v, base_v) + " |\n"
+
+nox.test.assert_true(nox.fs.exists("docs/benchmark-baseline.json"), "docs/benchmark-baseline.json exists")
+base_raw: str = nox.fs.read_to_string("docs/benchmark-baseline.json")
+base_doc: JsonValue = parse_strict_json(base_raw)
+base_ver: str = get_string_field(base_doc, "version")
+bm: JsonValue = get_field_value(base_doc, "metrics")
+
+cmp_md: str = "## Cipher KeyRing Cross-Version Benchmark Comparison (`v" + base_ver + "` vs `v1.0.10`)\n\n"
+cmp_md = cmp_md + "| Benchmark Metric | Baseline (`v" + base_ver + "`) | Current (`v1.0.10`) | Delta |\n"
+cmp_md = cmp_md + "|---|---:|---:|---:|\n"
+cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_2000_ms", get_int_field(bm, "seqlock_get_signing_key_2000_ms"), read_sign_ms)
+cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_batch200_p50_ms", get_int_field(bm, "seqlock_get_signing_key_batch200_p50_ms"), sign_p50_ms)
+cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_batch200_p95_ms", get_int_field(bm, "seqlock_get_signing_key_batch200_p95_ms"), sign_p95_ms)
+cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_2000_ms", get_int_field(bm, "seqlock_get_verification_key_2000_ms"), read_ver_ms)
+cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_batch200_p50_ms", get_int_field(bm, "seqlock_get_verification_key_batch200_p50_ms"), ver_p50_ms)
+cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_batch200_p95_ms", get_int_field(bm, "seqlock_get_verification_key_batch200_p95_ms"), ver_p95_ms)
+cmp_md = cmp_md + _cmp_row("atomic_rotate_50_ms", get_int_field(bm, "atomic_rotate_50_ms"), rot_ms)
+cmp_md = cmp_md + _cmp_row("atomic_rotate_batch5_p50_ms", get_int_field(bm, "atomic_rotate_batch5_p50_ms"), rot_p50_ms)
+cmp_md = cmp_md + _cmp_row("atomic_rotate_batch5_p95_ms", get_int_field(bm, "atomic_rotate_batch5_p95_ms"), rot_p95_ms)
+cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_20_ms", get_int_field(bm, "cross_thread_shared_sync_20_ms"), shared_sync_ms)
+cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_batch2_p50_ms", get_int_field(bm, "cross_thread_shared_sync_batch2_p50_ms"), sync_p50_ms)
+cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_batch2_p95_ms", get_int_field(bm, "cross_thread_shared_sync_batch2_p95_ms"), sync_p95_ms)
+cmp_md = cmp_md + _cmp_row("scaling_200_verify_1_key_ms", get_int_field(bm, "scaling_200_verify_1_key_ms"), scale_1_ms)
+cmp_md = cmp_md + _cmp_row("scaling_200_verify_16_keys_ms", get_int_field(bm, "scaling_200_verify_16_keys_ms"), scale_16_ms)
+cmp_md = cmp_md + _cmp_row("scaling_200_verify_64_keys_ms", get_int_field(bm, "scaling_200_verify_64_keys_ms"), scale_64_ms)
+nox.fs.write_string("benchmark-comparison.md", cmp_md)
+nox.test.assert_true(nox.fs.exists("benchmark-comparison.md"), "benchmark-comparison.md artifact written")
 
 print("benchmark_keyring_test passed! (sign_2000=" + str(read_sign_ms) + "ms, rot_50=" + str(rot_ms) + "ms, sync_20=" + str(shared_sync_ms) + "ms, scale_64k=" + str(scale_64_ms) + "ms)")
