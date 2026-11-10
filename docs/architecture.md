@@ -58,6 +58,10 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 - Rejects non-HTTPS schemes unconditionally.
 - Rejects all loopback addresses (`127.0.0.0/8`, `::1`, `localhost`, `0.0.0.0`).
 - Rejects link-local and cloud metadata (`169.254.0.0/16`, `fe80::`, metadata endpoints).
+- Rejects RFC 6598 CGNAT (`100.64.0.0/10`) and RFC 2544 Benchmark (`198.18.0.0/15`).
+- Rejects full IPv6 ULA (`fc00::/7`), link-local (`fe80::/10`), and IPv4-mapped IPv6.
+- Enforces DNS Pinning and redirect chain re-validation on all external HTTP transport adapters to prevent TOCTOU DNS rebinding SSRF.
+
 - Rejects all RFC 1918 private IPv4 ranges (`10.0.0.0/8`, `192.168.0.0/16`, and all 16 subnets of `172.16.0.0/12`).
 - Negative cache is bounded by `MAX_NEGATIVE_CACHE_ENTRIES` (256) with FIFO eviction, preventing memory exhaustion attacks under random `kid` floods.
 - Note on transport: Full socket pinning and DNS rebinding protections belong to NOX's common HTTP transport layer when remote HTTP fetching is integrated.

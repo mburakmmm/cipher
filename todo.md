@@ -504,3 +504,48 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
   - `tests/jwks_stress_test.nox` ile 1.000+ ardışık bilinmeyen kid altında negative cache'in 256 kayıtta bounded tutulduğu ve FIFO tahliyesi doğrulandı.
   - Test sonucu: `16 passed, 0 failed (16 total)` tam başarı.
   - Sürüm `1.0.2` yapıldı, `CHANGELOG.md` güncellendi, `v1.0.2` tag'i push edildi ve `noxc publish` çalıştırıldı.
+
+---
+
+# Phase 9 — `v1.0.3` Enterprise Concurrency, Immutable Keys & Advanced Hardening (SOL III Analizi)
+
+**Amaç:** Üçüncü bağımsız teknik incelemede (GPT 6 SOL III analizi) tespit edilen ileri düzey mimari ve üretim eksiklerini eksiksiz gidermek: KeyRing'de döndürülen referansların dış mutasyonlara karşı korunması (defensive cloning / immutability), çoklu yazarlar için CAS / version koordinasyonu, RSA exponent uzunluk sınırı ve taşma (overflow) koruması, `jwks.nox` içindeki çift `0x` kontrolünün düzeltilmesi ve yapısal IP/CIDR doğrulayıcısı, gerçek paket tüketicisi doğrulama betiği ve eşzamanlı stres testleri.
+
+## 0.9.1 — P0: KeyRef İmmutability & Dış Mutasyon Koruması (`keyring.nox`, `keys.nox`)
+- [x] `KeyRing.get_signing_key()` ve `KeyRing.get_verification_key()` metodlarının dahili snapshot'taki nesneyi doğrudan dönmek yerine `k.clone()` ile defansif kopya dönmesini sağla.
+- [x] Dışarıdan elde edilen `KeyRef` referansı üzerinde yapılacak `state`, `secret_material` vb. alan mutasyonlarının KeyRing'in yayımlanmış snapshot'ını etkilemediğini doğrulayan birim test ekle (`tests/keyring_test.nox`).
+
+## 0.9.2 — P0: Çoklu Yazar (Multi-Writer) CAS & Version Koordinasyonu (`keyring.nox`)
+- [x] `KeyRing` sınıfına monoton artan `version: int` alanı ekle.
+- [x] `rotate()`, `add_key()` ve `revoke()` işlemlerinde optimistic concurrency control / CAS denetimi uygula:
+  - İşlem öncesinde base snapshot versiyonunu kaydet.
+  - Commit aşamasında versiyon kontrolü yaparak concurrent write yarışlarını fail-closed olarak tespit et ve `ConfigurationError` fırlat.
+  - Başarılı commit'te versiyonu artır (`self.version = self.version + 1`).
+- [x] `tests/concurrency_keyring_test.nox` içine eşzamanlı çakışan yazarların tespiti testini ekle.
+
+## 0.9.3 — P0: RSA Exponent Uzunluk Sınırı ve Tamsayı Taşma Koruması (`jwk.nox`)
+- [x] RFC 7518 §6.3.1.2 ve kriptografik standartlar uyarınca RSA public exponent `e` için azami uzunluk sınırı getir (`len(self.e) <= 11`, azami 64-bit tamsayı, taşma koruması).
+- [x] `_b64url_to_uint` öncesinde aşırı büyük veya taşma riski taşıyan exponent değerlerini fail-closed reddet (`InvalidKeyError`).
+- [x] `tests/jwk_test.nox` içerisine aşırı uzun exponent negatif testini ekle.
+
+## 0.9.4 — P1: JWKS Çift Kontrol Düzeltmesi ve Yapısal IP/CIDR Doğrulaması (`jwks.nox`)
+- [x] `jwks.nox` satırındaki mükerrer `nox.strings.contains(host, "0x") or nox.strings.contains(host, "0x")` kontrolünü düzelt.
+- [x] Yapısal IP/CIDR kontrolü ekle:
+  - 4 parçalı IPv4 octet'lerini sayısal olarak ayrıştırıp `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`, `0.0.0.0/8`, `100.64.0.0/10` (CGNAT RFC 6598), `198.18.0.0/15` (Benchmark RFC 2544), `224.0.0.0/4` (Multicast), `240.0.0.0/4` (Reserved) CIDR aralıklarını tam olarak filtrele.
+  - IPv6 için `::1`, `::`, `fc00::/7` (ULA), `fe80::/10` (Link-local), `::ffff:0:0/96` (IPv4-mapped) yapısal doğrulaması yap.
+- [x] `docs/threat-model.md` ve `docs/architecture.md` dosyalarına gerçek HTTP istemcisi entegrasyonu için DNS Pinning (post-resolution IP sabitleme) ve redirect zinciri gereksinimlerini dokümante et.
+- [x] `tests/jwks_test.nox` içine CGNAT (`100.64.1.1`) ve Benchmark (`198.18.0.1`) test vektörlerini ekle.
+
+## 0.9.5 — P1: Gerçek Paket Tüketicisi Doğrulama Betiği (`scripts/test-isolated-consumer.sh`)
+- [x] `scripts/test-isolated-consumer.sh` betiğini kopyalama ve paket hiyerarşisi (`cipher/*.nox`) ile gerçek bağımsız proje tüketimini doğrulayacak şekilde güncelle ve çalıştır.
+
+## 0.9.6 — P2: JWKS Ağ Kesintisi, Stale Window ve Asenkron Simülasyon Testleri (`tests/jwks_stress_test.nox`)
+- [x] `tests/jwks_stress_test.nox` içerisine ağ gecikmesi, `mark_outage()`, stale penceresi aşımı ve taze besleme geçişlerini içeren simülasyon testleri ekle.
+
+## 0.9.7 — Phase 9 Çıkış Kapısı ve `v1.0.3` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (16+ test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve doğrula.
+- [x] `nox.json` versiyonunu `1.0.3` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.3` sürüm notlarını ekle.
+- [~] Git commit, `v1.0.3` git tag push ve `noxc publish` çalıştır.
+- [ ] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

@@ -52,7 +52,15 @@
 ### 2.6 Fetch Storms and DoS via Unknown `kid`
 - **Threat:** Attacker sends thousands of requests with random `kid`s to trigger an outgoing JWKS HTTP request for every token.
 - **Mitigation:**
-  - Rate limiting, request coalescing, and negative caching for non-existent `kid`s.
+  - Rate limiting, request coalescing, and negative caching for non-existent `kid`s (bounded at 256 entries).
+
+### 2.7 DNS Rebinding, Redirect Chains, and DNS Pinning in Real HTTP Transport
+- **Threat:** Attacker registers a domain (e.g. `evil-jwks.org`) that resolves to a public IP on pre-check, but returns a private IP (`127.0.0.1` or `169.254.169.254`) upon actual HTTP connection (DNS Rebinding / TOCTOU SSRF). Alternatively, the server responds with a 302 redirect pointing to an internal service.
+- **Mitigation & Normative Requirements:**
+  - **DNS Pinning:** Any production HTTP transport adapter consuming `JwksKeySource` must perform DNS resolution once, validate the resolved IP against Cipher's `_is_restricted_ipv4` / IPv6 CIDR filters, and connect strictly to the pinned socket IP address with SNI hostname verification.
+  - **Strict Redirect Handling:** The HTTP transport client must either disable redirects completely or re-run `is_safe_jwks_url()` on every redirect target in the chain prior to following it.
+  - **Structural CIDR Blocking:** Cipher automatically rejects all 14 non-routable CIDR blocks, including RFC 6598 CGNAT (`100.64.0.0/10`) and RFC 2544 Benchmark (`198.18.0.0/15`).
+
 
 ---
 

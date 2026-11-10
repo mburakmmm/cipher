@@ -8,6 +8,9 @@ from errors import EncodingError, InvalidKeyError, JsonFormatError
 from json_strict import get_string_field, has_field, is_object, parse_strict_json
 
 MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
+MAX_RSA_EXPONENT_CHARS: int = 11  # Upper bound for 64-bit RSA public exponent (e.g. 65537 'AQAB' is 4 chars)
+MAX_SAFE_INT_BEFORE_SHIFT: int = 140737488355327  # (2^53 - 1) >> 6: Safe integer overflow prevention
+
 
 def _b64_char_to_val(code: int) -> int:
     if code >= 65 and code <= 90:
@@ -35,6 +38,8 @@ def _b64url_to_uint(s: str) -> int:
         c_val: int = _b64_char_to_val(code)
         if c_val < 0:
             raise InvalidKeyError("Invalid character in Base64URL integer")
+        if val > MAX_SAFE_INT_BEFORE_SHIFT:
+            raise InvalidKeyError("Integer overflow detected while decoding Base64URL integer")
         val = (val << 6) | c_val
         i = i + 1
     
@@ -98,6 +103,8 @@ class JwkKey:
             # 3. Public exponent 'e' validation (RFC 7518 §6.3.1.2)
             if len(self.e) == 0 or len(self.e) % 4 == 1:
                 raise InvalidKeyError("RSA public exponent 'e' has invalid Base64URL length")
+            if len(self.e) > MAX_RSA_EXPONENT_CHARS:
+                raise InvalidKeyError("RSA public exponent 'e' exceeds maximum allowable length of " + str(MAX_RSA_EXPONENT_CHARS) + " characters")
             e_c0: int = _b64_char_to_val(ord(self.e[0]))
             e_c1: int = _b64_char_to_val(ord(self.e[1]))
             e_first_byte: int = (e_c0 << 2) | (e_c1 >> 4)

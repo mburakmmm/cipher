@@ -4,6 +4,22 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL III Architecture Audit)
+- **KeyRef Defensive Cloning & Snapshot Immutability (`keyring.nox`):** `KeyRing.get_signing_key()` and `KeyRing.get_verification_key()` now return defensive clones (`k.clone()`). Mutations on caller-held `KeyRef` references (e.g. `k.state = STATE_RETIRED` or tampering with `secret_material`) cannot affect or corrupt the internal KeyRing published snapshot. Verified in `tests/keyring_test.nox`.
+- **Multi-Writer Optimistic Concurrency Control (CAS) & Versioning (`keyring.nox`):** Added a monotonically increasing `version: int` attribute and `expected_version` CAS parameter to `add_key()`, `rotate()`, and `revoke()`. Concurrent conflicting writers attempting to commit state against a stale snapshot are immediately detected and rejected with `ConfigurationError` without mutating KeyRing state. Added `get_version()` and `get_snapshot()`, verified in `tests/concurrency_keyring_test.nox`.
+- **RSA Public Exponent Length Upper Bound & Integer Overflow Protection (`jwk.nox`):** Enforces an explicit upper bound on RSA public exponent length (`MAX_RSA_EXPONENT_CHARS: int = 11`, 64-bit / 8 bytes ceiling, RFC 7518 §6.3.1.2) and guards `_b64url_to_uint` against 64-bit integer bit-shift overflows (> `MAX_SAFE_INT_BEFORE_SHIFT = 140737488355327`). Excessively long or overflowing exponent values fail closed with `InvalidKeyError`. Negative tests added in `tests/jwk_test.nox`.
+- **Structural IP Parsing & 14-CIDR SSRF Filter (`jwks.nox`):**
+  - Removed duplicate `0x` check.
+  - Implemented numerical `_is_restricted_ipv4` parser filtering 14 non-routable CIDR blocks: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (RFC 6598 CGNAT), `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15` (RFC 2544 Benchmark), `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, and `240.0.0.0/4`.
+  - Applied structural verification to IPv4-mapped IPv6 targets (`::ffff:...`).
+  - Added negative test vectors in `tests/jwks_test.nox`.
+  - Documented DNS Pinning and redirect chain requirements in `docs/threat-model.md` and `docs/architecture.md`.
+- **Package Hierarchy Submodule Forwarding Facade (`cipher/`):** Added package forwarding directory (`cipher/*.nox`) enabling external consumers using `nox.json` `requires` and `noxc fetch` to consume Cipher seamlessly via standard NOX package resolution (`from cipher.cipher import ...` or `from cipher.jwt import ...`).
+- **JWKS Network Outage & Stale Grace Transition Suite (`tests/jwks_stress_test.nox`):** Added simulation test suite verifying `mark_outage()` recording, stale grace window tolerances during active outages, fail-closed enforcement when stale grace is exceeded, and instant recovery upon fresh JWKS feed delivery.
+
+
 ## [1.0.2] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL II Architecture Audit)

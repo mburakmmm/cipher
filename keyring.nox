@@ -10,12 +10,30 @@ from rotation import RotationReceipt
 class KeyRing:
     trust_domain: str
     keys: list[KeyRef]
+    version: int
 
     def __init__(self, trust_domain: str = "default") -> None:
         self.trust_domain = trust_domain
         self.keys = []
+        self.version = 0
 
-    def add_key(self, key: KeyRef) -> None:
+    def get_version(self) -> int:
+        return self.version
+
+    def get_snapshot(self) -> list[KeyRef]:
+        snap: list[KeyRef] = []
+        i: int = 0
+        n: int = len(self.keys)
+        while i < n:
+            snap.append(self.keys[i].clone())
+            i = i + 1
+        return snap
+
+    def add_key(self, key: KeyRef, expected_version: int = -1) -> None:
+        # Optimistic concurrency check (CAS)
+        if expected_version >= 0 and self.version != expected_version:
+            raise ConfigurationError("KeyRing version mismatch (CAS failed): expected " + str(expected_version) + ", current is " + str(self.version))
+
         # Cross-tenant trust domain boundary check
         if key.trust_domain != self.trust_domain:
             raise ConfigurationError("Key trust domain mismatch: key is '" + key.trust_domain + "', keyring is '" + self.trust_domain + "'")
@@ -45,6 +63,7 @@ class KeyRing:
             k_idx = k_idx + 1
         new_snap.append(key.clone())
         self.keys = new_snap
+        self.version = self.version + 1
 
     def get_signing_key(self, algorithm: str) -> KeyRef:
         snap: list[KeyRef] = self.keys
@@ -53,7 +72,8 @@ class KeyRing:
         while i < n:
             k: KeyRef = snap[i]
             if k.algorithm == algorithm and k.can_sign():
-                return k
+                # Defensive cloning: Caller cannot mutate internal snapshot state
+                return k.clone()
             i = i + 1
         raise KeyUnavailableError("No active signing key available for algorithm: " + algorithm)
 
@@ -68,12 +88,17 @@ class KeyRing:
                     raise KeyUnavailableError("Key has been revoked: " + kid)
                 if not k.can_verify(current_time_sec):
                     raise KeyUnavailableError("Key is retired or past its overlap window: " + kid)
-                return k
+                # Defensive cloning: Caller cannot mutate internal snapshot state
+                return k.clone()
             i = i + 1
         raise UnknownKeyError("Key not found in keyring: " + kid)
 
     def rotate(self, new_key: KeyRef, overlap_seconds: int = 3600,
-               clock_time_sec: int = 0) -> RotationReceipt:
+               clock_time_sec: int = 0, expected_version: int = -1) -> RotationReceipt:
+        # Optimistic concurrency check (CAS)
+        if expected_version >= 0 and self.version != expected_version:
+            raise ConfigurationError("KeyRing rotation CAS failed: expected version " + str(expected_version) + ", current is " + str(self.version))
+
         now: int = clock_time_sec
         if now <= 0:
             now = nox.time.now_ms() // 1000
@@ -126,11 +151,16 @@ class KeyRing:
         activated_new.activated_at = now
         new_snap.append(activated_new)
 
-        # Single-step atomic reference publication
+        # Single-step atomic reference publication and version increment
         self.keys = new_snap
+        self.version = self.version + 1
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
-    def revoke(self, kid: str) -> None:
+    def revoke(self, kid: str, expected_version: int = -1) -> None:
+        # Optimistic concurrency check (CAS)
+        if expected_version >= 0 and self.version != expected_version:
+            raise ConfigurationError("KeyRing revoke CAS failed: expected version " + str(expected_version) + ", current is " + str(self.version))
+
         found: bool = False
         new_snap: list[KeyRef] = []
         k_i: int = 0
@@ -148,3 +178,4 @@ class KeyRing:
         if not found:
             raise UnknownKeyError("Cannot revoke unknown key: " + kid)
         self.keys = new_snap
+        self.version = self.version + 1

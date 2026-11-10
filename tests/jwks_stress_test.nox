@@ -76,4 +76,32 @@ nox.test.assert_true(not source.is_in_negative_cache("ghost-kid-1050"), "Negativ
 k_reloaded: JwkKey = source.get_key("k-prod-active", current_time_sec=1700001710)
 nox.test.assert_eq_str(k_reloaded.kid, "k-prod-active", "Key retrieved after feed")
 
+# ==============================================================================
+# 4. Outage Simulation & Stale Grace Transition Test (0.9.6)
+# ==============================================================================
+outage_source: JwksKeySource = JwksKeySource("https://auth.company.org/jwks", cache_ttl_sec=60, stale_grace_sec=300)
+outage_source.feed_jwks(rsa_jwks, timestamp_sec=2000000000)
+
+# Simulate network outage at t=2000000070 (cache TTL expired, but within 300s stale grace)
+outage_source.mark_outage(2000000070)
+nox.test.assert_eq_int(outage_source.last_failed_at, 2000000070, "Outage timestamp recorded")
+
+# Key can still be resolved during stale grace window
+k_outage: JwkKey = outage_source.get_key("k-prod-active", current_time_sec=2000000150)
+nox.test.assert_eq_str(k_outage.kid, "k-prod-active", "Key served from stale grace cache during active outage")
+
+# Stale grace expires at 2000000000 + 60 + 300 = 2000000360
+# At t=2000000400, lookup MUST fail closed
+outage_expired_caught: bool = False
+try:
+    outage_source.get_key("k-prod-active", current_time_sec=2000000400)
+except KeyUnavailableError:
+    outage_expired_caught = True
+nox.test.assert_true(outage_expired_caught, "Stale grace exceeded during outage must fail closed with KeyUnavailableError")
+
+# Outage ends: Server returns fresh JWKS feed at t=2000000450
+outage_source.feed_jwks(rsa_jwks, timestamp_sec=2000000450)
+k_restored: JwkKey = outage_source.get_key("k-prod-active", current_time_sec=2000000460)
+nox.test.assert_eq_str(k_restored.kid, "k-prod-active", "Keys immediately restored and available post-outage")
+
 print("jwks_stress_test passed!")

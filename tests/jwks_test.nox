@@ -20,6 +20,24 @@ nox.test.assert_true(not is_safe_jwks_url("https://172.20.0.5/jwks"), "RFC 1918 
 nox.test.assert_true(not is_safe_jwks_url("https://172.16.0.1/jwks"), "RFC 1918 172.16.0.0/16 must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://172.31.255.254/jwks"), "RFC 1918 172.31.0.0/16 must be rejected")
 
+# Structural CIDR Filtering (0.9.4)
+# RFC 6598 CGNAT (100.64.0.0/10)
+nox.test.assert_true(not is_safe_jwks_url("https://100.64.0.1/jwks"), "RFC 6598 CGNAT 100.64.0.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://100.64.1.1/jwks"), "RFC 6598 CGNAT 100.64.1.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://100.127.255.254/jwks"), "RFC 6598 CGNAT boundary 100.127.255.254 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[::ffff:100.64.1.1]/jwks"), "IPv4-mapped IPv6 CGNAT must be rejected")
+
+# RFC 2544 Benchmark (198.18.0.0/15)
+nox.test.assert_true(not is_safe_jwks_url("https://198.18.0.1/jwks"), "RFC 2544 Benchmark 198.18.0.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://198.19.255.254/jwks"), "RFC 2544 Benchmark boundary 198.19.255.254 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[::ffff:198.18.0.1]/jwks"), "IPv4-mapped IPv6 Benchmark must be rejected")
+
+# RFC 5737 TEST-NET, RFC 5771 Multicast, RFC 1112 Reserved
+nox.test.assert_true(not is_safe_jwks_url("https://192.0.2.1/jwks"), "RFC 5737 TEST-NET-1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://224.0.0.1/jwks"), "RFC 5771 Multicast 224.0.0.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://240.0.0.1/jwks"), "RFC 1112 Reserved 240.0.0.1 must be rejected")
+
+
 # Userinfo SSRF bypass test
 nox.test.assert_true(not is_safe_jwks_url("https://user:password@auth.example.com/jwks"), "URL with userinfo credentials must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://admin:pass@127.0.0.1/jwks"), "Userinfo prefix on loopback must be rejected")

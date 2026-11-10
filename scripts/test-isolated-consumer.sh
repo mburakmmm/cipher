@@ -19,8 +19,9 @@ trap cleanup EXIT
 echo "==> Setting up isolated consumer project in: ${TMP_DIR}"
 mkdir -p "${TMP_DIR}"
 
-# 1. Vendor / copy cipher library modules to isolated environment
+# 1. Vendor / copy cipher library modules and package hierarchy to isolated environment
 cp "${REPO_ROOT}"/*.nox "${TMP_DIR}/"
+cp -r "${REPO_ROOT}/cipher" "${TMP_DIR}/"
 
 # 2. Write consumer application nox.json
 cat << 'EOF' > "${TMP_DIR}/nox.json"

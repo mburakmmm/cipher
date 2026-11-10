@@ -102,3 +102,13 @@ try:
 except InvalidKeyError:
     small_e_rejected = True
 nox.test.assert_true(small_e_rejected, "RSA public exponent <= 1 must be rejected")
+
+# P0: Excessive RSA public exponent length & overflow protection (0.9.3)
+excessive_e_json: str = "{\"kty\":\"RSA\",\"kid\":\"rsa-overflow\",\"n\":\"" + key.n + "\",\"e\":\"AQABAAAAAAAAAAAAAAAA\"}"
+excessive_e_rejected: bool = False
+try:
+    parse_jwk(excessive_e_json)
+except InvalidKeyError:
+    excessive_e_rejected = True
+nox.test.assert_true(excessive_e_rejected, "RSA public exponent exceeding MAX_RSA_EXPONENT_CHARS must be rejected")
+

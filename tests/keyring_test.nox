@@ -143,3 +143,31 @@ nox.test.assert_true(rot_invalid_state_failed, "Rotation with REVOKED key must r
 
 current_after_invalid_state: KeyRef = ring_atomic.get_signing_key("HS256")
 nox.test.assert_eq_str(current_after_invalid_state.kid, "k-orig-1", "Rollback invariant: original key stays active after invalid state fail")
+
+# 6. P0 Immutability & Defensive Cloning Guarantee (0.9.1)
+# KeyRef returned by get_signing_key or get_verification_key must be a defensive clone;
+# mutations on the caller's reference must NOT corrupt the KeyRing's internal state.
+ring_defensive: KeyRing = KeyRing(trust_domain="tenant-defensive")
+base_key: KeyRef = KeyRef("k-def-1", "HS256", "super-secret-key-32-bytes-minimum", trust_domain="tenant-defensive", state="ACTIVE_SIGNING")
+ring_defensive.add_key(base_key)
+
+# 6a. External mutation on get_signing_key reference
+caller_key: KeyRef = ring_defensive.get_signing_key("HS256")
+caller_key.state = STATE_RETIRED
+caller_key.secret_material = "corrupted-secret-value-by-caller"
+
+# Invariant: KeyRing internal key must still be ACTIVE_SIGNING with original secret
+ring_key_after_tamper: KeyRef = ring_defensive.get_signing_key("HS256")
+nox.test.assert_eq_str(ring_key_after_tamper.state, "ACTIVE_SIGNING", "Internal key state must remain ACTIVE_SIGNING despite external mutation")
+nox.test.assert_eq_str(ring_key_after_tamper.secret_material, "super-secret-key-32-bytes-minimum", "Internal secret must remain untouched")
+nox.test.assert_true(ring_key_after_tamper.can_sign(), "Internal key must still can_sign()")
+
+# 6b. External mutation on get_verification_key reference
+verif_key: KeyRef = ring_defensive.get_verification_key("k-def-1")
+verif_key.state = STATE_REVOKED
+verif_key.kid = "k-def-tampered"
+
+ring_verif_after_tamper: KeyRef = ring_defensive.get_verification_key("k-def-1")
+nox.test.assert_eq_str(ring_verif_after_tamper.kid, "k-def-1", "Internal kid remains unmodified")
+nox.test.assert_eq_str(ring_verif_after_tamper.state, "ACTIVE_SIGNING", "Internal verification key state remains unmodified")
+

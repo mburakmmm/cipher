@@ -113,4 +113,63 @@ except UnknownKeyError:
     unknown_revoke_failed = True
 nox.test.assert_true(unknown_revoke_failed, "Revoking non-existent key fails closed with UnknownKeyError")
 
+# ==============================================================================
+# Test 5: P0 Optimistic Concurrency Control (CAS) & Multi-Writer Coordination (0.9.2)
+# ==============================================================================
+cas_ring: KeyRing = KeyRing(trust_domain="tenant-cas")
+nox.test.assert_eq_int(cas_ring.get_version(), 0, "Initial keyring version is 0")
+
+cas_k1: KeyRef = KeyRef("k-cas-1", "HS256", "super-secret-cas-material-001-32b", trust_domain="tenant-cas", state=STATE_ACTIVE_SIGNING)
+cas_ring.add_key(cas_k1, expected_version=0)
+nox.test.assert_eq_int(cas_ring.get_version(), 1, "KeyRing version increments to 1 after add_key")
+
+# Concurrent writer simulation:
+# Writer A reads version 1
+v_reader_a: int = cas_ring.get_version()
+nox.test.assert_eq_int(v_reader_a, 1, "Writer A reads version 1")
+
+# Writer B also reads version 1
+v_reader_b: int = cas_ring.get_version()
+nox.test.assert_eq_int(v_reader_b, 1, "Writer B reads version 1")
+
+# Writer A succeeds in rotating first (commit with expected_version=1)
+cas_k2: KeyRef = KeyRef("k-cas-2", "HS256", "super-secret-cas-material-002-32b", trust_domain="tenant-cas", state=STATE_PREPARED)
+rec_a: RotationReceipt = cas_ring.rotate(cas_k2, overlap_seconds=3600, clock_time_sec=1000, expected_version=v_reader_a)
+nox.test.assert_eq_str(rec_a.new_kid, "k-cas-2", "Writer A rotation succeeded")
+nox.test.assert_eq_int(cas_ring.get_version(), 2, "KeyRing version increments to 2 after Writer A commit")
+
+# Writer B attempts rotation using stale expected_version=1 -> MUST FAIL (Conflict detected)
+cas_k3: KeyRef = KeyRef("k-cas-3", "HS256", "super-secret-cas-material-003-32b", trust_domain="tenant-cas", state=STATE_PREPARED)
+cas_b_conflict_detected: bool = False
+try:
+    cas_ring.rotate(cas_k3, overlap_seconds=3600, clock_time_sec=1000, expected_version=v_reader_b)
+except ConfigurationError:
+    cas_b_conflict_detected = True
+nox.test.assert_true(cas_b_conflict_detected, "Writer B rotation rejected with ConfigurationError due to version conflict")
+
+# KeyRing must remain at version 2, and active signer must remain k-cas-2
+nox.test.assert_eq_int(cas_ring.get_version(), 2, "KeyRing version remains 2 after failed CAS")
+cas_signer: KeyRef = cas_ring.get_signing_key("HS256")
+nox.test.assert_eq_str(cas_signer.kid, "k-cas-2", "Active signer is still k-cas-2 after conflict")
+
+# CAS Revoke test:
+# Revoke with wrong expected_version must fail
+revoke_conflict_detected: bool = False
+try:
+    cas_ring.revoke("k-cas-1", expected_version=99)
+except ConfigurationError:
+    revoke_conflict_detected = True
+nox.test.assert_true(revoke_conflict_detected, "Revoke rejected when expected_version does not match")
+
+# Revoke with correct version succeeds
+cas_ring.revoke("k-cas-1", expected_version=2)
+nox.test.assert_eq_int(cas_ring.get_version(), 3, "Version increments to 3 after CAS revoke")
+
+# Snapshot defensive cloning verification
+snap_list: list[KeyRef] = cas_ring.get_snapshot()
+nox.test.assert_eq_int(len(snap_list), 2, "Snapshot has 2 keys")
+snap_list[0].kid = "corrupted-in-snapshot"
+active_after_snap_tamper: KeyRef = cas_ring.get_signing_key("HS256")
+nox.test.assert_eq_str(active_after_snap_tamper.kid, "k-cas-2", "Tampering with get_snapshot() list does not corrupt KeyRing")
+
 print("concurrency_keyring_test passed!")
