@@ -1,18 +1,30 @@
 # Cipher — KeyRing & Safe Key Lifecycle Management
 # Enforces trust domain isolation, unique kid indexing, zero dual-active signers,
-# deep snapshot immutability, and hardware-backed atomic CAS + writer mutex rotation.
+# tamper-evident SHA-256 snapshot sealing, Seqlock coherent reads, and exception-safe hardware atomic CAS.
 
 import nox.atomic
+import nox.crypto
 import nox.strings
 import nox.time
 from cipher.errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from cipher.keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
 from cipher.rotation import RotationReceipt
 
+def _compute_state_seal(version: int, keys: list[KeyRef], created_at: int) -> str:
+    raw: str = "CIPHER-KR-SEAL-V1|" + str(version) + "|" + str(created_at) + "|" + str(len(keys))
+    i: int = 0
+    n: int = len(keys)
+    while i < n:
+        k: KeyRef = keys[i]
+        raw = raw + "|" + k.kid + ":" + k.algorithm + ":" + k.state + ":" + k.trust_domain + ":" + str(k.activated_at) + ":" + str(k.retire_at) + ":" + k.secret_material
+        i = i + 1
+    return nox.crypto.sha256(raw)
+
 class KeyRingState:
     version: int
     _keys: list[KeyRef]
     created_at: int
+    _integrity_hash: str
 
     def __init__(self, version: int, keys: list[KeyRef], created_at: int = 0) -> None:
         self.version = version
@@ -25,8 +37,15 @@ class KeyRingState:
             i = i + 1
         self._keys = cloned
         self.created_at = created_at
+        self._integrity_hash = _compute_state_seal(self.version, self._keys, self.created_at)
+
+    def verify_integrity(self) -> None:
+        expected: str = _compute_state_seal(self.version, self._keys, self.created_at)
+        if not nox.crypto.constant_time_eq(expected, self._integrity_hash):
+            raise ConfigurationError("KeyRingState integrity violation: unauthorized direct field mutation detected")
 
     def get_keys(self) -> list[KeyRef]:
+        self.verify_integrity()
         # Return deep defensive clone on every inspection: external mutations never corrupt snapshot
         snap: list[KeyRef] = []
         i: int = 0
@@ -37,30 +56,66 @@ class KeyRingState:
         return snap
 
     def key_count(self) -> int:
+        self.verify_integrity()
         return len(self._keys)
 
 class KeyRing:
     trust_domain: str
-    state: KeyRingState
+    _state: KeyRingState
     _write_lock: nox.atomic.AtomicBool
+    _seq: nox.atomic.AtomicInt
     _atomic_version: nox.atomic.AtomicInt
 
     def __init__(self, trust_domain: str = "default") -> None:
         self.trust_domain = trust_domain
         initial_keys: list[KeyRef] = []
-        self.state = KeyRingState(0, initial_keys, 0)
+        self._state = KeyRingState(0, initial_keys, 0)
         self._write_lock = nox.atomic.new_bool(False)
+        self._seq = nox.atomic.new_int(0)
         self._atomic_version = nox.atomic.new_int(0)
 
+    def get_lock_handle(self) -> int:
+        return self._write_lock.handle
+
+    def get_seq_handle(self) -> int:
+        return self._seq.handle
+
+    def get_version_handle(self) -> int:
+        return self._atomic_version.handle
+
+    def bind_shared_atomics(self, lock_handle: int, seq_handle: int, ver_handle: int) -> None:
+        self._write_lock = nox.atomic.from_bool_handle(lock_handle)
+        self._seq = nox.atomic.from_int_handle(seq_handle)
+        self._atomic_version = nox.atomic.from_int_handle(ver_handle)
+
+    def _read_consistent_state(self) -> KeyRingState:
+        # Seqlock + Single-Truth Snapshot Reader Protocol
+        # Guarantees that version and key snapshot are always observed as a coherent atomic unit.
+        attempts: int = 0
+        while attempts < 1024:
+            s1: int = self._seq.load()
+            if (s1 & 1) != 0:
+                attempts = attempts + 1
+                continue
+            st: KeyRingState = self._state
+            s2: int = self._seq.load()
+            if s1 == s2:
+                st.verify_integrity()
+                if st.version != (s1 >> 1):
+                    raise ConfigurationError("KeyRing state version desynchronization detected")
+                return st
+            attempts = attempts + 1
+        raise ConfigurationError("KeyRing read contention timeout: writer active in critical section")
+
     def get_version(self) -> int:
-        return self._atomic_version.load()
+        return self._read_consistent_state().version
 
     def get_state(self) -> KeyRingState:
-        s: KeyRingState = self.state
+        s: KeyRingState = self._read_consistent_state()
         return KeyRingState(s.version, s.get_keys(), s.created_at)
 
     def get_snapshot(self) -> list[KeyRef]:
-        return self.state.get_keys()
+        return self._read_consistent_state().get_keys()
 
     def acquire_write_lock(self) -> bool:
         return self._write_lock.compare_and_swap(False, True)
@@ -73,21 +128,43 @@ class KeyRing:
         if not self._write_lock.compare_and_swap(False, True):
             raise ConfigurationError("Concurrent modification in progress: writer mutex lock contention")
 
-        # 2. Hardware Atomic Compare-And-Swap on Version (nox_atomic_cas on AtomicInt)
-        # Eliminates the T1-T6 check-then-act race window at the CPU instruction level.
-        if not self._atomic_version.compare_and_swap(base_ver, base_ver + 1):
+        prev_state: KeyRingState = self._state
+        cas_won: bool = False
+        try:
+            # 2. Verify snapshot seal integrity and base version under exclusive writer lock
+            prev_state.verify_integrity()
+            new_state.verify_integrity()
+            if prev_state.version != base_ver or new_state.version != (base_ver + 1):
+                raise ConfigurationError("Concurrent modification detected: state version mismatch (expected " + str(base_ver) + ")")
+
+            # 3. Hardware Atomic Compare-And-Swap on Version (nox_atomic_cas on AtomicInt)
+            if not self._atomic_version.compare_and_swap(base_ver, base_ver + 1):
+                raise ConfigurationError("Concurrent modification detected: atomic CAS version mismatch (expected " + str(base_ver) + ")")
+            cas_won = True
+
+            # 4. Enter Seqlock write section (odd sequence value signals in-flight state transition)
+            self._seq.store(base_ver * 2 + 1)
+
+            # 5. Publish new unified KeyRingState reference FIRST
+            self._state = new_state
+
+            # 6. Seal Seqlock write section (even sequence value = 2 * new_state.version)
+            self._seq.store((base_ver + 1) * 2)
+        except Exception as err:
+            # Exception-safe rollback (only if this writer won CAS) & guaranteed writer lock release
+            if cas_won:
+                self._state = prev_state
+                self._atomic_version.store(base_ver)
+                self._seq.store(base_ver * 2)
             self._write_lock.store(False)
-            raise ConfigurationError("Concurrent modification detected: atomic CAS version mismatch (expected " + str(base_ver) + ")")
+            raise ConfigurationError(str(err))
 
-        # 3. Single-reference publication under exclusive writer mutex
-        self.state = new_state
-
-        # 4. Release Hardware Writer Mutex
+        # 7. Release Hardware Writer Mutex
         self._write_lock.store(False)
 
     def add_key(self, key: KeyRef, expected_version: int = -1) -> None:
-        base_ver: int = self._atomic_version.load()
-        base_state: KeyRingState = self.state
+        base_state: KeyRingState = self._read_consistent_state()
+        base_ver: int = base_state.version
 
         # Optimistic concurrency check (CAS)
         if expected_version >= 0 and base_ver != expected_version:
@@ -127,7 +204,7 @@ class KeyRing:
         self._commit_state(base_ver, new_state)
 
     def get_signing_key(self, algorithm: str) -> KeyRef:
-        snap: list[KeyRef] = self.state.get_keys()
+        snap: list[KeyRef] = self._read_consistent_state().get_keys()
         i: int = 0
         n: int = len(snap)
         while i < n:
@@ -138,7 +215,7 @@ class KeyRing:
         raise KeyUnavailableError("No active signing key available for algorithm: " + algorithm)
 
     def get_verification_key(self, kid: str, current_time_sec: int = 0) -> KeyRef:
-        snap: list[KeyRef] = self.state.get_keys()
+        snap: list[KeyRef] = self._read_consistent_state().get_keys()
         i: int = 0
         n: int = len(snap)
         while i < n:
@@ -154,8 +231,8 @@ class KeyRing:
 
     def rotate(self, new_key: KeyRef, overlap_seconds: int = 3600,
                clock_time_sec: int = 0, expected_version: int = -1) -> RotationReceipt:
-        base_ver: int = self._atomic_version.load()
-        base_state: KeyRingState = self.state
+        base_state: KeyRingState = self._read_consistent_state()
+        base_ver: int = base_state.version
 
         # Optimistic concurrency check (CAS)
         if expected_version >= 0 and base_ver != expected_version:
@@ -214,14 +291,14 @@ class KeyRing:
         activated_new.activated_at = now
         new_snap.append(activated_new)
 
-        # 3. Hardware-atomic CAS & Mutex commit
+        # 3. Hardware-atomic Seqlock + CAS & Mutex commit
         new_state: KeyRingState = KeyRingState(base_ver + 1, new_snap, now)
         self._commit_state(base_ver, new_state)
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
     def revoke(self, kid: str, expected_version: int = -1) -> None:
-        base_ver: int = self._atomic_version.load()
-        base_state: KeyRingState = self.state
+        base_state: KeyRingState = self._read_consistent_state()
+        base_ver: int = base_state.version
 
         # Optimistic concurrency check (CAS)
         if expected_version >= 0 and base_ver != expected_version:
@@ -245,6 +322,6 @@ class KeyRing:
         if not found:
             raise UnknownKeyError("Cannot revoke unknown key: " + kid)
 
-        # Hardware-atomic CAS & Mutex commit
+        # Hardware-atomic Seqlock + CAS & Mutex commit
         new_state: KeyRingState = KeyRingState(base_ver + 1, new_snap, nox.time.now_ms() // 1000)
         self._commit_state(base_ver, new_state)

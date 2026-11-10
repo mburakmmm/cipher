@@ -653,3 +653,55 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.5` sürüm notları eklendi.
 - [x] Git commit, `v1.0.5` git tag push ve `noxc publish` çalıştırıldı (`published: cipher updated in the registry as @mburakmmm`).
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığı ve `Cipher v1.0.5` GitHub Release'inin yayınlandığı doğrulandı.
+
+---
+
+# Phase 12 — `v1.0.6` Seqlock Coherent Snapshot Publication, Exception-Safe Lock Release, Tamper-Evident Sealing & Property/Fuzz Verification (SOL VI Analizi)
+
+**Amaç:** Altıncı bağımsız teknik incelemede (GPT 6 SOL VI analizi) tespit edilen commit sıralaması / okuyucu tutarlılığı riskini ve doğrulama hedeflerini eksiksiz tamamlamak:
+1. **P0:** `KeyRing` içerisinde Seqlock + Tek Doğruluk Kaynağı (`_state: KeyRingState` + `_seq: nox.atomic.AtomicInt`) protokolünü uygulayarak `get_version()` ile `get_state()` / `get_snapshot()` arasındaki tutarsızlık penceresini tamamen ortadan kaldırmak (okuyucular versiyon ve anahtar listesini daima aynı Seqlock-doğrulanmış `_state` nesnesinden atomik bir bütün olarak okur).
+2. **P0:** `_commit_state()` içinde `try ... except` bloğu ile her türlü hata durumunda `_seq` ve `_write_lock` durumunun geri alınmasını ve writer kilidinin kesin olarak serbest bırakılmasını (exception-safe lock release) garanti altına almak.
+3. **P1:** `KeyRingState` içerisine kriptografik SHA-256 bütünlük mührü (`_integrity_hash: str`) ekleyerek dil düzeyinde `private` anahtar kelimesi bulunmayan NOX çalışma zamanında `_state` veya `_keys` alanlarına doğrudan yapılan yetkisiz mutasyonları tespit edip fail-closed `ConfigurationError` ile reddetmek.
+4. **P1:** `tests/concurrency_keyring_test.nox` içerisine doğrudan `KeyRing` üzerinde çoklu eşzamanlı writer (`rotate`, `revoke`) ve reader (`get_signing_key`, `get_state`, `get_version`) görevlerini çalıştıran gerçek paralel KeyRing testleri eklemek.
+5. **P1:** `scripts/test-isolated-consumer.sh` içerisine hem yerel Git staging hem de gerçek uzak `noxpkg.noxlang.com` merkezi kayıt defteri üzerinden (`noxc add cipher` + `noxc fetch`) iki aşamalı kurulum doğrulaması eklemek.
+6. **P2:** IPv4 ve IPv6 ayrıştırıcıları için kapsamlı property-based ve fuzz test paketi (`tests/ip_fuzz_property_test.nox`) oluşturmak ve `v1.0.6` sürümünü yayınlamak.
+
+## 0.12.1 — P0: Seqlock + Tek Doğruluk Kaynağı (`_state`) Tutarlı Yayın Protokolü (`keyring.nox`)
+- [x] `KeyRing` içinde `state` alanını `_state: KeyRingState` yap ve Seqlock sıra sayacı `_seq: nox.atomic.AtomicInt` (çift = kararlı, tek = yazma aşamasında) ekle.
+- [x] `_read_consistent_state(self) -> KeyRingState` metodunu uygula:
+  - Seqlock okuma protokolü ile `_seq` çift sayı iken `_state` referansını oku, sonrasındaki `_seq` değerinin değişmediğini ve `_state.version * 2 == _seq` olduğunu doğrula.
+- [x] `get_version()`, `get_state()`, `get_snapshot()`, `get_signing_key()` ve `get_verification_key()` metotlarının tamamının `_read_consistent_state()` üzerinden çalışmasını sağla; böylece `get_version()` ve `get_state()` asla farklı sürümleri gözlemleyemesin.
+
+## 0.12.2 — P0: `_commit_state()` Exception-Safe Lock Release & Atomik Geri Alma (`keyring.nox`)
+- [x] `_commit_state(self, base_ver: int, new_state: KeyRingState)` içinde:
+  - `_write_lock.compare_and_swap(False, True)` ile kilidi al.
+  - `try:` bloğu içinde `_state.version == base_ver` ve `_atomic_version.compare_and_swap(base_ver, base_ver + 1)` kontrolünü `cas_won` bayrağı ile yap.
+  - Yeni `new_state` bütünlüğünü doğrula, `_seq.store(base_ver * 2 + 1)` (yazma başladı) yap, **önce** `self._state = new_state` ata, **sonra** `self._seq.store((base_ver + 1) * 2)` (yazma tamamlandı) olarak mühürle.
+  - `except` bloğunda herhangi bir hata oluşursa `cas_won == True` ise `_seq`, `_atomic_version` ve `_state` değerlerini `base_ver` durumuna geri yükle, `_write_lock.store(False)` ile kilidi kesin olarak serbest bırak ve hatayı yeniden fırlat (`raise`).
+
+## 0.12.3 — P1: `KeyRingState` Kriptografik SHA-256 Bütünlük Mührü (Tamper-Evident Sealing) (`keyring.nox`)
+- [x] `KeyRingState` oluşturulurken `version`, `created_at` ve `_keys` içindeki tüm anahtarların alanları üzerinden SHA-256 özeti (`_integrity_hash: str`) hesapla.
+- [x] `KeyRingState.verify_integrity()` metodunu uygula ve `get_keys()`, `key_count()` ile `_read_consistent_state()` içinde çağır; eğer dışarıdan `_state.version` veya `_state._keys` doğrudan değiştirilmişse sabit zamanlı karşılaştırma (`nox.crypto.constant_time_eq`) ile yakalayıp `ConfigurationError("KeyRingState integrity violation: unauthorized direct field mutation detected")` fırlat.
+
+## 0.12.4 — P1: Gerçek Paralel `KeyRing` Writer/Reader Yarış Testleri (`tests/concurrency_keyring_test.nox`)
+- [x] Aynı `KeyRing` nesnesi üzerinde eşzamanlı `rotate()`, `revoke()`, `get_signing_key()`, `get_state()` ve `get_version()` çalıştıran paralel görevler (Test 11b) ve 4 OS iş parçacıklı (`nox.thread.start`) paylaşılan handle'lı `KeyRing` rotasyon testi (Test 11) ekle.
+- [x] Okuyucuların hiçbir zaman `get_version() != get_state().version` tutarsızlığı görmediğini, başarısız commit sonrası writer lock'un serbest kaldığını (Test 10) ve `_state` doğrudan mutasyonunun SHA-256 mührüyle yakalandığını (Test 9) doğrula.
+
+## 0.12.5 — P1: İki Aşamalı Paket Kurulum Testi: Yerel Git + Gerçek Uzak Registry (`scripts/test-isolated-consumer.sh`)
+- [x] `scripts/test-isolated-consumer.sh` betiğini iki aşamalı yap:
+  - **Stage 1:** Yerel Git staging deposundan `noxc add cipher <local_repo> --ref main` + `noxc fetch` doğrulaması.
+  - **Stage 2:** Doğrudan uzak `noxpkg.noxlang.com` merkezi kayıt defteri ve GitHub üzerinden `noxc add cipher` + `noxc fetch` + `nox.lock` + `noxc run main.nox` doğrulaması.
+
+## 0.12.6 — P2: IPv4/IPv6 Ayrıştırıcı Property-Based ve Fuzz Test Paketi (`tests/ip_fuzz_property_test.nox`)
+- [x] `tests/ip_fuzz_property_test.nox` dosyasını oluştur:
+  - Property 1: Geçerli IPv4 `(o0, o1, o2, o3)` round-trip ve 14 CIDR politika değişmezliği (invariant) testi.
+  - Property 2: Noktalı IPv4 (`a.b.c.d`), noktalı IPv4-mapped IPv6 (`::ffff:a.b.c.d`), genişletilmiş (`0:0:0:0:0:ffff:a.b.c.d`), köşeli parantezli (`[::ffff:a.b.c.d]`) ve saf hex (`::ffff:XXXX:YYYY` küçük/büyük harf) formların 8-hextet ve `verify_resolved_ip` eşdeğerliği testi.
+  - Property 3 & 4: `::` sıfır sıkıştırma konumu değişmezliği ve 100+ bozuk/adversarial IPv4 ve IPv6 girdisiyle deterministik fuzzing (sıfır beklenmeyen çökme, `%100 False` reddi).
+
+## 0.12.7 — Phase 12 Çıkış Kapısı ve `v1.0.6` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (17 testin 17'si de %100 geçti).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.6` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.6` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.6` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

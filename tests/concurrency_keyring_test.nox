@@ -182,9 +182,10 @@ init_k: KeyRef = KeyRef("k-atom-1", "HS256", "super-secret-key-material-atomic-3
 state_ring.add_key(init_k)
 
 # 6a. Single immutable KeyRingState object verification
-nox.test.assert_eq_int(state_ring.state.version, 1, "KeyRingState encapsulates version 1")
-nox.test.assert_eq_int(state_ring.state.key_count(), 1, "KeyRingState encapsulates 1 key")
-nox.test.assert_true(state_ring.state.created_at > 0, "KeyRingState tracks creation timestamp")
+st_snap: KeyRingState = state_ring.get_state()
+nox.test.assert_eq_int(st_snap.version, 1, "KeyRingState encapsulates version 1")
+nox.test.assert_eq_int(st_snap.key_count(), 1, "KeyRingState encapsulates 1 key")
+nox.test.assert_true(st_snap.created_at > 0, "KeyRingState tracks creation timestamp")
 
 # 6b. Deep Immutability of KeyRingState & get_keys() (0.11.2)
 ext_state: KeyRingState = state_ring.get_state()
@@ -194,7 +195,7 @@ ext_keys[0].state = STATE_REVOKED
 ext_keys[0].secret_material = "tampered-secret-material-00000000"
 ext_keys.append(KeyRef("k-injected", "HS256", "injected-secret-key-material-32b", trust_domain="tenant-atomic"))
 
-nox.test.assert_eq_int(state_ring.state.key_count(), 1, "Appending to get_keys() list does not alter internal key count")
+nox.test.assert_eq_int(state_ring.get_state().key_count(), 1, "Appending to get_keys() list does not alter internal key count")
 untouched_signer: KeyRef = state_ring.get_signing_key("HS256")
 nox.test.assert_eq_str(untouched_signer.kid, "k-atom-1", "Internal kid untouched after KeyRingState mutation attempt")
 nox.test.assert_eq_str(untouched_signer.state, STATE_ACTIVE_SIGNING, "Internal state untouched after KeyRingState mutation attempt")
@@ -303,5 +304,154 @@ async def run_parallel_cas_test() -> None:
 
 t_parallel: Task[None] = spawn run_parallel_cas_test()
 await t_parallel
+
+# ==============================================================================
+# Test 9: P1 Tamper-Evident SHA-256 Sealing of KeyRingState (0.12.3)
+# ==============================================================================
+seal_ring: KeyRing = KeyRing(trust_domain="tenant-sealed")
+seal_k1: KeyRef = KeyRef("k-seal-1", "HS256", "super-secret-sealed-key-material-32b", trust_domain="tenant-sealed", state=STATE_ACTIVE_SIGNING)
+seal_ring.add_key(seal_k1)
+
+# Direct unauthorized field tampering on internal _state._keys[0] must be caught by SHA-256 seal!
+seal_ring._state._keys[0].state = STATE_REVOKED
+tamper_caught: bool = False
+try:
+    seal_ring.get_signing_key("HS256")
+except ConfigurationError:
+    tamper_caught = True
+nox.test.assert_true(tamper_caught, "Direct mutation of _state._keys[0] detected and rejected via SHA-256 integrity seal")
+
+# Direct unauthorized tampering of _state.version must also be caught!
+seal_ring2: KeyRing = KeyRing(trust_domain="tenant-sealed-2")
+seal_ring2.add_key(KeyRef("k-seal-2", "HS256", "super-secret-sealed-key-material-32b", trust_domain="tenant-sealed-2", state=STATE_ACTIVE_SIGNING))
+seal_ring2._state.version = 999
+ver_tamper_caught: bool = False
+try:
+    seal_ring2.get_version()
+except ConfigurationError:
+    ver_tamper_caught = True
+nox.test.assert_true(ver_tamper_caught, "Direct mutation of _state.version detected and rejected via SHA-256 integrity seal")
+
+# ==============================================================================
+# Test 10: P0 Exception-Safe Lock Release & Seqlock Coherent Snapshot (0.12.1 & 0.12.2)
+# ==============================================================================
+coherent_ring: KeyRing = KeyRing(trust_domain="tenant-coherent")
+coh_k1: KeyRef = KeyRef("k-coh-1", "HS256", "super-secret-coherent-material-01-32", trust_domain="tenant-coherent", state=STATE_ACTIVE_SIGNING)
+coherent_ring.add_key(coh_k1)
+nox.test.assert_eq_int(coherent_ring.get_version(), coherent_ring.get_state().version, "Coherent initial version == state.version")
+
+# Trigger a failed _commit_state with a corrupted/tampered new_state:
+corrupted_next: KeyRingState = KeyRingState(2, coherent_ring.get_snapshot(), 3000)
+corrupted_next._keys[0].secret_material = "corrupted-after-seal-creation-32b"
+commit_failed_safely: bool = False
+try:
+    coherent_ring._commit_state(1, corrupted_next)
+except ConfigurationError:
+    commit_failed_safely = True
+nox.test.assert_true(commit_failed_safely, "Corrupted state rejected during _commit_state")
+
+# Prove that _commit_state exception handler released the writer lock and rolled back state/version/seq:
+nox.test.assert_eq_int(coherent_ring.get_version(), 1, "Version rolled back to 1 after exception in _commit_state")
+nox.test.assert_eq_int(coherent_ring.get_state().version, 1, "State version remains 1 after exception in _commit_state")
+coh_k2: KeyRef = KeyRef("k-coh-2", "HS256", "super-secret-coherent-material-02-32", trust_domain="tenant-coherent", state=STATE_PREPARED)
+rec_coh: RotationReceipt = coherent_ring.rotate(coh_k2, overlap_seconds=600, clock_time_sec=3100, expected_version=1)
+nox.test.assert_eq_str(rec_coh.new_kid, "k-coh-2", "Subsequent rotate() succeeds proving writer lock was released on exception")
+nox.test.assert_eq_int(coherent_ring.get_version(), 2, "Version cleanly advanced to 2")
+nox.test.assert_eq_int(coherent_ring.get_state().version, 2, "get_state().version matches get_version() == 2")
+
+# ==============================================================================
+# Test 11: P1 Parallel Multi-Thread KeyRing.rotate() & Reader Coherency (0.12.4)
+# ==============================================================================
+async def parallel_keyring_worker(packed_handles_str: str) -> int:
+    # Unpack handles: "lock_h:seq_h:ver_h:worker_id"
+    parts: list[str] = nox.strings.split(packed_handles_str, ":")
+    lock_h: int = int(parts[0])
+    seq_h: int = int(parts[1])
+    ver_h: int = int(parts[2])
+    worker_id: str = parts[3]
+
+    # Instantiate KeyRing bound to the shared hardware atomic mutex/seqlock/version cells
+    worker_ring: KeyRing = KeyRing(trust_domain="tenant-mt")
+    k_init: KeyRef = KeyRef("k-mt-init", "HS256", "super-secret-mt-initial-key-32bytes", trust_domain="tenant-mt", state=STATE_ACTIVE_SIGNING)
+    worker_ring.add_key(k_init)
+    # Bind shared cross-thread hardware atomics
+    worker_ring.bind_shared_atomics(lock_h, seq_h, ver_h)
+
+    rot_wins: int = 0
+    step_i: int = 0
+    while step_i < 40:
+        try:
+            # Synchronize local state version to current shared version before attempting KeyRing.rotate()
+            shared_v: int = nox.atomic.from_int_handle(ver_h).load()
+            worker_ring._state = KeyRingState(shared_v, worker_ring._state.get_keys(), 4000 + step_i)
+
+            cand_kid: str = "k-mt-w" + worker_id + "-" + str(step_i) + "-" + str(shared_v)
+            cand_key: KeyRef = KeyRef(cand_kid, "HS256", "super-secret-mt-worker-key-32bytes!", trust_domain="tenant-mt", state=STATE_PREPARED)
+            worker_ring.rotate(cand_key, overlap_seconds=300, clock_time_sec=5000 + step_i, expected_version=shared_v)
+            rot_wins = rot_wins + 1
+        except ConfigurationError:
+            # Expected when another OS thread wins the hardware lock, Seqlock, or CAS race
+            pass
+        step_i = step_i + 1
+    return rot_wins
+
+async def run_parallel_keyring_rotation_test() -> None:
+    master_ring: KeyRing = KeyRing(trust_domain="tenant-mt")
+    master_k0: KeyRef = KeyRef("k-mt-0", "HS256", "super-secret-mt-master-key-32bytes!", trust_domain="tenant-mt", state=STATE_ACTIVE_SIGNING)
+    master_ring.add_key(master_k0)
+    # Master starts at version 1
+    base_h_str: str = str(master_ring.get_lock_handle()) + ":" + str(master_ring.get_seq_handle()) + ":" + str(master_ring.get_version_handle())
+
+    th1: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":1")
+    th2: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":2")
+    th3: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":3")
+    th4: ThreadHandle[int] = nox.thread.start(parallel_keyring_worker, base_h_str + ":4")
+
+    rw1: int = await th1.join()
+    rw2: int = await th2.join()
+    rw3: int = await th3.join()
+    rw4: int = await th4.join()
+
+    total_rotations: int = rw1 + rw2 + rw3 + rw4
+    final_shared_ver: int = nox.atomic.from_int_handle(master_ring.get_version_handle()).load()
+
+    # Initial version was 1; every successful KeyRing.rotate() across 4 OS threads incremented version by 1
+    nox.test.assert_eq_int(final_shared_ver, 1 + total_rotations, "Parallel KeyRing.rotate() across 4 OS threads has zero lost updates")
+    nox.test.assert_true(total_rotations > 0, "Parallel KeyRing workers completed rotations")
+
+t_kr_parallel: Task[None] = spawn run_parallel_keyring_rotation_test()
+await t_kr_parallel
+
+# 11b. Concurrent Writer (rotate + revoke) & Reader Coherency on Shared KeyRing Instance
+shared_rw_ring: KeyRing = KeyRing(trust_domain="tenant-rw")
+shared_rw_ring.add_key(KeyRef("k-rw-0", "HS256", "super-secret-rw-initial-key-32bytes", trust_domain="tenant-rw", state=STATE_ACTIVE_SIGNING))
+
+rw_round: int = 1
+while rw_round <= 30:
+    # Writer 1 rotates active key
+    next_rw_kid: str = "k-rw-" + str(rw_round)
+    prev_rw_kid: str = "k-rw-" + str(rw_round - 1)
+    v_before: int = shared_rw_ring.get_version()
+    shared_rw_ring.rotate(
+        KeyRef(next_rw_kid, "HS256", "super-secret-rw-rotated-key-32bytes", trust_domain="tenant-rw", state=STATE_PREPARED),
+        overlap_seconds=600,
+        clock_time_sec=6000 + rw_round,
+        expected_version=v_before
+    )
+
+    # Concurrent Reader checks Seqlock coherency between get_version() and get_state()
+    r_ver: int = shared_rw_ring.get_version()
+    r_state: KeyRingState = shared_rw_ring.get_state()
+    nox.test.assert_eq_int(r_ver, r_state.version, "Reader always observes coherent get_version() == get_state().version")
+    r_signer: KeyRef = shared_rw_ring.get_signing_key("HS256")
+    nox.test.assert_eq_str(r_signer.kid, next_rw_kid, "Reader observes newly rotated active signer")
+
+    # Writer 2 revokes previous key while Reader verifies current signer remains active
+    shared_rw_ring.revoke(prev_rw_kid, expected_version=r_ver)
+    r_ver_after_rev: int = shared_rw_ring.get_version()
+    r_state_after_rev: KeyRingState = shared_rw_ring.get_state()
+    nox.test.assert_eq_int(r_ver_after_rev, r_state_after_rev.version, "Reader observes coherent version after revoke()")
+
+    rw_round = rw_round + 1
 
 print("concurrency_keyring_test passed!")

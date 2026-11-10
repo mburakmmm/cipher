@@ -4,6 +4,24 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL VI Architecture Audit)
+- **Seqlock Coherent Snapshot & Commit Ordering Fix in `KeyRing` (`keyring.nox`):**
+  - Eliminated the transient reader-inconsistency window where `_atomic_version` was incremented before `self.state` was assigned (which could allow a concurrent reader calling `get_version()` and `get_signing_key()` to observe version `N+1` with key snapshot `N`).
+  - Implemented a hardware-backed Seqlock + Single-Truth Snapshot protocol (`_state: KeyRingState`, `_seq: nox.atomic.AtomicInt`, `_read_consistent_state()`). Writers enter an odd sequence (`_seq.store(base_ver * 2 + 1)`), publish `self._state = new_state` FIRST, and seal with an even sequence (`_seq.store((base_ver + 1) * 2)`).
+  - All reader operations (`get_version()`, `get_state()`, `get_snapshot()`, `get_signing_key()`, `get_verification_key()`) now read exclusively through `_read_consistent_state()`, guaranteeing version and key snapshot coherency.
+- **Exception-Safe Writer Lock Release & Atomic Rollback (`keyring.nox`):**
+  - Wrapped the critical section of `_commit_state()` in a `try ... except Exception as err:` guard with a `cas_won` flag. If any error occurs after lock acquisition, `_state`, `_atomic_version`, and `_seq` are rolled back cleanly (when `cas_won == True`) and `_write_lock.store(False)` is unconditionally executed before raising `ConfigurationError`, preventing permanent writer deadlock.
+- **Cryptographic Tamper-Evident Sealing of `KeyRingState` (`keyring.nox`):**
+  - Because NOX does not provide a language-level `private` keyword, `KeyRingState` now computes a SHA-256 integrity seal (`_integrity_hash: str` via `_compute_state_seal`) over `(version, created_at, canonical _keys state)` at construction and verifies it in constant time (`nox.crypto.constant_time_eq`) on every state read (`verify_integrity()`, `get_keys()`, `key_count()`, `_read_consistent_state()`). Direct external tampering with `state.version`, `state.created_at`, or `state._keys` fails closed with `ConfigurationError`.
+- **Parallel Multi-Thread `rotate()` & Mixed Reader/Writer Contention Tests (`tests/concurrency_keyring_test.nox`):**
+  - Added Test 9 (Tamper-Evident SHA-256 Sealing of `KeyRingState`), Test 10 (Exception-Safe Lock Release & Seqlock Coherent Snapshot), Test 11 (4-OS-Thread Parallel `KeyRing.rotate()` Contention via `nox.thread.start`), and Test 11b (Concurrent `rotate` + `revoke` & Reader Coherency on Shared `KeyRing`).
+- **Two-Stage Local + Remote Registry Consumer Verification (`scripts/test-isolated-consumer.sh`):**
+  - Upgraded `scripts/test-isolated-consumer.sh` to execute both **Stage 1** (Local Git Staging repository `noxc add` + `noxc fetch`) and **Stage 2** (Real Remote Registry installation via `noxc add cipher` + `noxc fetch` resolving `https://github.com/mburakmmm/cipher@main` from `noxpkg.noxlang.com`).
+- **Property-Based & Adversarial Fuzz Suite for IPv4/IPv6 Parsers (`tests/ip_fuzz_property_test.nox`):**
+  - Added a dedicated property-based and fuzz test suite covering exhaustive CIDR boundary invariants across all 14 restricted IPv4 blocks, 5-representation equivalence (`::ffff:a.b.c.d`, `0:0:0:0:0:ffff:a.b.c.d`, `[::ffff:a.b.c.d]`, lowercase/uppercase pure hex `::ffff:XXXX:YYYY`) for IPv4-mapped IPv6, `::` zero-compression position invariance, and 100+ adversarial malformed IP inputs.
+
 ## [1.0.5] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL V Architecture Audit)

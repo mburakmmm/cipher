@@ -48,11 +48,14 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 
 ## 3. Resilience, SSRF & Atomic Rollback Invariants
 
-### KeyRing Unified State, Deep Immutability & Hardware Atomic CAS
-`KeyRing` manages key lifecycle and rotation through a deeply immutable `KeyRingState` model backed by `nox.atomic` primitives:
-1. **Deeply Immutable `KeyRingState`:** Internal keys are stored in `_keys: list[KeyRef]` with defensive cloning on both construction and inspection (`get_keys()`). No direct mutable reference to the internal key array is exposed (`self.keys` alias was removed).
+### KeyRing Unified State, Seqlock Coherency, Tamper-Evident Sealing & Hardware Atomic CAS
+`KeyRing` manages key lifecycle and rotation through a deeply immutable `KeyRingState` model backed by `nox.atomic` primitives and a Seqlock reader/writer protocol:
+1. **Deeply Immutable & Tamper-Evident `KeyRingState`:** Internal keys are stored in `_keys: list[KeyRef]` with defensive cloning on both construction and inspection (`get_keys()`). Because NOX does not provide a language-level `private` keyword, `KeyRingState` computes a cryptographic SHA-256 integrity seal (`_integrity_hash`) over `(version, created_at, canonical _keys state)` at construction and verifies it in constant time (`nox.crypto.constant_time_eq`) inside `verify_integrity()`, `get_keys()`, and `key_count()`. Any direct external mutation of `state.version`, `state.created_at`, or `state._keys` fails closed with `ConfigurationError`.
 2. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated on cloned snapshots before any state transition.
-3. **Hardware Atomic Writer Mutex & CAS (`_commit_state`):** State commits acquire a hardware-backed writer lock (`_write_lock: nox.atomic.AtomicBool` via `nox_atomic_cas`) and execute a CPU-level atomic compare-and-swap on the version cell (`_atomic_version: nox.atomic.AtomicInt` via `compare_and_swap(base_ver, base_ver + 1)`). This eliminates the check-then-act race window at the hardware level and guarantees zero lost updates across concurrent writers.
+3. **Seqlock Coherent Snapshot Publication & Exception-Safe Lock Release (`_commit_state` & `_read_consistent_state`):**
+   - State commits acquire a hardware-backed writer lock (`_write_lock: nox.atomic.AtomicBool` via `nox_atomic_cas`) inside a `try ... except Exception:` block that unconditionally releases `_write_lock.store(False)` on any error path and rolls back state/version/sequence if `cas_won == True`.
+   - Writers advance the hardware version cell (`_atomic_version.compare_and_swap(base_ver, base_ver + 1)`), enter an odd Seqlock sequence (`_seq.store(base_ver * 2 + 1)`), publish `self._state = new_state` FIRST, and finally seal the commit with an even Seqlock sequence (`_seq.store((base_ver + 1) * 2)`).
+   - Readers (`get_version()`, `get_state()`, `get_snapshot()`, `get_signing_key()`, `get_verification_key()`) all read through `_read_consistent_state()`, verifying an even sequence number before and after capturing `self._state` (`s1 == s2 and st.version * 2 == s1`) plus `st.verify_integrity()`. Readers never observe a new version number paired with a stale key snapshot.
 
 ### Decoupled IP Syntax Parsing, SSRF Policy & Negative Cache Boundaries
 `jwks.nox` strictly separates syntactic IP parsing from SSRF security policy evaluation:

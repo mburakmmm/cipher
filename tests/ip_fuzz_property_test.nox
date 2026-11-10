@@ -1,0 +1,319 @@
+# Cipher — Property-Based & Adversarial Fuzz Test Suite for IPv4/IPv6 Parsers & SSRF Policy
+
+from cipher import EncodingError, IPv4Address, IPv6Address, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, verify_resolved_ip
+
+def _nibble_to_hex(n: int, upper: bool) -> str:
+    if n == 0:
+        return "0"
+    if n == 1:
+        return "1"
+    if n == 2:
+        return "2"
+    if n == 3:
+        return "3"
+    if n == 4:
+        return "4"
+    if n == 5:
+        return "5"
+    if n == 6:
+        return "6"
+    if n == 7:
+        return "7"
+    if n == 8:
+        return "8"
+    if n == 9:
+        return "9"
+    if n == 10:
+        if upper:
+            return "A"
+        return "a"
+    if n == 11:
+        if upper:
+            return "B"
+        return "b"
+    if n == 12:
+        if upper:
+            return "C"
+        return "c"
+    if n == 13:
+        if upper:
+            return "D"
+        return "d"
+    if n == 14:
+        if upper:
+            return "E"
+        return "e"
+    if upper:
+        return "F"
+    return "f"
+
+def _u16_to_hex4(val: int, upper: bool) -> str:
+    d3: int = (val >> 12) & 15
+    d2: int = (val >> 8) & 15
+    d1: int = (val >> 4) & 15
+    d0: int = val & 15
+    return _nibble_to_hex(d3, upper) + _nibble_to_hex(d2, upper) + _nibble_to_hex(d1, upper) + _nibble_to_hex(d0, upper)
+
+def _check_ipv4_case(o0: int, o1: int, o2: int, o3: int, expected_restricted: bool) -> None:
+    ip_str: str = str(o0) + "." + str(o1) + "." + str(o2) + "." + str(o3)
+    parsed: IPv4Address = parse_ipv4(ip_str)
+    if parsed.o0 != o0 or parsed.o1 != o1 or parsed.o2 != o2 or parsed.o3 != o3:
+        raise Exception("Property 1 failure: octet round-trip mismatch for: " + ip_str)
+    restricted: bool = is_restricted_ipv4_addr(parsed)
+    if restricted != expected_restricted:
+        raise Exception("Property 1 failure: CIDR policy mismatch for " + ip_str)
+    resolved_ok: bool = verify_resolved_ip(ip_str)
+    if resolved_ok == expected_restricted:
+        raise Exception("Property 1 failure: verify_resolved_ip mismatch for " + ip_str)
+
+    # Property 2: IPv4-Mapped IPv6 Equivalence across all 5 syntactic representations
+    hi16: int = (o0 * 256) + o1
+    lo16: int = (o2 * 256) + o3
+    f1: str = "::ffff:" + ip_str
+    f2: str = "0:0:0:0:0:ffff:" + ip_str
+    f3: str = "[::ffff:" + ip_str + "]"
+    f4: str = "::ffff:" + _u16_to_hex4(hi16, False) + ":" + _u16_to_hex4(lo16, False)
+    f5: str = "::FFFF:" + _u16_to_hex4(hi16, True) + ":" + _u16_to_hex4(lo16, True)
+
+    forms: list[str] = [f1, f2, f3, f4, f5]
+    idx: int = 0
+    while idx < len(forms):
+        cur: str = forms[idx]
+        p6: IPv6Address = parse_ipv6(cur)
+        if p6.hextets[0] != 0 or p6.hextets[1] != 0 or p6.hextets[2] != 0 or p6.hextets[3] != 0 or p6.hextets[4] != 0:
+            raise Exception("Property 2 failure: mapped prefix non-zero for: " + cur)
+        if p6.hextets[5] != 65535 or p6.hextets[6] != hi16 or p6.hextets[7] != lo16:
+            raise Exception("Property 2 failure: mapped 8-hextet expansion mismatch for: " + cur)
+        if is_restricted_ipv6_addr(p6) != expected_restricted:
+            raise Exception("Property 2 failure: mapped IPv6 policy mismatch for: " + cur)
+        if verify_resolved_ip(cur) == expected_restricted:
+            raise Exception("Property 2 failure: verify_resolved_ip mapped mismatch for: " + cur)
+        idx = idx + 1
+
+# ==============================================================================
+# Property 1 & 2: Exhaustive CIDR Boundary & IPv4-Mapped IPv6 Equivalence Matrix
+# ==============================================================================
+# 0.0.0.0/8 (This network)
+_check_ipv4_case(0, 0, 0, 0, True)
+_check_ipv4_case(0, 255, 255, 255, True)
+# 1.0.0.0/8 (Public)
+_check_ipv4_case(1, 0, 0, 1, False)
+_check_ipv4_case(1, 1, 1, 1, False)
+_check_ipv4_case(8, 8, 8, 8, False)
+_check_ipv4_case(9, 255, 255, 255, False)
+# 10.0.0.0/8 (RFC 1918)
+_check_ipv4_case(10, 0, 0, 0, True)
+_check_ipv4_case(10, 128, 42, 1, True)
+_check_ipv4_case(10, 255, 255, 255, True)
+_check_ipv4_case(11, 0, 0, 1, False)
+# 100.64.0.0/10 (CGNAT)
+_check_ipv4_case(100, 63, 255, 255, False)
+_check_ipv4_case(100, 64, 0, 0, True)
+_check_ipv4_case(100, 100, 100, 100, True)
+_check_ipv4_case(100, 127, 255, 255, True)
+_check_ipv4_case(100, 128, 0, 0, False)
+# 127.0.0.0/8 (Loopback)
+_check_ipv4_case(126, 255, 255, 255, False)
+_check_ipv4_case(127, 0, 0, 0, True)
+_check_ipv4_case(127, 0, 0, 1, True)
+_check_ipv4_case(127, 255, 255, 255, True)
+_check_ipv4_case(128, 0, 0, 1, False)
+# 169.254.0.0/16 (Link-local / Cloud Metadata)
+_check_ipv4_case(169, 253, 255, 255, False)
+_check_ipv4_case(169, 254, 0, 0, True)
+_check_ipv4_case(169, 254, 169, 254, True)
+_check_ipv4_case(169, 254, 255, 255, True)
+_check_ipv4_case(169, 255, 0, 0, False)
+# 172.16.0.0/12 (RFC 1918)
+_check_ipv4_case(172, 15, 255, 255, False)
+_check_ipv4_case(172, 16, 0, 0, True)
+_check_ipv4_case(172, 24, 10, 5, True)
+_check_ipv4_case(172, 31, 255, 255, True)
+_check_ipv4_case(172, 32, 0, 0, False)
+# 192.0.0.0/24 & 192.0.2.0/24 & 192.88.99.0/24 & 192.168.0.0/16
+_check_ipv4_case(192, 0, 0, 1, True)
+_check_ipv4_case(192, 0, 1, 1, False)
+_check_ipv4_case(192, 0, 2, 1, True)
+_check_ipv4_case(192, 0, 3, 1, False)
+_check_ipv4_case(192, 88, 98, 255, False)
+_check_ipv4_case(192, 88, 99, 1, True)
+_check_ipv4_case(192, 88, 100, 1, False)
+_check_ipv4_case(192, 167, 255, 255, False)
+_check_ipv4_case(192, 168, 0, 1, True)
+_check_ipv4_case(192, 168, 255, 255, True)
+_check_ipv4_case(192, 169, 0, 1, False)
+# 198.18.0.0/15 & 198.51.100.0/24 & 203.0.113.0/24
+_check_ipv4_case(198, 17, 255, 255, False)
+_check_ipv4_case(198, 18, 0, 1, True)
+_check_ipv4_case(198, 19, 255, 255, True)
+_check_ipv4_case(198, 20, 0, 1, False)
+_check_ipv4_case(198, 51, 99, 255, False)
+_check_ipv4_case(198, 51, 100, 42, True)
+_check_ipv4_case(198, 51, 101, 0, False)
+_check_ipv4_case(203, 0, 112, 255, False)
+_check_ipv4_case(203, 0, 113, 1, True)
+_check_ipv4_case(203, 0, 114, 1, False)
+# 224.0.0.0/3 (Multicast + Reserved + Broadcast)
+_check_ipv4_case(223, 255, 255, 255, False)
+_check_ipv4_case(224, 0, 0, 1, True)
+_check_ipv4_case(239, 255, 255, 255, True)
+_check_ipv4_case(240, 0, 0, 1, True)
+_check_ipv4_case(255, 255, 255, 255, True)
+
+# ==============================================================================
+# Property 3: IPv6 Zero-Compression ('::') Position Invariance
+# ==============================================================================
+def _check_ipv6_equivalence(compressed: str, uncompressed: str, expected_restricted: bool) -> None:
+    p_comp: IPv6Address = parse_ipv6(compressed)
+    p_full: IPv6Address = parse_ipv6(uncompressed)
+    i: int = 0
+    while i < 8:
+        if p_comp.hextets[i] != p_full.hextets[i]:
+            raise Exception("Property 3 failure: hextet mismatch at index " + str(i) + " for " + compressed)
+        i = i + 1
+    if is_restricted_ipv6_addr(p_comp) != expected_restricted or is_restricted_ipv6_addr(p_full) != expected_restricted:
+        raise Exception("Property 3 failure: policy mismatch for " + compressed)
+
+_check_ipv6_equivalence("::", "0:0:0:0:0:0:0:0", True)
+_check_ipv6_equivalence("::1", "0:0:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("fe80::1", "fe80:0:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("febf::abcd:1", "febf:0:0:0:0:0:abcd:1", True)
+_check_ipv6_equivalence("fec0::1", "fec0:0:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("fc00::1", "fc00:0:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("fd12:3456:789a::1", "fd12:3456:789a:0:0:0:0:1", True)
+_check_ipv6_equivalence("ff02::1", "ff02:0:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("2001:db8::1", "2001:db8:0:0:0:0:0:1", True)
+_check_ipv6_equivalence("2001:4860:4860::8888", "2001:4860:4860:0:0:0:0:8888", False)
+_check_ipv6_equivalence("2606:4700:4700::1111", "2606:4700:4700:0:0:0:0:1111", False)
+_check_ipv6_equivalence("2620:fe::fe", "2620:fe:0:0:0:0:0:fe", False)
+
+# ==============================================================================
+# Property 4: Adversarial & Malformed Input Fuzzing (100% Fail-Closed)
+# ==============================================================================
+malformed_inputs: list[str] = [
+    "",
+    " ",
+    ".",
+    "..",
+    "...",
+    "....",
+    ":",
+    ":::",
+    "::::",
+    "1",
+    "1.2",
+    "1.2.3",
+    "1.2.3.4.5",
+    "1.2.3.4.5.6",
+    ".1.2.3.4",
+    "1..2.3.4",
+    "1.2..3.4",
+    "1.2.3..4",
+    "1.2.3.4.",
+    "256.0.0.1",
+    "1.256.0.1",
+    "1.2.256.1",
+    "1.2.3.256",
+    "999.999.999.999",
+    "-1.0.0.1",
+    "1.-2.3.4",
+    "+1.2.3.4",
+    "01.1.1.1",
+    "1.01.1.1",
+    "1.1.01.1",
+    "1.1.1.01",
+    "010.0.0.1",
+    "0177.0.0.1",
+    "00.0.0.0",
+    "0x7f.0.0.1",
+    "2130706433",
+    "8.8.8.8 ",
+    " 8.8.8.8",
+    "8.8.8.8\t",
+    "8.8.8.8\n",
+    "8.8.8.8/32",
+    "8.8.8.8:443",
+    "127.0.0.1" + chr(0),
+    ":1",
+    "1:",
+    "2001:db8:",
+    ":2001:db8:1",
+    "2001::db8::1",
+    "::1::",
+    "::1::2",
+    "1:2:3:4:5:6:7",
+    "1:2:3:4:5:6:7:8:9",
+    "::1:2:3:4:5:6:7:8",
+    "1:2:3:4:5:6:7::8",
+    "20011:4860:4860::8888",
+    "2001:48600:4860::8888",
+    "2001:4860:4860::88888",
+    "2001:4860:4860::888g",
+    "gggg::1",
+    "fe80::1%eth0",
+    "fe80::1%25eth0",
+    "[::1",
+    "::1]",
+    "[]",
+    "[::1]:8443",
+    "[[::1]]",
+    "[2001:4860:4860::8888]trailing",
+    "::ffff:1.2.3",
+    "::ffff:1.2.3.4.5",
+    "::ffff:256.1.1.1",
+    "::ffff:1.1.1.256",
+    "::ffff:010.0.0.1",
+    "::ffff:127.0.0.01",
+    "::ffff:127.0.0.1.",
+    "::ffff:.127.0.0.1",
+    "1:2:3:4:5:6:7:8.8.8.8",
+    "1:2:3:4:5:ffff:8.8.8",
+    "https://8.8.8.8/jwks.json",
+    "auth.example.com"
+]
+
+def _assert_malformed_rejected(bad: str) -> None:
+    v4_rejected: bool = False
+    try:
+        _p4: IPv4Address = parse_ipv4(bad)
+    except EncodingError:
+        v4_rejected = True
+    if not v4_rejected:
+        raise Exception("Property 4 failure: parse_ipv4 accepted malformed input: " + bad)
+
+    v6_rejected: bool = False
+    try:
+        _p6: IPv6Address = parse_ipv6(bad)
+    except EncodingError:
+        v6_rejected = True
+    if not v6_rejected:
+        raise Exception("Property 4 failure: parse_ipv6 accepted malformed input: " + bad)
+
+    if verify_resolved_ip(bad):
+        raise Exception("Property 4 failure: verify_resolved_ip accepted malformed input: " + bad)
+
+m_idx: int = 0
+while m_idx < len(malformed_inputs):
+    _assert_malformed_rejected(malformed_inputs[m_idx])
+    m_idx = m_idx + 1
+
+# Programmatic fuzzing of synthetic corruptions around valid public IPs
+base_octets: list[int] = [256, 257, 512, 1000, 65536, -1, -255]
+b_idx: int = 0
+while b_idx < len(base_octets):
+    bad_oct: str = str(base_octets[b_idx])
+    c1: str = bad_oct + ".8.8.8"
+    c2: str = "8." + bad_oct + ".8.8"
+    c3: str = "8.8." + bad_oct + ".8"
+    c4: str = "8.8.8." + bad_oct
+    c5: str = "::ffff:" + c1
+    c6: str = "::ffff:" + c4
+    _assert_malformed_rejected(c1)
+    _assert_malformed_rejected(c2)
+    _assert_malformed_rejected(c3)
+    _assert_malformed_rejected(c4)
+    _assert_malformed_rejected(c5)
+    _assert_malformed_rejected(c6)
+    b_idx = b_idx + 1
+
+print("ip_fuzz_property_test passed!")
