@@ -1,0 +1,115 @@
+name: Release Gate & Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify-cross-platform:
+    name: Release Gate Matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Configure Git line endings
+        run: git config --global core.autocrlf false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential curl
+
+      - name: Install Nox (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://noxlang.com/install.sh | bash
+          echo "$HOME/.nox-lang/bin" >> $GITHUB_PATH
+
+      - name: Install Nox (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          irm https://noxlang.com/install.ps1 | iex
+          echo "$env:USERPROFILE\.nox-lang\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify Toolchain
+        run: noxc version
+
+      - name: Run Full Test Suite
+        run: noxc test
+
+  create-release:
+    name: Publish GitHub Release
+    needs: [verify-cross-platform]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Tag & Validate Version
+        id: version_check
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ -z "$TAG" ] || [[ "$TAG" != v* ]]; then
+            TAG="${{ inputs.tag_name }}"
+          fi
+          echo "Release Tag: $TAG"
+          CLEAN_VERSION="${TAG#v}"
+          NOX_JSON_VERSION=$(grep -o '"version": *"[^"]*"' nox.json | cut -d'"' -f4)
+          echo "nox.json version: $NOX_JSON_VERSION"
+          if [ "$CLEAN_VERSION" != "$NOX_JSON_VERSION" ]; then
+            echo "ERROR: Tag version ($CLEAN_VERSION) does not match nox.json ($NOX_JSON_VERSION)!"
+            exit 1
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "clean_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Extract Release Notes from CHANGELOG.md
+        id: changelog
+        run: |
+          VERSION="${{ steps.version_check.outputs.clean_version }}"
+          python3 -c "
+          import re, sys
+          version = sys.argv[1]
+          with open('CHANGELOG.md', 'r') as f:
+              content = f.read()
+          pattern = r'## \[' + re.escape(version) + r'\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+          match = re.search(pattern, content, re.DOTALL)
+          if match:
+              notes = match.group(1).strip()
+              with open('release_notes.md', 'w') as out:
+                  out.write(notes)
+              print('Extracted release notes successfully')
+          else:
+              with open('release_notes.md', 'w') as out:
+                  out.write('Automated release for Cipher v' + version)
+              print('Using default release notes')
+          " "$VERSION"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version_check.outputs.tag }}
+          name: Cipher ${{ steps.version_check.outputs.tag }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

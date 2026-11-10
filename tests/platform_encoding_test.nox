@@ -1,0 +1,16 @@
+import nox.base64
+import nox.strings
+import nox.test
+
+# Test base64url encoding and decoding behaviors
+raw_str: str = "cipher-token-payload-2026!?"
+encoded: str = nox.base64.encode_url(raw_str)
+
+# Assert no '=' padding in URL-safe output
+nox.test.assert_true(not nox.strings.contains(encoded, "="), "base64url should have no padding")
+nox.test.assert_true(not nox.strings.contains(encoded, "+"), "base64url should not contain '+'")
+nox.test.assert_true(not nox.strings.contains(encoded, "/"), "base64url should not contain '/'")
+
+# Verify roundtrip decode
+decoded: str = nox.base64.decode(encoded)
+nox.test.assert_eq_str(decoded, raw_str, "base64 roundtrip decode matches original")

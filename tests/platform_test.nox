@@ -1,0 +1,13 @@
+import nox.crypto
+import nox.test
+
+# Verify crypto primitives
+hashed: str = nox.crypto.sha256("cipher")
+nox.test.assert_eq_str(hashed, "c806cd9c716cfbfdb4763c71dd1394b3e602fce81291a0338bf8e3225416ac32", "sha256 of 'cipher'")
+
+mac: str = nox.crypto.hmac_sha256("secret", "message")
+nox.test.assert_true(nox.crypto.constant_time_eq(mac, mac), "constant_time_eq self")
+nox.test.assert_true(not nox.crypto.constant_time_eq(mac, "bad"), "constant_time_eq mismatch")
+
+rnd: str = nox.crypto.secure_random_hex(16)
+nox.test.assert_eq_int(len(rnd), 32, "secure_random_hex length")

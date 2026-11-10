@@ -1,0 +1,62 @@
+# Threat Model — Cipher
+
+> **Target:** NOX Cryptographic Tokens & Contracts  
+> **Status:** Active Normative Document  
+> **Standard References:** RFC 7515, RFC 7519, RFC 8725 (JWT BCP)
+
+---
+
+## 1. Threat Actors & Attack Vectors
+
+| Threat Actor | Capabilities | Objective |
+|---|---|---|
+| **Unauthenticated Network Attacker** | Sends arbitrary tokens, manipulates headers, forged signatures | Bypass authentication, elevate privileges, forge tokens |
+| **Malicious Tenant User** | Possesses valid token for Tenant A | Access Tenant B's keys/resources (cross-tenant confusion) |
+| **Compromised Key Holder** | Controls a revoked or expired private key | Continue issuing valid tokens post-revocation |
+| **Malicious JWKS Provider** | Controls untrusted external HTTP endpoints | SSRF, internal network scan, denial of service (DoS) |
+| **Eavesdropper / Network Observer** | Inspects token traffic | Steal bearer tokens or infer secrets via timing attacks |
+
+---
+
+## 2. Adversarial Scenarios & Mitigations
+
+### 2.1 Algorithm Manipulation (`alg=none` and Algorithm Confusion)
+- **Threat:** Attacker modifies `{"alg":"HS256"}` to `{"alg":"none"}` or signs an RSA token with an HMAC secret (confusing public key with secret).
+- **Mitigation:**
+  - `alg=none` is unconditionally rejected at the parser level.
+  - Verification algorithm is strictly verifier-controlled through an explicit allowlist.
+  - Symmetric secrets and asymmetric keys use incompatible static types in NOX.
+
+### 2.2 Untrusted Header Parameter Abuse (`kid`, `jku`, `x5u`)
+- **Threat:** Attacker provides SQL injection, path traversal (`../../etc/passwd`), or malicious URL in `kid` or `jku` to force arbitrary file read or SSRF.
+- **Mitigation:**
+  - `kid` is treated strictly as an opaque lookup identifier (exact equality match in memory).
+  - Remote key directives (`jku`, `x5u`, embedded `jwk`) are ignored or rejected by default.
+  - Untrusted header URLs are never fetched over the network.
+
+### 2.3 Timing Side-Channel Attacks
+- **Threat:** Byte-by-byte string comparison (`==`) stops on the first mismatch, allowing an attacker to deduce the valid signature by observing response times.
+- **Mitigation:**
+  - All signature and MAC checks use `nox.crypto.constant_time_eq`.
+
+### 2.4 Duplicate JSON Keys & Ambiguity
+- **Threat:** Attacker crafts JSON with duplicate keys (e.g. `{"alg":"HS256", "alg":"none"}`) hoping parser will verify one and use the other.
+- **Mitigation:**
+  - Strict duplicate key detection in `json_strict.nox` rejects any JSON containing repeated object keys.
+
+### 2.5 Re-serialization & ASCII Input Mismatch
+- **Threat:** Verifier decodes header/payload, modifies formatting or whitespace, and re-encodes, verifying an altered payload.
+- **Mitigation:**
+  - The signing input is preserved as the exact original ASCII substring `base64url(header) + "." + base64url(payload)`.
+
+### 2.6 Fetch Storms and DoS via Unknown `kid`
+- **Threat:** Attacker sends thousands of requests with random `kid`s to trigger an outgoing JWKS HTTP request for every token.
+- **Mitigation:**
+  - Rate limiting, request coalescing, and negative caching for non-existent `kid`s.
+
+---
+
+## 3. Residual Risks & Exclusions
+
+- **Bearer Token Theft in Transit:** Cipher cannot prevent token interception if TLS is broken or terminated insecurely by the host application.
+- **Replay Attacks:** Cipher validates time (`exp`, `nbf`), but replay prevention requires an application-level nonce store managed by Sentinel.

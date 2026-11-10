@@ -1,0 +1,63 @@
+import nox.base64
+import nox.crypto
+import nox.strings
+
+def hex_digit_val(c: int) -> int:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    return -1
+
+def hex_to_raw_bytes(hex_str: str) -> str:
+    n: int = nox.strings.byte_len(hex_str)
+    out: str = ""
+    i: int = 0
+    while i + 1 < n:
+        hi: int = hex_digit_val(nox.strings.byte_at(hex_str, i))
+        lo: int = hex_digit_val(nox.strings.byte_at(hex_str, i + 1))
+        out = out + nox.strings.char_from_byte((hi << 4) | lo)
+        i = i + 2
+    return out
+
+# 1. Sign
+secret: str = "cipher-super-secure-production-key-256-bits"
+header_json: str = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+payload_json: str = "{\"sub\":\"user_123\",\"iss\":\"cipher-test\"}"
+
+header_b64: str = nox.base64.encode_url(header_json)
+payload_b64: str = nox.base64.encode_url(payload_json)
+signing_input: str = header_b64 + "." + payload_b64
+
+mac_hex: str = nox.crypto.hmac_sha256(secret, signing_input)
+sig_raw: str = hex_to_raw_bytes(mac_hex)
+sig_b64: str = nox.base64.encode_url(sig_raw)
+
+token: str = signing_input + "." + sig_b64
+print("Spike Generated Token: " + token)
+
+# 2. Verify
+parts: list[str] = nox.strings.split(token, ".")
+if len(parts) != 3:
+    print("Verification Failed: wrong part count")
+else:
+    recomputed_mac_hex: str = nox.crypto.hmac_sha256(secret, parts[0] + "." + parts[1])
+    recomputed_sig_raw: str = hex_to_raw_bytes(recomputed_mac_hex)
+    recomputed_sig_b64: str = nox.base64.encode_url(recomputed_sig_raw)
+    
+    if nox.crypto.constant_time_eq(parts[2], recomputed_sig_b64):
+        print("Spike Verification Success! Payload: " + nox.base64.decode(parts[1]))
+    else:
+        print("Verification Failed: invalid signature")
+
+# 3. Fail-Closed Check with Tampered Payload
+tampered_token: str = header_b64 + "." + nox.base64.encode_url("{\"sub\":\"attacker\"}") + "." + sig_b64
+tampered_parts: list[str] = nox.strings.split(tampered_token, ".")
+tampered_mac_hex: str = nox.crypto.hmac_sha256(secret, tampered_parts[0] + "." + tampered_parts[1])
+tampered_sig_raw: str = hex_to_raw_bytes(tampered_mac_hex)
+tampered_sig_b64: str = nox.base64.encode_url(tampered_sig_raw)
+
+if not nox.crypto.constant_time_eq(tampered_parts[2], tampered_sig_b64):
+    print("Fail-Closed Verified: Tampered token correctly rejected!")

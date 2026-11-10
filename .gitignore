@@ -1,0 +1,13 @@
+.nox/
+.DS_Store
+*.ll
+*.ssa
+*.o
+*.obj
+*.s
+*.dSYM/
+test-results.xml
+zig-cache/
+.bin/
+bin/
+tmp/
