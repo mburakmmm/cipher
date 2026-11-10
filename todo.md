@@ -447,3 +447,4 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
   - Signed token temporal fraud, excessive TTL ve `verify_with_keyring` desteği eklendi (`tests/signed_token_test.nox`).
   - `nox.json` entry noktası `"cipher.nox"` yapıldı ve `tests/consumer_test.nox` tüketici testi eklendi.
   - Test sonucu: `14 passed, 0 failed (14 total)`.
+  - Git tag `v1.0.1` push edildi ve `noxc publish https://github.com/mburakmmm/cipher` başarıyla yayınlandı (`published: cipher updated in the registry as @mburakmmm`).
