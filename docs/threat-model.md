@@ -57,9 +57,11 @@
 ### 2.7 DNS Rebinding, Redirect Chains, and DNS Pinning in Real HTTP Transport
 - **Threat:** Attacker registers a domain (e.g. `evil-jwks.org`) that resolves to a public IP on pre-check, but returns a private IP (`127.0.0.1` or `169.254.169.254`) upon actual HTTP connection (DNS Rebinding / TOCTOU SSRF). Alternatively, the server responds with a 302 redirect pointing to an internal service.
 - **Mitigation & Normative Requirements:**
-  - **DNS Pinning:** Any production HTTP transport adapter consuming `JwksKeySource` must perform DNS resolution once, validate the resolved IP against Cipher's `_is_restricted_ipv4` / IPv6 CIDR filters, and connect strictly to the pinned socket IP address with SNI hostname verification.
+  - **Programmatic Post-Resolution Verification:** Cipher exports `verify_resolved_ip(ip_str: str) -> bool`. Any HTTP transport layer integrated with Cipher must resolve DNS, pass the resulting socket IP string directly to `verify_resolved_ip()`, and reject connection if it returns `false`.
+  - **DNS Pinning:** Production HTTP clients must connect strictly to the validated numeric IP address and pass the original hostname via TLS SNI (Server Name Indication) and `Host` header. Re-resolution during the HTTP session is forbidden.
   - **Strict Redirect Handling:** The HTTP transport client must either disable redirects completely or re-run `is_safe_jwks_url()` on every redirect target in the chain prior to following it.
-  - **Structural CIDR Blocking:** Cipher automatically rejects all 14 non-routable CIDR blocks, including RFC 6598 CGNAT (`100.64.0.0/10`) and RFC 2544 Benchmark (`198.18.0.0/15`).
+  - **Structural CIDR & IPv6 Bitmask Filtering:** Cipher rejects all 14 non-routable IPv4 CIDR blocks (including RFC 6598 CGNAT `100.64.0.0/10` and RFC 2544 Benchmark `198.18.0.0/15`) and evaluates structural IPv6 hextet bitmasks for RFC 4193 ULA (`fc00::/7`), RFC 4291 Link-Local (`fe80::/10`), Multicast (`ff00::/8`), Discard (`100::/64`), and Documentation prefixes (`2001:db8::/32`).
+
 
 
 ---

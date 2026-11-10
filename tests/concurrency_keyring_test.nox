@@ -172,4 +172,43 @@ snap_list[0].kid = "corrupted-in-snapshot"
 active_after_snap_tamper: KeyRef = cas_ring.get_signing_key("HS256")
 nox.test.assert_eq_str(active_after_snap_tamper.kid, "k-cas-2", "Tampering with get_snapshot() list does not corrupt KeyRing")
 
+# ==============================================================================
+# Test 6: P0 Unified KeyRingState & Interleaved Lost-Update Protection (0.10.2)
+# ==============================================================================
+state_ring: KeyRing = KeyRing(trust_domain="tenant-atomic")
+init_k: KeyRef = KeyRef("k-atom-1", "HS256", "super-secret-key-material-atomic-32", trust_domain="tenant-atomic", state=STATE_ACTIVE_SIGNING)
+state_ring.add_key(init_k)
+
+# 6a. Single immutable KeyRingState object verification
+nox.test.assert_eq_int(state_ring.state.version, 1, "KeyRingState encapsulates version 1")
+nox.test.assert_eq_int(len(state_ring.state.keys), 1, "KeyRingState encapsulates keys array")
+nox.test.assert_true(state_ring.state.created_at > 0, "KeyRingState tracks creation timestamp")
+
+# 6b. True Lost-Update Detection Simulation:
+# Two concurrent writers W1 and W2 both capture base state at version 1
+w1_base_ver: int = state_ring.get_version()
+w2_base_ver: int = state_ring.get_version()
+nox.test.assert_eq_int(w1_base_ver, 1, "W1 reads version 1")
+nox.test.assert_eq_int(w2_base_ver, 1, "W2 reads version 1")
+
+# W1 completes preparation and commits rotate to k-atom-2
+w1_key: KeyRef = KeyRef("k-atom-2", "HS256", "super-secret-key-material-w1-key-32", trust_domain="tenant-atomic", state=STATE_PREPARED)
+rec_w1: RotationReceipt = state_ring.rotate(w1_key, overlap_seconds=600, clock_time_sec=2000, expected_version=w1_base_ver)
+nox.test.assert_eq_str(rec_w1.new_kid, "k-atom-2", "W1 successfully committed")
+nox.test.assert_eq_int(state_ring.get_version(), 2, "State version advanced to 2")
+
+# W2 attempts commit using its stale base version (1) -> Must be rejected immediately!
+w2_key: KeyRef = KeyRef("k-atom-3", "HS256", "super-secret-key-material-w2-key-32", trust_domain="tenant-atomic", state=STATE_PREPARED)
+w2_lost_update_caught: bool = False
+try:
+    state_ring.rotate(w2_key, overlap_seconds=600, clock_time_sec=2000, expected_version=w2_base_ver)
+except ConfigurationError:
+    w2_lost_update_caught = True
+nox.test.assert_true(w2_lost_update_caught, "W2 rotate rejected: CAS / lost-update prevented")
+
+# Verify state remains at version 2 and W1's active signer is preserved
+nox.test.assert_eq_int(state_ring.get_version(), 2, "KeyRing version remains 2 after conflicting write aborted")
+current_active: KeyRef = state_ring.get_signing_key("HS256")
+nox.test.assert_eq_str(current_active.kid, "k-atom-2", "W1's active signer was NOT overwritten by W2")
+
 print("concurrency_keyring_test passed!")

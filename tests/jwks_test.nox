@@ -1,7 +1,7 @@
 import nox.test
 from errors import ConfigurationError, KeyUnavailableError, UnknownKeyError
 from jwk import JwkKey
-from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks
+from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks, verify_resolved_ip
 
 # 1. SSRF Protection Tests
 nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
@@ -114,3 +114,33 @@ cache_len: int = len(test_source_bounded.negative_cache_kids)
 nox.test.assert_true(cache_len <= 256, "Negative cache size must be bounded by MAX_NEGATIVE_CACHE_ENTRIES")
 nox.test.assert_true(test_source_bounded.is_in_negative_cache("spam-kid-299"), "Most recent kid is retained in bounded cache")
 nox.test.assert_true(not test_source_bounded.is_in_negative_cache("spam-kid-0"), "Oldest kid evicted from bounded cache")
+
+# ==============================================================================
+# 6. Structural IPv6 Bitmask & Extended SSRF Prefix Tests (0.10.4)
+# ==============================================================================
+nox.test.assert_true(not is_safe_jwks_url("https://[::]/jwks"), "IPv6 unspecified address [::] must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[ff02::1]/jwks"), "IPv6 multicast ff02::1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[100::1]/jwks"), "RFC 6666 Discard prefix 100::1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[2001:db8::1]/jwks"), "RFC 3849 Documentation prefix 2001:db8::1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[2001:2::1]/jwks"), "RFC 5180 Benchmark prefix 2001:2::1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[fec0::1]/jwks"), "RFC 3879 Site-local fec0::1 must be rejected")
+
+# ==============================================================================
+# 7. DNS Resolution Post-Check IP Verification Tests (0.10.5)
+# ==============================================================================
+# Private / loopback / restricted IPs must be rejected by verify_resolved_ip
+nox.test.assert_true(not verify_resolved_ip("127.0.0.1"), "Resolved loopback 127.0.0.1 rejected")
+nox.test.assert_true(not verify_resolved_ip("10.0.1.20"), "Resolved private 10.0.1.20 rejected")
+nox.test.assert_true(not verify_resolved_ip("192.168.1.1"), "Resolved private 192.168.1.1 rejected")
+nox.test.assert_true(not verify_resolved_ip("169.254.169.254"), "Resolved cloud metadata rejected")
+nox.test.assert_true(not verify_resolved_ip("100.64.1.1"), "Resolved CGNAT 100.64.1.1 rejected")
+nox.test.assert_true(not verify_resolved_ip("198.18.0.1"), "Resolved Benchmark 198.18.0.1 rejected")
+nox.test.assert_true(not verify_resolved_ip("::1"), "Resolved IPv6 loopback ::1 rejected")
+nox.test.assert_true(not verify_resolved_ip("fe80::1"), "Resolved IPv6 link-local rejected")
+nox.test.assert_true(not verify_resolved_ip("fc00::1"), "Resolved IPv6 ULA rejected")
+nox.test.assert_true(not verify_resolved_ip("ff02::1"), "Resolved IPv6 multicast rejected")
+
+# Public routable IPs must pass verify_resolved_ip
+nox.test.assert_true(verify_resolved_ip("93.184.216.34"), "Valid public IPv4 address accepted")
+nox.test.assert_true(verify_resolved_ip("2606:2800:220:1:248:1893:25c8:1946"), "Valid public IPv6 address accepted")
+

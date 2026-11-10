@@ -7,42 +7,57 @@ from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, U
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
 from rotation import RotationReceipt
 
+class KeyRingState:
+    version: int
+    keys: list[KeyRef]
+    created_at: int
+
+    def __init__(self, version: int, keys: list[KeyRef], created_at: int = 0) -> None:
+        self.version = version
+        self.keys = keys
+        self.created_at = created_at
+
 class KeyRing:
     trust_domain: str
-    keys: list[KeyRef]
-    version: int
+    state: KeyRingState
+    keys: list[KeyRef]  # Direct snapshot alias for backward compatibility
 
     def __init__(self, trust_domain: str = "default") -> None:
         self.trust_domain = trust_domain
-        self.keys = []
-        self.version = 0
+        initial_keys: list[KeyRef] = []
+        self.state = KeyRingState(0, initial_keys, 0)
+        self.keys = initial_keys
 
     def get_version(self) -> int:
-        return self.version
+        return self.state.version
 
     def get_snapshot(self) -> list[KeyRef]:
+        curr_keys: list[KeyRef] = self.state.keys
         snap: list[KeyRef] = []
         i: int = 0
-        n: int = len(self.keys)
+        n: int = len(curr_keys)
         while i < n:
-            snap.append(self.keys[i].clone())
+            snap.append(curr_keys[i].clone())
             i = i + 1
         return snap
 
     def add_key(self, key: KeyRef, expected_version: int = -1) -> None:
+        base_state: KeyRingState = self.state
+
         # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and self.version != expected_version:
-            raise ConfigurationError("KeyRing version mismatch (CAS failed): expected " + str(expected_version) + ", current is " + str(self.version))
+        if expected_version >= 0 and base_state.version != expected_version:
+            raise ConfigurationError("KeyRing version mismatch (CAS failed): expected " + str(expected_version) + ", current is " + str(base_state.version))
 
         # Cross-tenant trust domain boundary check
         if key.trust_domain != self.trust_domain:
             raise ConfigurationError("Key trust domain mismatch: key is '" + key.trust_domain + "', keyring is '" + self.trust_domain + "'")
         
         # Unique kid enforcement
+        curr_keys: list[KeyRef] = base_state.keys
         i: int = 0
-        n: int = len(self.keys)
+        n: int = len(curr_keys)
         while i < n:
-            if self.keys[i].kid == key.kid:
+            if curr_keys[i].kid == key.kid:
                 raise AmbiguousKeyError("Duplicate key identifier in keyring: " + key.kid)
             i = i + 1
         
@@ -50,7 +65,7 @@ class KeyRing:
         if key.state == STATE_ACTIVE_SIGNING:
             j: int = 0
             while j < n:
-                existing: KeyRef = self.keys[j]
+                existing: KeyRef = curr_keys[j]
                 if existing.state == STATE_ACTIVE_SIGNING and existing.algorithm == key.algorithm:
                     raise ConfigurationError("Keyring already has an active signing key for algorithm: " + key.algorithm)
                 j = j + 1
@@ -59,14 +74,20 @@ class KeyRing:
         new_snap: list[KeyRef] = []
         k_idx: int = 0
         while k_idx < n:
-            new_snap.append(self.keys[k_idx])
+            new_snap.append(curr_keys[k_idx])
             k_idx = k_idx + 1
         new_snap.append(key.clone())
+
+        # Atomic commit & lost-update detection:
+        if self.state.version != base_state.version:
+            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
+
+        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, nox.time.now_ms() // 1000)
+        self.state = new_state
         self.keys = new_snap
-        self.version = self.version + 1
 
     def get_signing_key(self, algorithm: str) -> KeyRef:
-        snap: list[KeyRef] = self.keys
+        snap: list[KeyRef] = self.state.keys
         i: int = 0
         n: int = len(snap)
         while i < n:
@@ -78,7 +99,7 @@ class KeyRing:
         raise KeyUnavailableError("No active signing key available for algorithm: " + algorithm)
 
     def get_verification_key(self, kid: str, current_time_sec: int = 0) -> KeyRef:
-        snap: list[KeyRef] = self.keys
+        snap: list[KeyRef] = self.state.keys
         i: int = 0
         n: int = len(snap)
         while i < n:
@@ -95,9 +116,11 @@ class KeyRing:
 
     def rotate(self, new_key: KeyRef, overlap_seconds: int = 3600,
                clock_time_sec: int = 0, expected_version: int = -1) -> RotationReceipt:
+        base_state: KeyRingState = self.state
+
         # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and self.version != expected_version:
-            raise ConfigurationError("KeyRing rotation CAS failed: expected version " + str(expected_version) + ", current is " + str(self.version))
+        if expected_version >= 0 and base_state.version != expected_version:
+            raise ConfigurationError("KeyRing rotation CAS failed: expected version " + str(expected_version) + ", current is " + str(base_state.version))
 
         now: int = clock_time_sec
         if now <= 0:
@@ -108,10 +131,11 @@ class KeyRing:
             raise ConfigurationError("Key trust domain mismatch: key is '" + new_key.trust_domain + "', keyring is '" + self.trust_domain + "'")
         
         # Check duplicate kid in existing keyring
+        curr_keys: list[KeyRef] = base_state.keys
         i: int = 0
-        n: int = len(self.keys)
+        n: int = len(curr_keys)
         while i < n:
-            if self.keys[i].kid == new_key.kid:
+            if curr_keys[i].kid == new_key.kid:
                 raise AmbiguousKeyError("Duplicate key identifier in keyring: " + new_key.kid)
             i = i + 1
         
@@ -124,7 +148,7 @@ class KeyRing:
         existing_idx: int = -1
         j: int = 0
         while j < n:
-            existing: KeyRef = self.keys[j]
+            existing: KeyRef = curr_keys[j]
             if existing.algorithm == new_key.algorithm and existing.state == STATE_ACTIVE_SIGNING:
                 old_kid = existing.kid
                 existing_idx = j
@@ -135,7 +159,7 @@ class KeyRing:
         new_snap: list[KeyRef] = []
         k_i: int = 0
         while k_i < n:
-            curr: KeyRef = self.keys[k_i]
+            curr: KeyRef = curr_keys[k_i]
             if k_i == existing_idx:
                 demoted: KeyRef = curr.clone()
                 demoted.transition_to(STATE_VERIFY_ONLY)
@@ -151,22 +175,30 @@ class KeyRing:
         activated_new.activated_at = now
         new_snap.append(activated_new)
 
-        # Single-step atomic reference publication and version increment
+        # Atomic commit & lost-update detection:
+        if self.state.version != base_state.version:
+            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
+
+        # Single-step atomic reference publication of entire state (version + keys together)
+        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, now)
+        self.state = new_state
         self.keys = new_snap
-        self.version = self.version + 1
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
     def revoke(self, kid: str, expected_version: int = -1) -> None:
-        # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and self.version != expected_version:
-            raise ConfigurationError("KeyRing revoke CAS failed: expected version " + str(expected_version) + ", current is " + str(self.version))
+        base_state: KeyRingState = self.state
 
+        # Optimistic concurrency check (CAS)
+        if expected_version >= 0 and base_state.version != expected_version:
+            raise ConfigurationError("KeyRing revoke CAS failed: expected version " + str(expected_version) + ", current is " + str(base_state.version))
+
+        curr_keys: list[KeyRef] = base_state.keys
         found: bool = False
         new_snap: list[KeyRef] = []
         k_i: int = 0
-        n: int = len(self.keys)
+        n: int = len(curr_keys)
         while k_i < n:
-            curr: KeyRef = self.keys[k_i]
+            curr: KeyRef = curr_keys[k_i]
             if curr.kid == kid:
                 found = True
                 revoked_k: KeyRef = curr.clone()
@@ -177,5 +209,12 @@ class KeyRing:
             k_i = k_i + 1
         if not found:
             raise UnknownKeyError("Cannot revoke unknown key: " + kid)
+
+        # Atomic commit & lost-update detection:
+        if self.state.version != base_state.version:
+            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
+
+        # Single-step atomic reference publication of entire state (version + keys together)
+        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, nox.time.now_ms() // 1000)
+        self.state = new_state
         self.keys = new_snap
-        self.version = self.version + 1

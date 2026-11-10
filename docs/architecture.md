@@ -48,19 +48,21 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 
 ## 3. Resilience, SSRF & Atomic Rollback Invariants
 
-### KeyRing Atomic Rollback
-`KeyRing.rotate()` executes in two strictly distinct phases:
-1. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated. Any mismatch or conflict raises typed exceptions immediately without mutating existing active signers.
-2. **Commit Phase:** Only upon successful validation is the existing active signer transitioned to `VERIFY_ONLY` and the new key activated. This guarantees that signing services never experience downtime due to invalid rotation requests.
+### KeyRing Unified State & Atomic Rollback
+`KeyRing` manages key lifecycle and rotation through an immutable `KeyRingState` model:
+1. **Unified State Encapsulation:** `keys`, `version`, and `created_at` are encapsulated within a single immutable `KeyRingState` object. Single-reference assignment (`self.state = new_state`) ensures versions and key snapshots are published simultaneously and atomically.
+2. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated. Any mismatch raises typed exceptions immediately without mutating existing signers.
+3. **Commit & Lost-Update Guard:** Immediately before state publication, KeyRing verifies `self.state.version == base_state.version`. If an interleaved writer committed changes during preparation, the operation aborts with `ConfigurationError("Concurrent modification detected")`, preventing lost updates.
 
 ### SSRF & Negative Cache Boundaries
-`is_safe_jwks_url()` enforces strict destination validation:
+`is_safe_jwks_url()` and `verify_resolved_ip()` enforce strict destination validation:
 - Rejects non-HTTPS schemes unconditionally.
 - Rejects all loopback addresses (`127.0.0.0/8`, `::1`, `localhost`, `0.0.0.0`).
 - Rejects link-local and cloud metadata (`169.254.0.0/16`, `fe80::`, metadata endpoints).
 - Rejects RFC 6598 CGNAT (`100.64.0.0/10`) and RFC 2544 Benchmark (`198.18.0.0/15`).
-- Rejects full IPv6 ULA (`fc00::/7`), link-local (`fe80::/10`), and IPv4-mapped IPv6.
-- Enforces DNS Pinning and redirect chain re-validation on all external HTTP transport adapters to prevent TOCTOU DNS rebinding SSRF.
+- Evaluates structural IPv6 bitmasks for RFC 4193 ULA (`fc00::/7`), RFC 4291 Link-Local (`fe80::/10`), Multicast (`ff00::/8`), and documentation prefixes.
+- Programmatic post-resolution verification via `verify_resolved_ip(ip_str: str) -> bool` prevents TOCTOU DNS rebinding SSRF.
+
 
 - Rejects all RFC 1918 private IPv4 ranges (`10.0.0.0/8`, `192.168.0.0/16`, and all 16 subnets of `172.16.0.0/12`).
 - Negative cache is bounded by `MAX_NEGATIVE_CACHE_ENTRIES` (256) with FIFO eviction, preventing memory exhaustion attacks under random `kid` floods.

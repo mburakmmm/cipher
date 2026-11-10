@@ -8,8 +8,9 @@ from errors import EncodingError, InvalidKeyError, JsonFormatError
 from json_strict import get_string_field, has_field, is_object, parse_strict_json
 
 MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
-MAX_RSA_EXPONENT_CHARS: int = 11  # Upper bound for 64-bit RSA public exponent (e.g. 65537 'AQAB' is 4 chars)
-MAX_SAFE_INT_BEFORE_SHIFT: int = 140737488355327  # (2^53 - 1) >> 6: Safe integer overflow prevention
+MAX_RSA_EXPONENT_CHARS: int = 11  # Upper bound for safe integer RSA public exponent (IEEE 754 53-bit safe integer limit; e.g. 65537 'AQAB' is 4 chars)
+MAX_SAFE_INT_BEFORE_SHIFT: int = 140737488355327  # (2^53 - 1) >> 6: IEEE 754 53-bit safe integer overflow prevention boundary
+
 
 
 def _b64_char_to_val(code: int) -> int:

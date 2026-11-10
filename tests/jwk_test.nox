@@ -112,3 +112,30 @@ except InvalidKeyError:
     excessive_e_rejected = True
 nox.test.assert_true(excessive_e_rejected, "RSA public exponent exceeding MAX_RSA_EXPONENT_CHARS must be rejected")
 
+# P1: Invalid Base64URL integer length (n % 4 == 1) for exponent (0.10.6)
+single_char_e_json: str = "{\"kty\":\"RSA\",\"n\":\"" + key.n + "\",\"e\":\"A\"}"
+single_char_e_rejected: bool = False
+try:
+    parse_jwk(single_char_e_json)
+except InvalidKeyError:
+    single_char_e_rejected = True
+nox.test.assert_true(single_char_e_rejected, "1-character RSA public exponent (len % 4 == 1) must be rejected")
+
+five_char_e_json: str = "{\"kty\":\"RSA\",\"n\":\"" + key.n + "\",\"e\":\"AQABA\"}"
+five_char_e_rejected: bool = False
+try:
+    parse_jwk(five_char_e_json)
+except InvalidKeyError:
+    five_char_e_rejected = True
+nox.test.assert_true(five_char_e_rejected, "5-character RSA public exponent (len % 4 == 1) must be rejected")
+
+# P1: Exponent integer overflow within MAX_RSA_EXPONENT_CHARS limit (0.10.6)
+overflow_e_json: str = "{\"kty\":\"RSA\",\"n\":\"" + key.n + "\",\"e\":\"__________\"}"
+overflow_e_rejected: bool = False
+try:
+    parse_jwk(overflow_e_json)
+except InvalidKeyError:
+    overflow_e_rejected = True
+nox.test.assert_true(overflow_e_rejected, "RSA public exponent causing integer overflow (> 53 bits) must be rejected")
+
+

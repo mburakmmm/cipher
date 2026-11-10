@@ -4,6 +4,20 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL IV Architecture Audit)
+- **Unified `KeyRingState` Single-Reference Atomic Publication (`keyring.nox`):** Replaced separate `self.keys` and `self.version` fields with a single, immutable `KeyRingState` record (`version: int`, `keys: list[KeyRef]`, `created_at: int`). All state mutations publish atomically via a single reference assignment (`self.state = KeyRingState(...)`), completely eliminating torn reads and ensuring readers always observe an internally coherent snapshot.
+- **Lost-Update Guard in Multi-Writer Coordination (`keyring.nox`):** Hardened `add_key()`, `rotate()`, and `revoke()` by capturing `base_state = self.state` at the start of preparation. If an interleaved concurrent writer commits before the prepared state is published (`self.state.version != base_state.version`), the mutation aborts fail-closed with `ConfigurationError("Concurrent modification detected...")`, guaranteeing zero lost updates.
+- **Structural Hextet & Bitmask IPv6 SSRF Validation (`jwks.nox`):** Replaced fragile string prefix matching with full RFC 4291 structural hextet parsing, `::` zero-compression expansion, and numerical 16-bit bitmask validation:
+  - ULA: `fc00::/7` via `(h0 & 0xfe00) == 0xfc00`
+  - Link-Local: `fe80::/10` via `(h0 & 0xffc0) == 0xfe80`
+  - Multicast: `ff00::/8` via `(h0 & 0xff00) == 0xff00`
+  - Discard (`100::/64`), Documentation (`2001:db8::/32`), Benchmark (`2001:2::/48`)
+- **DNS Resolution Verification Public API (`verify_resolved_ip` in `jwks.nox`, `cipher.nox`):** Added and exported `verify_resolved_ip(ip_str: str) -> bool` to allow caller HTTP transports to validate resolved IP addresses against all restricted IPv4 and IPv6 CIDR blocks before connecting (mitigating DNS Rebinding and TOCTOU attacks). Documented in `docs/threat-model.md` and `docs/architecture.md`.
+- **RSA Public Exponent IEEE 754 53-Bit Safe Integer Clarification & Boundary Tests (`jwk.nox`, `tests/jwk_test.nox`):** Corrected documentation and error definitions to reflect IEEE 754 53-bit safe integer limits (`2^53 - 1` ceiling, `MAX_SAFE_INT_BEFORE_SHIFT = 140737488355327`). Added comprehensive negative tests for 1-character (`len % 4 == 1`), 5-character, and overflowing 10-character exponents.
+- **Concurrency & Interleaving Test Suite (`tests/concurrency_keyring_test.nox`):** Added Test 6 verifying unified snapshot state publication and interleaved lost-update conflict rejection.
+
 ## [1.0.3] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL III Architecture Audit)

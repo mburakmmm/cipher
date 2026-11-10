@@ -549,3 +549,55 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.3` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.3` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 10 — `v1.0.4` Atomic Snapshot State, Strict IPv6 Bitmask & Concurrency Hardening (SOL IV Analizi)
+
+**Amaç:** Dördüncü bağımsız teknik incelemede (GPT 6 SOL IV analizi) tespit edilen mimari ayrışmaları ve güvenlik eksiklerini eksiksiz gidermek: KeyRing'de `keys` ve `version` alanlarının iki ayrı referans yerine tek bir immutable `KeyRingState` nesnesinde birleştirilmesi, preparation esnasında araya giren yazıcı modifikasyonlarının (lost update) tespiti ve tek adımda atomik snapshot yayını, prefix tabanlı kontroller yerine tam hextet ve sayısal bitmask tabanlı yapısal IPv6 ayrıştırıcısı (`_is_restricted_ipv6`), DNS çözümleme sonrası IP doğrulama fonksiyonu (`verify_resolved_ip`), RSA exponent güvenli tamsayı sınır testleri ve `v1.0.4` resmi yayını.
+
+## 0.10.1 — P0: `KeyRingState` Birleşik İmmutable Snapshot Modeli (`keyring.nox`, `keys.nox`)
+- [x] `KeyRingState` sınıfı tanımlandı: `version: int`, `keys: list[KeyRef]`, `created_at: int`.
+- [x] `KeyRing` sınıfı `self.state: KeyRingState` tek referansını yönetecek şekilde refactor edildi.
+- [x] `get_signing_key()` ve `get_verification_key()` metodlarının `snap = self.state.keys` üzerinden tek referans yakalayarak çalışması sağlandı.
+- [x] `get_version() -> int` ve `get_snapshot() -> list[KeyRef]` metodları `self.state` üzerinden güncellendi.
+
+## 0.10.2 — P0: Gerçek Atomik Yazıcı Koordinasyonu & Lost-Update Koruması (`keyring.nox`)
+- [x] `add_key()`, `rotate()` ve `revoke()` işlemlerinde:
+  - İşlem başında güncel snapshot durumu alındı (`base_state = self.state`).
+  - `expected_version >= 0 and base_state.version != expected_version` kontrolü uygulandı.
+  - Snapshot kopyaları üzerinde doğrulamalar tamamlandı.
+  - Atomik commit öncesinde yarış kontrolü yapıldı: Hazırlık esnasında başka bir işlem commit olmuşsa (`self.state.version != base_state.version`), işlem iptal edilip fail-closed `ConfigurationError("Concurrent modification detected: keyring state changed during preparation")` fırlatıldı (lost-update koruması).
+  - Tek referans atamasıyla yeni durum yayınlandı: `self.state = KeyRingState(base_state.version + 1, new_keys, now)`.
+
+## 0.10.3 — P1: Eşzamanlı Yarış Koşulu & Interleaved Writer Testleri (`tests/concurrency_keyring_test.nox`)
+- [x] Test 6 eklendi: İki yazarın aynı anda aynı sürüm snapshot'ını alıp hazırlık yaptığı, birinci yazarın commit etmesinden sonra ikinci yazarın commit anında `Concurrent modification detected` hatasıyla reddedildiğini ve ilk yazarın değişikliklerinin korunduğunu kanıtlayan negatif yarış testi doğrulandı.
+
+## 0.10.4 — P1: Yapısal IPv6 Ayrıştırıcı & Bitmask Filtreleme (`jwks.nox`)
+- [x] `_is_restricted_ipv6(host: str) -> bool` fonksiyonu yapısal olarak uygulandı:
+  - `::` çift iki nokta genişletmesi (expansion), hextet ayrıştırması (1-8 segment, hex to int).
+  - Sayısal hextet kontrolleri:
+    - Loopback (`::1`) ve Unspecified (`::`).
+    - IPv4-mapped IPv6 (`::ffff:x.x.x.x`): son oktetlerin `_is_restricted_ipv4` ile doğrulanması.
+    - ULA (`fc00::/7`): Sayısal bitmask `(h0 & 0xfe00) == 0xfc00`.
+    - Link-Local (`fe80::/10`): Sayısal bitmask `(h0 & 0xffc0) == 0xfe80`.
+    - Multicast (`ff00::/8`): Sayısal bitmask `(h0 & 0xff00) == 0xff00`.
+    - Discard Prefix (`100::/64` RFC 6666): `h0 == 0x100 and h1 == 0 and h2 == 0 and h3 == 0`.
+    - Documentation (`2001:db8::/32` RFC 3849): `h0 == 0x2001 and h1 == 0xdb8`.
+- [x] `tests/jwks_test.nox` içine tüm IPv6 sınır ve bitmask testleri eklendi.
+
+## 0.10.5 — P1: DNS Çözümleme Sonrası IP Doğrulama Fonksiyonu & Dokümantasyon (`jwks.nox`)
+- [x] Public `verify_resolved_ip(ip_str: str) -> bool` fonksiyonu eklendi (çözümlenen IPv4 veya IPv6 adresinin SSRF filtrelerinden geçip geçmediğini doğrular).
+- [x] `docs/threat-model.md` ve `docs/architecture.md` içerisine DNS Pinning ve Transport API kullanım sözleşmesi detaylandırıldı.
+
+## 0.10.6 — P2: RSA Exponent 53-Bit Safe Integer Sınırları & Boundary Testleri (`jwk.nox`, `tests/jwk_test.nox`)
+- [x] Dokümantasyon 64-bit yerine IEEE 754 53-bit Safe Integer (`2^53 - 1`) limiti olarak güncellendi.
+- [x] `tests/jwk_test.nox` içine 1-karakter (`len % 4 == 1`), 5-karakter ve overflow eden 10-karakter sınır testleri eklendi.
+
+## 0.10.7 — Phase 10 Çıkış Kapısı ve `v1.0.4` Yayını
+- [x] `noxc test` ile tüm test matrisi çalıştırıldı (16 testin 16'sı da %100 geçti).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştırıldı ve başarıyla doğrulandı.
+- [x] `nox.json` versiyonu `1.0.4` yapıldı.
+- [x] `CHANGELOG.md` dosyasına `v1.0.4` sürüm notları eklendi.
+- [ ] Git commit, `v1.0.4` git tag push ve `noxc publish` çalıştır.
+- [ ] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

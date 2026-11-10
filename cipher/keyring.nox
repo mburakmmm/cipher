@@ -1,1 +1,1 @@
-from keyring import KeyRing
+from keyring import KeyRing, KeyRingState
