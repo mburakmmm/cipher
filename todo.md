@@ -359,6 +359,76 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 
 ---
 
+# Phase 7 — `v1.0.1` Production Sertleştirme ve Güvenlik/Tutarlılık İyileştirmeleri (SOL Analizi)
+
+**Amaç:** Bağımsız teknik analizde (GPT 6 SOL analizi) tespit edilen P0 (KeyRing atomik olmayan rotasyon tutarsızlığı), P1 (JWKS SSRF IP aralıkları, negative cache sınırsız büyüme, strict integer NumericDate, JWT typ kontrolü, signed token temporal/ttl/kid kontrolleri, JWK 2048-bit 256 bayt modulus ve dürüst RS256 yol haritası) ve P2 (paketleme/entry, README API örnekleri, tüketici testi) maddelerini eksiksiz tamamlamak.
+
+## 0.7.1 — P0: `KeyRing.rotate()` Validate-Before-Commit ve Rollback Garantisi (`keyring.nox`)
+- [x] Yeni anahtarın `trust_domain`, mükerrer `kid` ve geçerli durum kontrollerini eski anahtara dokunmadan ÖNCE tamamla.
+- [x] Herhangi bir doğrulama hatasında işlemi iptal et ve hem eski aktif anahtarı (`STATE_ACTIVE_SIGNING`) hem de yeni anahtarı önceki durumunda koru (rollback garantisi).
+- [x] Keyring'in hiçbir zaman aktif imzalayıcısız kalmamasını garanti et.
+
+## 0.7.2 — P0: KeyRing Başarısız Rotasyon, Yanlış Trust Domain ve Duplicate Kid Testleri (`tests/keyring_test.nox`)
+- [x] Yanlış `trust_domain` ile rotasyon denemesi testi: exception fırlatıldığını VE eski anahtarın `STATE_ACTIVE_SIGNING` kalmaya devam ettiğini doğrula.
+- [x] Mükerrer `kid` ile rotasyon denemesi testi: exception fırlatıldığını VE eski anahtarın aktif imzalayıcı kaldığını doğrula.
+- [x] Başarısız rotasyon sonrası `get_signing_key()` çağrısının sorunsuz eski anahtarı döndürdüğünü doğrula.
+
+## 0.7.3 — P1: JWKS URL & SSRF IP Kontrollerinin Düzeltilmesi (`jwks.nox`)
+- [x] `is_safe_jwks_url()` içinde loopback kontrolü: yalnızca `127.0.0.1` değil, tüm `127.*.*.*` IPv4 aralığını, `::1`, `[::1]`, `localhost` ve `0.0.0.0`'ı engelle.
+- [x] Link-local kontrolü: tüm `169.254.*.*` aralığını engelle.
+- [x] RFC 1918 Özel IP kontrolleri:
+  - `10.*.*.*`
+  - `192.168.*.*`
+  - `172.16.*.*` ile `172.31.*.*` arasındaki tüm 16 alt ağı (16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31) eksiksiz engelle.
+- [x] IPv6 köşeli parantez `[ip]:port` ayrıştırmasını güvenli hale getir.
+
+## 0.7.4 — P1: `JwksKeySource` Negative Cache Kapasite ve Bellek Sınırı (`jwks.nox`)
+- [x] Bounded negative cache: `MAX_NEGATIVE_CACHE_ENTRIES` (maksimum 256/1024 anahtar) sınırı getir.
+- [x] Kapasite aşıldığında bellek şişmesini (OOM) önleyecek tahliye (eviction/rotation) mekanizması uygula.
+- [x] SSRF socket pinning ve DNS rebinding sınırlarına dair mimari notları güncelle.
+
+## 0.7.5 — P1: JWK 2048-bit RSA Modulus Kontrolü (`jwk.nox`)
+- [x] `MIN_RSA_MODULUS_CHARS = 342` olarak Base64URL karakter uzunluğu üzerinden güncelle (2048 bit tam 256 bayttır ve 342 Base64URL karakteridir; 2040 bit 340 karakter olup kesinlikle reddedilir).
+- [x] JWK testlerini ve hata mesajlarını 256 bayt (2048 bit) standardına göre güncelle.
+
+## 0.7.6 — P1: Algoritma Destek Matrisinin Dürüstçe Netleştirilmesi
+- [x] `README.md`, `docs/algorithms.md`, `docs/architecture.md` ve `docs/compatibility.md` dosyalarını güncelle:
+  - Üretimdeki kriptografik çalışma zamanı motorunun şu anda **HS256** olduğunu açıkça belirt.
+  - JWK/JWKS ayrıştırma ve RFC 7638 thumbprint'in RSA desteklediğini, ancak doğrudan RSA imza doğrulamasının NOX stdlib/native FFI genişletmesiyle (ADR-0001) planlandığını netleştir.
+
+## 0.7.7 — P1: Strict Integer NumericDate Doğrulaması (`json_strict.nox`)
+- [x] `get_int_field()` içinde kesirli kayan noktalı sayıları (ör. `1700000000.5`) reddet (`float(int(val.n)) != val.n`).
+- [x] Strict integer kontrolü ile `JsonFormatError` fırlat.
+- [x] Kesirli `exp`, `nbf`, `iat` taşıyan token'ların fail-closed reddedildiğini test et.
+
+## 0.7.8 — P1: Explicit Token-Type (`typ`) Doğrulaması (`jws.nox`, `jwt.nox`, `claims.nox`)
+- [x] `VerificationProfile` sınıfına `expected_typ: str = ""` alanını ekle.
+- [x] Eğer `expected_typ` tanımlanmışsa, token başlığındaki `typ` ile tam eşleştiğini doğrula (RFC 8725 §3.11).
+- [x] Uyuşmayan veya eksik `typ` durumunda `InvalidClaimsError` fırlatılmasını test et.
+
+## 0.7.9 — P1: Signed Token Temporal, TTL ve KeyRing/Key Seçimi (`signed_token.nox`)
+- [x] Gelecekteki `issued_at` değerlerini (`iat > now + leeway`) reddet.
+- [x] Pozitif `ttl` doğrulaması ve aşırı büyük `ttl` kontrolü ekle.
+- [x] `KeyRing` üzerinden anahtar seçimi veya `expected_kid` doğrulaması için `verify_with_keyring` desteği ekle.
+
+## 0.7.10 — P2: `nox.json` Paket Entry ve Public Facade Düzeltmesi
+- [x] `nox.json` içindeki `"entry"` alanını `"examples/sentinel_adapter.nox"` yerine kütüphanenin kamu cephesi olan `"cipher.nox"` yap.
+
+## 0.7.11 — P2: README API Örnekleri ve Yol Haritası Güncellemesi
+- [x] `README.md` içindeki örnek kodları çalışan geçerli NOX sözdizimine dönüştür (`sign_hs256`, `verify_hs256`).
+- [x] Yol haritası onay kutularını (`[x]`) ve sürüm durumunu güncelle.
+
+## 0.7.12 — P2: Paket Tüketici Entegrasyon Testi (`tests/consumer_test.nox`)
+- [x] Harici bir tüketicinin `from cipher import ...` ile tüm kamu modüllerini içe aktarıp uçtan uca token imzalayıp doğrulayabildiğini kanıtlayan test yaz ve çalıştır.
+
+## 0.7.13 — Phase 7 Çıkış Kapısı ve v1.0.1 Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (14/14 test %100 geçti).
+- [x] `nox.json` versiyonunu `1.0.1` olarak güncelle.
+- [x] `CHANGELOG.md` dosyasına `v1.0.1` girişini ekle.
+- [x] Git commit, `v1.0.1` git tag push ve `noxc publish` çalıştır.
+
+---
+
 ## 3. Günlük Kanıt Kayıtları
 
 *(Her sürüm ve adım tamamlandığında çalıştırılan terminal komutları, test çıktıları ve commit referansları buraya işlenecektir.)*
@@ -368,3 +438,12 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - **2026-11-10 (Yayın & Tagleme):** 
   - Git tag `v1.0.0` oluşturuldu ve GitHub `origin`'e push edildi (`git push origin v1.0.0`).
   - `noxc publish https://github.com/mburakmmm/cipher` çalıştırıldı: Paket merkezi (`noxpkg.noxlang.com`) tarafından başarıyla alındı (`submitted: cipher (id=009c7147-e46a-4b23-bb18-427052b31629) as @mburakmmm — awaiting approval`).
+- **2026-11-10 (Faz 7 — v1.0.1 SOL Analizi İyileştirmeleri):**
+  - KeyRing validate-before-commit ve atomic rollback uygulandı ve test edildi (`tests/keyring_test.nox`).
+  - JWKS SSRF filtreleri genişletildi (tüm 127/8, loopback, IPv6 link-local/ULA, 169.254/16, 172.16-31 RFC 1918 aralıkları) ve negative cache bounded capacity (256) uygulandı (`tests/jwks_test.nox`).
+  - JWK 2048-bit modulus Base64URL karakter standardına bağlandı (>=342 chars / 256 bytes) (`tests/jwk_test.nox`).
+  - Strict integer NumericDate doğrulaması (`json_strict.nox`) eklendi (`tests/json_strict_test.nox`).
+  - Explicit token typing (`typ`) zorunluluğu RFC 8725 §3.11 uygulandı (`tests/jwt_test.nox`).
+  - Signed token temporal fraud, excessive TTL ve `verify_with_keyring` desteği eklendi (`tests/signed_token_test.nox`).
+  - `nox.json` entry noktası `"cipher.nox"` yapıldı ve `tests/consumer_test.nox` tüketici testi eklendi.
+  - Test sonucu: `14 passed, 0 failed (14 total)`.

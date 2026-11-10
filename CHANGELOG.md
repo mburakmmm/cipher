@@ -4,6 +4,19 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL Audit)
+- **KeyRing Validate-Before-Commit & Atomic Rollback (`keyring.nox`):** Fixed critical consistency vulnerability where a failed rotation would leave the keyring without an active signer. Pre-validates `trust_domain`, unique `kid`, and key states before mutating active signers. On validation failure, previous active keys remain in `STATE_ACTIVE_SIGNING` (rollback guarantee).
+- **JWKS SSRF & IP Range Controls (`jwks.nox`):** Expanded `is_safe_jwks_url()` to cover all `127.0.0.0/8` loopbacks, IPv6 loopback (`::1`, `[::1]`), IPv6 link-local/ULA (`fe80::`, `fc00::`), cloud metadata, link-local `169.254.0.0/16`, and all 16 subnets of RFC 1918 `172.16.0.0/12`.
+- **JWKS Bounded Negative Cache (`jwks.nox`):** Added `MAX_NEGATIVE_CACHE_ENTRIES` (256) with FIFO eviction, protecting against memory exhaustion attacks during high-volume unknown `kid` floods.
+- **Strict Integer NumericDate Validation (`json_strict.nox`):** Rejects fractional numeric timestamps in `exp`, `nbf`, `iat` with `JsonFormatError` (`float(i) == val.n`).
+- **Explicit Token Typing (`typ`) Enforcement (`jws.nox`, `jwt.nox`):** Added `expected_typ` to `VerificationProfile` enforcing RFC 8725 §3.11 explicit typing to mitigate cross-JWT confusion attacks.
+- **Signed Token Temporal & KeyRing Controls (`signed_token.nox`):** Added future `issued_at` rejection (`iat > now + leeway`), verified positive TTL and maximum TTL bounds, and added `verify_with_keyring()` for multi-tenant key resolution.
+- **RSA 2048-bit Modulus Size Enforcement (`jwk.nox`):** Enforces minimum 2048-bit (256 bytes) modulus length using Base64URL character length check (`len(self.n) >= 342`, RFC 7518 §3.3), avoiding false positives from NOX's C-string NUL-byte dropping behavior.
+- **Package Entry & Facade Alignment (`nox.json`):** Set package entry to `"cipher.nox"`.
+- **Consumer Integration Suite (`tests/consumer_test.nox`):** Added end-to-end integration test proving external consumers importing `from cipher import ...` can sign, verify, and manage keys without issues.
+
 ## [1.0.0] - 2026-11-10
 
 ### Added

@@ -1,0 +1,37 @@
+import nox.test
+from cipher import ClaimsProfile, JwkKey, KeyRef, KeyRing, VerificationProfile, VerifiedJws, VerifiedJwt, encode_jwt_hs256, issue_signed_token, parse_jwk, sign_hs256, verify_hs256, verify_jwt_hs256, verify_signed_token
+
+# 1. Consumer JWS Compact HS256
+secret: str = "consumer-secret-key-material-at-least-32-bytes"
+payload: str = "{\"sub\":\"consumer_app\",\"tenant\":\"tenant-1\"}"
+jws_token: str = sign_hs256(payload, secret, kid="k-cons-1")
+
+algs: list[str] = ["HS256"]
+profile: VerificationProfile = VerificationProfile(algs, expected_kid="k-cons-1")
+verified_jws: VerifiedJws = verify_hs256(jws_token, secret, profile)
+nox.test.assert_eq_str(verified_jws.payload, payload, "Consumer verified JWS payload matches")
+
+# 2. Consumer JWT Claims Validation
+claims_json: str = "{\"iss\":\"https://issuer.cons.org\",\"sub\":\"user_99\",\"aud\":\"app://service\",\"exp\":2000000000,\"iat\":1700000000}"
+jwt_token: str = encode_jwt_hs256(claims_json, secret, kid="k-cons-1")
+
+c_prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://issuer.cons.org", clock_time_sec=1700000000)
+c_prof.with_audience("app://service")
+verified_jwt: VerifiedJwt = verify_jwt_hs256(jwt_token, secret, profile, c_prof)
+nox.test.assert_eq_str(verified_jwt.claims.sub, "user_99", "Consumer verified JWT sub matches")
+
+# 3. Consumer Signed Opaque Token
+signed_tok: str = issue_signed_token("auth_nonce_999", "login_challenge", secret, ttl_seconds=300)
+verified_nonce: str = verify_signed_token(signed_tok, "login_challenge", secret)
+nox.test.assert_eq_str(verified_nonce, "auth_nonce_999", "Consumer verified signed token payload matches")
+
+# 4. Consumer KeyRing & JWK
+ring: KeyRing = KeyRing(trust_domain="tenant-1")
+kref: KeyRef = KeyRef("k-cons-1", "HS256", secret, trust_domain="tenant-1", state="ACTIVE_SIGNING")
+ring.add_key(kref)
+active_k: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(active_k.kid, "k-cons-1", "KeyRing active key kid matches")
+
+jwk_json: str = "{\"kty\":\"oct\",\"k\":\"c3VwZXItc2VjcmV0LWtleS1hdC1sZWFzdC0zMi1ieXRlcw\",\"kid\":\"cons-jwk\"}"
+jwk_key: JwkKey = parse_jwk(jwk_json)
+nox.test.assert_eq_str(jwk_key.kid, "cons-jwk", "JWK parsed kid matches")

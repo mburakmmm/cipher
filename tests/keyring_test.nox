@@ -98,3 +98,48 @@ try:
 except KeyUnavailableError:
     revoked_check_failed = True
 nox.test.assert_true(revoked_check_failed, "Revoked key immediately rejected")
+
+# 5. P0 Validation-before-commit & Rollback Integrity Tests
+ring_atomic: KeyRing = KeyRing(trust_domain="tenant-secure")
+orig_key: KeyRef = KeyRef("k-orig-1", "HS256", "original-active-key-32-bytes-long", trust_domain="tenant-secure", state="ACTIVE_SIGNING")
+ring_atomic.add_key(orig_key)
+
+# 5a. Rotation with mismatching trust_domain must fail and KEEP original key as ACTIVE_SIGNING
+foreign_rot_key: KeyRef = KeyRef("k-foreign-rot", "HS256", "foreign-rot-key-32-bytes-long", trust_domain="tenant-other", state="PREPARED")
+rot_foreign_failed: bool = False
+try:
+    ring_atomic.rotate(foreign_rot_key, overlap_seconds=3600, clock_time_sec=1700000000)
+except ConfigurationError:
+    rot_foreign_failed = True
+nox.test.assert_true(rot_foreign_failed, "Rotation with wrong trust_domain must raise ConfigurationError")
+
+# Invariant: Original key MUST STILL BE ACTIVE SIGNER
+current_after_domain_fail: KeyRef = ring_atomic.get_signing_key("HS256")
+nox.test.assert_eq_str(current_after_domain_fail.kid, "k-orig-1", "Rollback invariant: original key stays active after trust domain fail")
+nox.test.assert_true(orig_key.can_sign(), "Rollback invariant: original key can_sign remains true")
+nox.test.assert_eq_str(orig_key.state, "ACTIVE_SIGNING", "Rollback invariant: original key state remains ACTIVE_SIGNING")
+
+# 5b. Rotation with duplicate kid must fail and KEEP original key as ACTIVE_SIGNING
+dup_rot_key: KeyRef = KeyRef("k-orig-1", "HS256", "dup-kid-key-32-bytes-long-here", trust_domain="tenant-secure", state="PREPARED")
+rot_dup_failed: bool = False
+try:
+    ring_atomic.rotate(dup_rot_key, overlap_seconds=3600, clock_time_sec=1700000000)
+except AmbiguousKeyError:
+    rot_dup_failed = True
+nox.test.assert_true(rot_dup_failed, "Rotation with duplicate kid must raise AmbiguousKeyError")
+
+current_after_dup_fail: KeyRef = ring_atomic.get_signing_key("HS256")
+nox.test.assert_eq_str(current_after_dup_fail.kid, "k-orig-1", "Rollback invariant: original key stays active after duplicate kid fail")
+nox.test.assert_true(orig_key.can_sign(), "Rollback invariant: original key can_sign remains true after dup fail")
+
+# 5c. Rotation with invalid state (REVOKED) must fail and KEEP original key as ACTIVE_SIGNING
+revoked_rot_key: KeyRef = KeyRef("k-revoked-rot", "HS256", "revoked-key-32-bytes-long-here", trust_domain="tenant-secure", state="REVOKED")
+rot_invalid_state_failed: bool = False
+try:
+    ring_atomic.rotate(revoked_rot_key, overlap_seconds=3600, clock_time_sec=1700000000)
+except ConfigurationError:
+    rot_invalid_state_failed = True
+nox.test.assert_true(rot_invalid_state_failed, "Rotation with REVOKED key must raise ConfigurationError")
+
+current_after_invalid_state: KeyRef = ring_atomic.get_signing_key("HS256")
+nox.test.assert_eq_str(current_after_invalid_state.kid, "k-orig-1", "Rollback invariant: original key stays active after invalid state fail")

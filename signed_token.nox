@@ -5,7 +5,9 @@
 import nox.strings
 import nox.time
 from encoding import decode_base64url, encode_base64url
-from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError
+from errors import EncodingError, ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError, UnknownKeyError
+from keys import KeyRef
+from keyring import KeyRing
 from provider import CryptoProvider, DefaultCryptoProvider
 
 TOKEN_PREFIX: str = "cip_opk_v1"
@@ -50,7 +52,8 @@ class SignedTokenVerifier:
         return self
 
     def verify(self, token: str, expected_purpose: str, secret: str,
-               clock_time_sec: int = 0) -> str:
+               clock_time_sec: int = 0, leeway_seconds: int = 60,
+               max_ttl_seconds: int = 0, expected_kid: str = "") -> str:
         parts: list[str] = nox.strings.split(token, ".")
         # Format: prefix.purpose_b64.issued_at.ttl.kid_b64.payload_b64.sig_b64 (7 parts)
         if len(parts) != 7:
@@ -59,7 +62,14 @@ class SignedTokenVerifier:
         if parts[0] != TOKEN_PREFIX:
             raise MalformedTokenError("Invalid signed token prefix: expected " + TOKEN_PREFIX)
         
-        purpose: str = decode_base64url(parts[1])
+        purpose: str = ""
+        kid: str = ""
+        try:
+            purpose = decode_base64url(parts[1])
+            kid = decode_base64url(parts[4])
+        except EncodingError:
+            raise MalformedTokenError("Signed token contains malformed Base64URL segment")
+        
         if purpose != expected_purpose:
             raise InvalidClaimsError("Token purpose mismatch: got '" + purpose + "', expected '" + expected_purpose + "'")
         
@@ -69,23 +79,55 @@ class SignedTokenVerifier:
         payload_b64: str = parts[5]
         sig_b64: str = parts[6]
         
-        # Check expiration
+        # Check temporal validity
         now: int = clock_time_sec
         if now <= 0:
             now = nox.time.now_ms() // 1000
         
+        # 1. Reject future issued_at (clock skew/fraud prevention)
+        if issued_at > now + leeway_seconds:
+            raise InvalidClaimsError("Signed token issued_at is in the future")
+        
+        # 2. Enforce positive TTL and max TTL limits
+        if ttl <= 0:
+            raise InvalidClaimsError("Signed token TTL must be positive")
+        if max_ttl_seconds > 0 and ttl > max_ttl_seconds:
+            raise InvalidClaimsError("Signed token TTL exceeds maximum allowed TTL")
+        
+        # 3. Check expiration
         if now > issued_at + ttl:
             raise ExpiredTokenError("Signed token has expired")
         
-        # Verify HMAC signature over domain-separated signing input
+        # 4. Check expected kid (if specified)
+        if expected_kid != "" and kid != expected_kid:
+            raise UnknownKeyError("Signed token kid mismatch: got '" + kid + "', expected '" + expected_kid + "'")
+        
+        # 5. Verify HMAC signature over domain-separated signing input
         signing_input: str = "CIPHER-TOKEN-V1:" + purpose + ":" + str(issued_at) + ":" + str(ttl) + ":" + kid + ":" + payload_b64
-        sig_raw: str = decode_base64url(sig_b64)
+        sig_raw: str = ""
+        try:
+            sig_raw = decode_base64url(sig_b64)
+        except EncodingError:
+            raise InvalidSignatureError("Signed token signature malformed or corrupted")
         
         is_valid: bool = self.provider.verify_hmac_sha256(secret, signing_input, sig_raw)
         if not is_valid:
             raise InvalidSignatureError("Signed token signature mismatch")
         
         return decode_base64url(payload_b64)
+
+    def verify_with_keyring(self, token: str, expected_purpose: str,
+                            key_ring: KeyRing, clock_time_sec: int = 0,
+                            leeway_seconds: int = 60, max_ttl_seconds: int = 0) -> str:
+        parts: list[str] = nox.strings.split(token, ".")
+        if len(parts) != 7:
+            raise MalformedTokenError("Signed token must have exactly 7 dot-separated segments")
+        
+        kid: str = decode_base64url(parts[4])
+        key_ref: KeyRef = key_ring.get_verification_key(kid, clock_time_sec)
+        return self.verify(token, expected_purpose, key_ref.secret_material,
+                           clock_time_sec=clock_time_sec, leeway_seconds=leeway_seconds,
+                           max_ttl_seconds=max_ttl_seconds, expected_kid=kid)
 
 # Ergonomic helper functions
 def issue_signed_token(payload: str, purpose: str, secret: str, ttl_seconds: int,

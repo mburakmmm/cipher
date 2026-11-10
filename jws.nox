@@ -3,7 +3,7 @@
 
 import nox.strings
 from encoding import decode_base64url, encode_base64url
-from errors import DisallowedAlgorithmError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
+from errors import DisallowedAlgorithmError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
 from json_strict import get_bool_field, get_string_field, get_string_list_field, has_field, parse_strict_json
 from provider import CryptoProvider, DefaultCryptoProvider
 
@@ -24,10 +24,13 @@ class ProtectedHeader:
 class VerificationProfile:
     allowed_algs: list[str]
     expected_kid: str
+    expected_typ: str
 
-    def __init__(self, allowed_algs: list[str], expected_kid: str = "") -> None:
+    def __init__(self, allowed_algs: list[str], expected_kid: str = "",
+                 expected_typ: str = "") -> None:
         self.allowed_algs = allowed_algs
         self.expected_kid = expected_kid
+        self.expected_typ = expected_typ
 
     def is_alg_allowed(self, alg: str) -> bool:
         i: int = 0
@@ -151,6 +154,13 @@ class JwsVerifier:
             if header.kid != profile.expected_kid:
                 raise UnknownKeyError(header.kid)
         
+        # 4. Explicit token type (typ) enforcement (RFC 8725 §3.11)
+        if profile.expected_typ != "":
+            if header.typ == "":
+                raise InvalidClaimsError("Token header missing required 'typ' declaration")
+            if header.typ != profile.expected_typ:
+                raise InvalidClaimsError("Token type mismatch: got '" + header.typ + "', expected '" + profile.expected_typ + "'")
+        
         # 4. Strict signature verification over exact ASCII bytes
         signing_input: str = header_b64 + "." + payload_b64
         sig_raw: str = decode_base64url(sig_b64)
@@ -171,3 +181,9 @@ def sign_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> st
 def verify_hs256(token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
     verifier: JwsVerifier = JwsVerifier()
     return verifier.verify_hs256(token, secret, profile)
+
+def sign_jws_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
+    return sign_hs256(payload, secret, kid, typ)
+
+def verify_jws_hs256(token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
+    return verify_hs256(token, secret, profile)

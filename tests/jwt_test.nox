@@ -1,6 +1,6 @@
 import nox.test
 from claims import ClaimsProfile
-from errors import ExpiredTokenError, InvalidSignatureError
+from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError
 from jws import VerificationProfile
 from jwt import UnverifiedJwt, VerifiedJwt, decode_unverified_jwt, encode_jwt_hs256, verify_jwt_hs256
 
@@ -45,3 +45,17 @@ try:
 except InvalidSignatureError:
     bad_secret_failed = True
 nox.test.assert_true(bad_secret_failed, "Invalid secret rejected with InvalidSignatureError")
+
+# 6. Explicit Token Typing (RFC 8725 §3.11): Exact Match
+verif_prof_typ: VerificationProfile = VerificationProfile(algs, expected_kid="k-2026", expected_typ="JWT")
+verified_typ: VerifiedJwt = verify_jwt_hs256(token, secret, verif_prof_typ, claims_prof)
+nox.test.assert_eq_str(verified_typ.header.typ, "JWT", "Matching expected_typ verified successfully")
+
+# 7. Explicit Token Typing Mismatch: Rejection
+verif_prof_mismatch: VerificationProfile = VerificationProfile(algs, expected_kid="k-2026", expected_typ="at+jwt")
+typ_mismatch_failed: bool = False
+try:
+    verify_jwt_hs256(token, secret, verif_prof_mismatch, claims_prof)
+except InvalidClaimsError:
+    typ_mismatch_failed = True
+nox.test.assert_true(typ_mismatch_failed, "Mismatched expected_typ rejected with InvalidClaimsError")

@@ -1,6 +1,8 @@
 import nox.test
-from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError
-from signed_token import issue_signed_token, verify_signed_token
+from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError, UnknownKeyError
+from keys import KeyRef
+from keyring import KeyRing
+from signed_token import SignedTokenIssuer, SignedTokenVerifier, issue_signed_token, verify_signed_token
 
 secret: str = "opaque-token-signing-key-minimum-32-bytes-long"
 payload: str = "user_id=12345&action=reset_password"
@@ -44,3 +46,41 @@ try:
 except MalformedTokenError:
     prefix_failed = True
 nox.test.assert_true(prefix_failed, "Malformed signed token prefix rejected with MalformedTokenError")
+
+# 6. Negative: Future issued_at rejected
+verifier: SignedTokenVerifier = SignedTokenVerifier()
+# Verify with clock in the past (1000s before issuance)
+future_iat_failed: bool = False
+try:
+    verifier.verify(token, purpose, secret, clock_time_sec=1000000000, leeway_seconds=30)
+except InvalidClaimsError:
+    future_iat_failed = True
+nox.test.assert_true(future_iat_failed, "Future issued_at token must be rejected with InvalidClaimsError")
+
+# 7. Negative: Max TTL exceeded
+max_ttl_failed: bool = False
+try:
+    # token was issued with ttl=300; verify requiring max_ttl_seconds=60
+    verifier.verify(token, purpose, secret, max_ttl_seconds=60)
+except InvalidClaimsError:
+    max_ttl_failed = True
+nox.test.assert_true(max_ttl_failed, "Token exceeding max_ttl_seconds must be rejected")
+
+# 8. Negative: Kid mismatch
+kid_mismatch_failed: bool = False
+try:
+    verifier.verify(token, purpose, secret, expected_kid="other-key-id")
+except UnknownKeyError:
+    kid_mismatch_failed = True
+nox.test.assert_true(kid_mismatch_failed, "Token with mismatched kid must be rejected with UnknownKeyError")
+
+# 9. KeyRing Integration: verify_with_keyring
+ring: KeyRing = KeyRing(trust_domain="default")
+ring_key: KeyRef = KeyRef("key-ring-1", "HS256", "ring-secret-key-at-least-32-bytes-long", trust_domain="default", state="ACTIVE_SIGNING")
+ring.add_key(ring_key)
+
+ring_issuer: SignedTokenIssuer = SignedTokenIssuer()
+ring_token: str = ring_issuer.issue("session_data=secure", "session", ring_key.secret_material, ttl_seconds=600, kid="key-ring-1")
+
+ring_verified: str = verifier.verify_with_keyring(ring_token, "session", ring)
+nox.test.assert_eq_str(ring_verified, "session_data=secure", "KeyRing verified signed token payload matches")

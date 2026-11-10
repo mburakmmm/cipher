@@ -8,6 +8,7 @@ from jwk import JwkKey, parse_jwk
 from json_strict import get_field_value, has_field, is_object, parse_strict_json
 
 MAX_JWKS_RESPONSE_BYTES: int = 1048576  # 1 MB maximum JWKS payload
+MAX_NEGATIVE_CACHE_ENTRIES: int = 256    # Maximum negative cache capacity to prevent memory exhaustion
 
 def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
     # 1. Mandatory HTTPS scheme
@@ -18,26 +19,55 @@ def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
     without_scheme: str = nox.strings.replace(url, "https://", "")
     parts: list[str] = nox.strings.split(without_scheme, "/")
     host_port: str = parts[0]
-    host_parts: list[str] = nox.strings.split(host_port, ":")
-    host: str = host_parts[0]
+    
+    host: str = ""
+    # Handle IPv6 bracket format [::1] or [::1]:443
+    if nox.strings.starts_with(host_port, "["):
+        ipv6_parts: list[str] = nox.strings.split(host_port, "]")
+        bracketed: str = ipv6_parts[0]
+        host = nox.strings.replace(bracketed, "[", "")
+    else:
+        host_parts: list[str] = nox.strings.split(host_port, ":")
+        host = host_parts[0]
 
-    # 2. Reject localhost and loopback
-    if host == "localhost" or host == "127.0.0.1" or host == "::1" or host == "0.0.0.0":
+    # Normalize host to lowercase
+    host = nox.strings.lower(host)
+
+    # 2. Reject localhost and all IPv4/IPv6 loopback addresses
+    if host == "localhost" or host == "0.0.0.0" or host == "::1" or host == "0:0:0:0:0:0:0:1":
+        return False
+    if nox.strings.starts_with(host, "127."):
         return False
     
-    # 3. Reject cloud metadata endpoints
-    if host == "169.254.169.254" or host == "metadata.google.internal":
+    # 3. Reject cloud metadata and link-local endpoints (RFC 3927)
+    if host == "metadata.google.internal":
+        return False
+    if nox.strings.starts_with(host, "169.254."):
         return False
     
     # 4. Reject RFC 1918 Private IPv4 ranges
+    # 10.0.0.0/8
     if nox.strings.starts_with(host, "10."):
         return False
+    # 192.168.0.0/16
     if nox.strings.starts_with(host, "192.168."):
         return False
-    if nox.strings.starts_with(host, "172.16.") or nox.strings.starts_with(host, "172.17.") or nox.strings.starts_with(host, "172.18.") or nox.strings.starts_with(host, "172.31."):
+    # 172.16.0.0/12 (all 16 subnets: 172.16. through 172.31.)
+    if nox.strings.starts_with(host, "172."):
+        octets: list[str] = nox.strings.split(host, ".")
+        if len(octets) >= 2:
+            try:
+                second: int = int(octets[1])
+                if second >= 16 and second <= 31:
+                    return False
+            except ValueError:
+                return False
+
+    # 5. Reject IPv6 link-local and unique local addresses (ULA)
+    if nox.strings.starts_with(host, "fe80:") or nox.strings.starts_with(host, "fc00:") or nox.strings.starts_with(host, "fd00:"):
         return False
 
-    # 5. Whitelisted host matching (if configured)
+    # 6. Whitelisted host matching (if configured)
     if allowed_host != "":
         if host != allowed_host:
             return False
@@ -130,8 +160,20 @@ class JwksKeySource:
         return False
 
     def record_unknown_kid(self, kid: str) -> None:
-        if not self.is_in_negative_cache(kid):
-            self.negative_cache_kids.append(kid)
+        if self.is_in_negative_cache(kid):
+            return
+        
+        # Bounded capacity defense against memory exhaustion
+        if len(self.negative_cache_kids) >= MAX_NEGATIVE_CACHE_ENTRIES:
+            new_cache: list[str] = []
+            k_idx: int = 1
+            k_total: int = len(self.negative_cache_kids)
+            while k_idx < k_total:
+                new_cache.append(self.negative_cache_kids[k_idx])
+                k_idx = k_idx + 1
+            self.negative_cache_kids = new_cache
+            
+        self.negative_cache_kids.append(kid)
 
     def get_key(self, kid: str, current_time_sec: int = 0) -> JwkKey:
         now: int = current_time_sec

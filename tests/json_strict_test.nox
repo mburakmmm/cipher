@@ -49,3 +49,13 @@ try:
 except JsonFormatError:
     empty_caught = True
 nox.test.assert_true(empty_caught, "Empty input raises JsonFormatError")
+
+# 6. Fractional NumericDate Rejection
+float_json: str = "{\"exp\":1700000000.5}"
+v_float: JsonValue = parse_strict_json(float_json)
+float_rejected: bool = False
+try:
+    get_int_field(v_float, "exp")
+except JsonFormatError:
+    float_rejected = True
+nox.test.assert_true(float_rejected, "Fractional numeric field must be rejected with JsonFormatError")

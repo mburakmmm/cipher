@@ -85,14 +85,14 @@ Incoming Token
 
 ## Standards and RFC Profile
 
-| Specification | Scope & Profile in Cipher |
-|---|---|
-| **RFC 7515 (JWS)** | Compact JWS signing and verification, strict ASCII input validation |
-| **RFC 7517 (JWK)** | JSON Web Key parsing, safe public key export (zero private leakage) |
-| **RFC 7518 (JWA)** | HS256, RS256, PS256, ES256 algorithm support matrix |
-| **RFC 7519 (JWT)** | Registered claims (`exp`, `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`) verification |
-| **RFC 7638 (Thumbprint)** | Deterministic SHA-256 JWK thumbprint generation |
-| **RFC 8725 (JWT BCP)** | Best Current Practices: duplicate key rejection, fail-closed profiles |
+| Specification | Scope & Profile in Cipher | Status |
+|---|---|---|
+| **RFC 7515 (JWS)** | Compact JWS signing and verification, strict ASCII input validation | **Production (HS256)** |
+| **RFC 7517 (JWK)** | JSON Web Key parsing, safe public key export (zero private leakage) | **Production (RSA >= 2048-bit, oct)** |
+| **RFC 7518 (JWA)** | HS256 HMAC-SHA256 active; RS256/asymmetric parsing supported | **HS256 Active** *(RS256 verify gated by ADR-0001 FFI)* |
+| **RFC 7519 (JWT)** | Registered claims (`exp`, `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`) verification | **Production** |
+| **RFC 7638 (Thumbprint)** | Deterministic SHA-256 JWK thumbprint generation | **Production** |
+| **RFC 8725 (JWT BCP)** | Best Current Practices: duplicate key rejection, explicit typ enforcement | **Production** |
 
 ---
 
@@ -103,41 +103,43 @@ Incoming Token
 3. **Constant-Time Operations:** Cryptographic MAC checks utilize `nox.crypto.constant_time_eq` to eliminate timing attacks.
 4. **No Algorithm Guessing:** Neither `alg` nor `kid` can force key downloading, path traversal, or dynamic trust paths.
 5. **No Secret In Test Artefacts:** Production credentials and raw secrets are never committed; test fixtures use synthetic, explicitly marked keys.
+6. **KeyRing Atomic Rollback:** Key rotation validates new keys before mutating active signers, guaranteeing continuous signing availability.
 
 ---
 
 ## Quick Example (HS256 Compact JWS)
 
 ```python
-import nox.crypto
-from cipher import JwsSigner, JwsVerifier, VerificationProfile
+from cipher import VerificationProfile, VerifiedJws, sign_hs256, verify_hs256
 
 secret: str = "your-256-bit-minimum-secret-key-material-here"
 payload: str = '{"sub":"user_42","scope":"read"}'
 
 # 1. Sign
-token: str = JwsSigner.sign_hs256(payload, secret, kid="key-2026")
+token: str = sign_hs256(payload, secret, kid="key-2026")
 
 # 2. Verify with explicit policy
-profile: VerificationProfile = VerificationProfile(allowed_algs=["HS256"], expected_kid="key-2026")
-verified = JwsVerifier.verify(token, secret, profile)
+algs: list[str] = ["HS256"]
+profile: VerificationProfile = VerificationProfile(algs, expected_kid="key-2026")
+verified: VerifiedJws = verify_hs256(token, secret, profile)
 
 print("Verified Payload: " + verified.payload)
 ```
 
 ---
 
-## Development & Phased Roadmap
+## Phased Roadmap
 
 Track implementation progress and verification evidence in [todo.md](todo.md):
 
 - [x] **Phase 0:** Platform Validation & Toolchain Gates (`v0.0.x`)
-- [ ] **Phase 1:** Strict Core, Typed Errors & HS256 Compact JWS (`v0.1.x`)
-- [ ] **Phase 2:** JWT Claims Validation & Purpose-Bound Signed Tokens (`v0.2.x`)
-- [ ] **Phase 3:** Asymmetric JOSE (RS256) & JWK/JWKS (`v0.3.x`)
-- [ ] **Phase 4:** KeyRing & Safe Key Rotation Lifecycle (`v0.4.x`)
-- [ ] **Phase 5:** Remote JWKS & Outage Resilience (`v0.5.x`)
-- [ ] **Phase 6:** Sentinel Boundary Adapter & `v1.0.0` Release Gate
+- [x] **Phase 1:** Strict Core, Typed Errors & HS256 Compact JWS (`v0.1.x`)
+- [x] **Phase 2:** JWT Claims Validation & Purpose-Bound Signed Tokens (`v0.2.x`)
+- [x] **Phase 3:** JWK / RFC 7638 Thumbprints & Algorithm Confusion Defense (`v0.3.x`)
+- [x] **Phase 4:** KeyRing & Safe Key Rotation Lifecycle (`v0.4.x`)
+- [x] **Phase 5:** Remote JWKS, Outage Resilience & SSRF Defenses (`v0.5.x`)
+- [x] **Phase 6:** Sentinel Boundary Adapter & `v1.0.0` Release Gate
+- [x] **Phase 7:** Production Hardening, Atomic Rollback & `v1.0.1` Gate (SOL Analysis)
 
 ---
 

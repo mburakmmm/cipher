@@ -43,5 +43,21 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 - **`signed_token.nox`**: Domain-separated, purpose-bound tokens (`cip_opk_v1`) preventing cross-purpose token substitution.
 - **`jwk.nox`**: RFC 7517 JWK model, private key leakage protection, and RFC 7638 SHA-256 thumbprints.
 - **`keys.nox` & `rotation.nox`**: Key lifecycle state machine and audit rotation receipts.
-- **`keyring.nox`**: Multi-tenant keyring with single-active-signer invariants.
-- **`jwks.nox`**: Resilient remote JWKS discovery with SSRF defenses, negative caching, and stale tolerance.
+- **`keyring.nox`**: Multi-tenant keyring with single-active-signer invariants and validate-before-commit atomic rollback.
+- **`jwks.nox`**: Resilient remote JWKS discovery with SSRF defenses, bounded negative caching, and stale tolerance.
+
+## 3. Resilience, SSRF & Atomic Rollback Invariants
+
+### KeyRing Atomic Rollback
+`KeyRing.rotate()` executes in two strictly distinct phases:
+1. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated. Any mismatch or conflict raises typed exceptions immediately without mutating existing active signers.
+2. **Commit Phase:** Only upon successful validation is the existing active signer transitioned to `VERIFY_ONLY` and the new key activated. This guarantees that signing services never experience downtime due to invalid rotation requests.
+
+### SSRF & Negative Cache Boundaries
+`is_safe_jwks_url()` enforces strict destination validation:
+- Rejects non-HTTPS schemes unconditionally.
+- Rejects all loopback addresses (`127.0.0.0/8`, `::1`, `localhost`, `0.0.0.0`).
+- Rejects link-local and cloud metadata (`169.254.0.0/16`, `fe80::`, metadata endpoints).
+- Rejects all RFC 1918 private IPv4 ranges (`10.0.0.0/8`, `192.168.0.0/16`, and all 16 subnets of `172.16.0.0/12`).
+- Negative cache is bounded by `MAX_NEGATIVE_CACHE_ENTRIES` (256) with FIFO eviction, preventing memory exhaustion attacks under random `kid` floods.
+- Note on transport: Full socket pinning and DNS rebinding protections belong to NOX's common HTTP transport layer when remote HTTP fetching is integrated.

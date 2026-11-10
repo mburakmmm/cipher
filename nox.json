@@ -1,6 +1,6 @@
 {
   "name": "cipher",
-  "version": "1.0.0",
-  "entry": "examples/sentinel_adapter.nox",
+  "version": "1.0.1",
+  "entry": "cipher.nox",
   "requires": []
 }

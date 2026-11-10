@@ -1,6 +1,7 @@
 # Cipher — Strict Base64URL and Binary Encoding
 # Compliant with RFC 4648 Section 5 and RFC 7515 Section 2 (Unpadded, URL-safe).
 
+from nox.base64 import Base64Error
 import nox.base64
 import nox.strings
 from errors import EncodingError, ResourceLimitExceededError
@@ -49,7 +50,10 @@ def encode_base64url(raw: str) -> str:
 
 def decode_base64url(encoded: str) -> str:
     validate_base64url_syntax(encoded)
-    return nox.base64.decode(encoded)
+    try:
+        return nox.base64.decode(encoded)
+    except Base64Error:
+        raise EncodingError("Invalid Base64URL length or encoding")
 
 def _hex_char_to_val(c: int) -> int:
     if c >= 48 and c <= 57:

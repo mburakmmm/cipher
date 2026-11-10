@@ -30,6 +30,7 @@ From `~/.nox-lang/lib/nox/stdlib/nox/base64.nox`:
 
 ## Architecture Gaps & Implementation Strategy
 
-1. **Strict Base64URL:** `nox.base64.decode` handles standard and URL-safe base64, but strict RFC 7515 Section 2 requires rejecting padding (`=`), whitespace, and non-alphabet characters. Cipher will implement a strict parser wrapper in `encoding.nox`.
-2. **Duplicate JSON Keys:** Sıkı duplicate key reddi (RFC 8725 Section 3.10) için `json_strict.nox` modülü geliştirilecektir.
-3. **Asymmetric Crypto (RS256):** Standard library currently focuses on symmetric hashes (SHA256, SHA512, HMAC-SHA256, Argon2, bcrypt, scrypt). RS256/asymmetric verification will be verified and designed in Phase 3.
+1. **Strict Base64URL:** `nox.base64.decode` handles standard and URL-safe base64, but strict RFC 7515 Section 2 requires rejecting padding (`=`), whitespace, and non-alphabet characters. Cipher implements strict parser wrappers in `encoding.nox`.
+2. **Duplicate JSON Keys:** Sıkı duplicate key reddi (RFC 8725 Section 3.10) için `json_strict.nox` modülü geliştirilmiş olup, Zig tabanlı `nox.json.parse` duplicate anahtarlarda otomatik olarak `JsonError` fırlatır.
+3. **Asymmetric Crypto (RS256):** Standard library currently focuses on symmetric hashes (SHA256, SHA512, HMAC-SHA256, Argon2, bcrypt, scrypt). RS256/asymmetric verification is gated by ADR-0001 (NOX native provider FFI). Algorithmic confusion between HMAC and RSA is actively prevented.
+4. **NOX String NUL-Byte Semantics:** NOX runtime (`runtime/str.zig` `nox_char_from_byte`) uses C-style NUL-terminated strings where `b == 0` produces an empty string. Consequently, binary byte arrays containing `0x00` lose those bytes if converted to NOX `str`. For RSA 2048-bit modulus validation, length is verified via unpadded Base64URL characters (`len(self.n) >= 342`, RFC 7518 §3.3), guaranteeing that 2048 bits (256 bytes) are strictly enforced regardless of embedded zeroes.

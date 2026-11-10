@@ -7,7 +7,7 @@ from encoding import decode_base64url, encode_base64url, hex_to_bytes
 from errors import InvalidKeyError, JsonFormatError
 from json_strict import get_string_field, has_field, is_object, parse_strict_json
 
-MIN_RSA_MODULUS_BYTES: int = 255  # 2048 bits minimum (RFC 7518 §3.3 unpadded representation can be 255 or 256 bytes)
+MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
 
 class JwkKey:
     kty: str
@@ -35,11 +35,11 @@ class JwkKey:
         if self.kty == "RSA":
             if self.n == "" or self.e == "":
                 raise InvalidKeyError("RSA JWK must contain both 'n' and 'e' parameters")
-            # Enforce minimum 2048 bits for RSA
-            raw_n: str = decode_base64url(self.n)
-            n_bytes: int = nox.strings.byte_len(raw_n)
-            if n_bytes < MIN_RSA_MODULUS_BYTES:
-                raise InvalidKeyError("RSA modulus 'n' must be at least 2048 bits (256 bytes)")
+            # Enforce minimum 2048 bits (256 bytes) for RSA
+            # In Base64URL (RFC 7518 §3.3), a 256-byte modulus encodes to 342 unpadded characters.
+            # Any modulus with fewer than 2048 bits (e.g. 2040 bits / 255 bytes = 340 chars, 1024 bits = 171 chars) is strictly rejected.
+            if len(self.n) < MIN_RSA_MODULUS_CHARS:
+                raise InvalidKeyError("RSA modulus 'n' must be at least 2048 bits (256 bytes, 342 Base64URL chars)")
         
         if self.kty == "oct":
             if self.k == "":

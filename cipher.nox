@@ -6,7 +6,7 @@ from encoding import bytes_to_hex, decode_base64url, encode_base64url, hex_to_by
 from errors import AmbiguousKeyError, CipherError, ConfigurationError, DisallowedAlgorithmError, EncodingError, ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, InvalidKeyError, InvalidSignatureError, InvalidTypeError, JsonFormatError, KeyUnavailableError, MalformedTokenError, NotYetValidError, ProviderFailureError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
 from jwk import JwkKey, parse_jwk
 from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks
-from jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header, sign_hs256, verify_hs256
+from jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header, sign_hs256, sign_jws_hs256, verify_hs256, verify_jws_hs256
 from jwt import JwtIssuer, JwtVerifier, UnverifiedJwt, VerifiedJwt, decode_unverified_jwt, encode_jwt_hs256, verify_jwt_hs256
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
 from keyring import KeyRing

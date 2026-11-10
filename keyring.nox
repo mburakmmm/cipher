@@ -69,25 +69,45 @@ class KeyRing:
         if now <= 0:
             now = nox.time.now_ms() // 1000
         
-        old_kid: str = ""
-        # Find current active signing key for the same algorithm
+        # 1. Pre-commit validation phase (validate before mutating existing keys)
+        if new_key.trust_domain != self.trust_domain:
+            raise ConfigurationError("Key trust domain mismatch: key is '" + new_key.trust_domain + "', keyring is '" + self.trust_domain + "'")
+        
+        # Check duplicate kid in existing keyring
         i: int = 0
         n: int = len(self.keys)
         while i < n:
-            existing: KeyRef = self.keys[i]
-            if existing.algorithm == new_key.algorithm and existing.state == STATE_ACTIVE_SIGNING:
-                old_kid = existing.kid
-                existing.transition_to(STATE_VERIFY_ONLY)
-                existing.retire_at = now + overlap_seconds
-                break
+            if self.keys[i].kid == new_key.kid:
+                raise AmbiguousKeyError("Duplicate key identifier in keyring: " + new_key.kid)
             i = i + 1
         
-        # Activate new key
+        # New key must be in PREPARED or ACTIVE_SIGNING state
+        if new_key.state != STATE_PREPARED and new_key.state != STATE_ACTIVE_SIGNING:
+            raise ConfigurationError("New key must be in PREPARED or ACTIVE_SIGNING state: got " + new_key.state)
+        
+        # Find current active signing key for the same algorithm
+        old_kid: str = ""
+        existing_idx: int = -1
+        j: int = 0
+        while j < n:
+            existing: KeyRef = self.keys[j]
+            if existing.algorithm == new_key.algorithm and existing.state == STATE_ACTIVE_SIGNING:
+                old_kid = existing.kid
+                existing_idx = j
+                break
+            j = j + 1
+        
+        # 2. Atomic commit phase (all checks succeeded)
+        if existing_idx >= 0:
+            curr_active: KeyRef = self.keys[existing_idx]
+            curr_active.transition_to(STATE_VERIFY_ONLY)
+            curr_active.retire_at = now + overlap_seconds
+        
         if new_key.state == STATE_PREPARED:
             new_key.transition_to(STATE_ACTIVE_SIGNING)
         new_key.activated_at = now
         
-        self.add_key(new_key)
+        self.keys.append(new_key)
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
     def revoke(self, kid: str) -> None:

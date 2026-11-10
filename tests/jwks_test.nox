@@ -7,9 +7,18 @@ from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks
 nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://localhost/.well-known/jwks.json"), "localhost must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://127.0.0.1/jwks"), "127.0.0.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://127.0.0.2/jwks"), "127.0.0.2 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://127.100.200.1/jwks"), "127.* must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[::1]/jwks"), "IPv6 loopback [::1] must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[::1]:8443/jwks"), "IPv6 loopback with port must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://[fe80::1]/jwks"), "IPv6 link-local fe80:: must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://169.254.169.254/latest/meta-data"), "AWS/GCP metadata must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://169.254.1.20/jwks"), "Link-local 169.254.* must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://10.0.0.5/jwks"), "RFC 1918 10.0.0.0/8 must be rejected")
 nox.test.assert_true(not is_safe_jwks_url("https://192.168.1.50/jwks"), "RFC 1918 192.168.0.0/16 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://172.20.0.5/jwks"), "RFC 1918 172.20.0.0/16 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://172.16.0.1/jwks"), "RFC 1918 172.16.0.0/16 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://172.31.255.254/jwks"), "RFC 1918 172.31.0.0/16 must be rejected")
 nox.test.assert_true(is_safe_jwks_url("https://auth.company.org/.well-known/jwks.json"), "Valid public HTTPS URL allowed")
 
 # Whitelist host check
@@ -52,3 +61,16 @@ nox.test.assert_true(unknown_failed, "Unknown kid fails with UnknownKeyError")
 
 # Subsequent lookup is blocked immediately by negative cache
 nox.test.assert_true(source_fresh.is_in_negative_cache("unknown-hacker-kid"), "Unknown kid is negative-cached")
+
+# 5. Negative Cache Bounded Capacity Protection (Memory exhaustion prevention)
+test_source_bounded: JwksKeySource = JwksKeySource("https://auth.company.org/jwks")
+idx: int = 0
+while idx < 300:
+    test_source_bounded.record_unknown_kid("spam-kid-" + str(idx))
+    idx = idx + 1
+
+# Ensure negative cache does not exceed capacity bound (256)
+cache_len: int = len(test_source_bounded.negative_cache_kids)
+nox.test.assert_true(cache_len <= 256, "Negative cache size must be bounded by MAX_NEGATIVE_CACHE_ENTRIES")
+nox.test.assert_true(test_source_bounded.is_in_negative_cache("spam-kid-299"), "Most recent kid is retained in bounded cache")
+nox.test.assert_true(not test_source_bounded.is_in_negative_cache("spam-kid-0"), "Oldest kid evicted from bounded cache")
