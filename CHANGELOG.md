@@ -4,6 +4,27 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.9] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL IX Architecture Audit)
+- **Strict Lock-Guarded Zeroization & Seqlock Write Protocol (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Fixed a concurrency hazard in `zeroize_shared_state()` where failure to acquire `_write_lock` within the spin loop previously proceeded to overwrite shared cells without holding the lock.
+  - `zeroize_shared_state()` now **strictly requires** acquiring `_write_lock`: if the lock is held by another active writer, it immediately fails closed with `ConfigurationError("Zeroization contention error: cannot zeroize shared state while writer lock is held")` without modifying any shared cell (**Test 15a**).
+  - Once locked, `zeroize_shared_state()` enters the odd Seqlock write phase (`self._seq.add(1)`), flips `_shared_alive.store(False)`, overwrites all `_shared_cells` and `_shared_key_cells` with `0`, seals the even Seqlock counter (`self._seq.add(1)`), and releases `_write_lock`.
+- **Active Reader Reference Drain Protocol (`_shared_readers`) (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added `_shared_readers: nox.atomic.AtomicInt` (and `active_shared_readers() -> int`) to the shared handle state.
+  - Every shared `_read_consistent_state()` call increments `_shared_readers.add(1)` prior to checking `_shared_alive.load()` and decrements `_shared_readers.add(-1)` on every exit path (`try/except`).
+  - `free_shared_handle()` invokes `zeroize_shared_state()` and waits for all active readers (`_shared_readers == 0`) to drain before calling `.free()` on the underlying `nox.atomic` cells (or raises `ConfigurationError` if a reader remains in flight), verified under 4-OS-thread reader contention in **Test 15b**.
+- **Removal of Public Raw Key/Data Cell Reader APIs (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Removed `read_shared_cell_raw()` and `read_shared_key_cell_raw()` from `KeyRing` so production code cannot read raw words of the internal HMAC `_seal_key` or shared state cells.
+  - Added boolean-only `is_shared_zeroized(self) -> bool` to verify complete zeroization of `_shared_alive`, `_shared_len`, `_shared_cells`, and `_shared_key_cells` without exposing any cell value.
+- **Shared State Capacity Telemetry (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added `shared_capacity_bytes() -> int`, `shared_used_bytes() -> int`, and `shared_usage_permille() -> int` (`0..1000` permille utilization) so long-running Nyx and Aether services can monitor shared memory consumption and trigger `purge_expired_keys()` proactively (**Test 15c**).
+- **Malformed / Partially Constructed Shared Handle Cleanup & Validation (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Hardened `attach_shared_handle()` to validate all 8 handle segments, positive handle integers, key cell count (`11`), and data cell count (`64..8192`) **before** mutating any field on `self`, ensuring a target `KeyRing` remains 100% intact if `attach_shared_handle()` fails (**Test 16**).
+- **Warm-Up, Multi-Iteration p50/p95 Latency Percentiles & Key-Count Scaling Benchmarks (`tests/benchmark_keyring_test.nox`):**
+  - Upgraded `tests/benchmark_keyring_test.nox` with an explicit 100-iteration warm-up phase, nanosecond/microsecond timing (`nox.time.monotonic_ns()`), 20-batch `p50_us` / `p95_us` latency percentiles, and key-count scaling benchmarks across `1`, `16`, and `64` keys exported to `benchmark-results.json`.
+
 ## [1.0.8] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL VIII Architecture Audit)

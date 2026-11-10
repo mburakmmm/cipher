@@ -225,6 +225,7 @@ class KeyRing:
     _shared_attached: bool
     _shared_synced_seq: int
     _shared_alive: nox.atomic.AtomicBool
+    _shared_readers: nox.atomic.AtomicInt
     _shared_len: nox.atomic.AtomicInt
     _shared_key_cells: list[nox.atomic.AtomicInt]
     _shared_cells: list[nox.atomic.AtomicInt]
@@ -243,6 +244,7 @@ class KeyRing:
         self._shared_attached = False
         self._shared_synced_seq = 0
         self._shared_alive = nox.atomic.from_bool_handle(0)
+        self._shared_readers = nox.atomic.from_int_handle(0)
         self._shared_len = nox.atomic.from_int_handle(0)
         empty_key_cells: list[nox.atomic.AtomicInt] = []
         self._shared_key_cells = empty_key_cells
@@ -289,15 +291,44 @@ class KeyRing:
             return False
         return self._shared_alive.load()
 
-    def read_shared_cell_raw(self, index: int) -> int:
-        if index < 0 or index >= len(self._shared_cells):
-            raise ConfigurationError("Shared cell index out of range")
-        return self._shared_cells[index].load()
+    def is_shared_zeroized(self) -> bool:
+        # Boolean-only diagnostic verification that never exposes raw cell values or key words.
+        if not self._shared_attached:
+            return True
+        if self._shared_alive.load():
+            return False
+        if self._shared_len.load() != 0:
+            return False
+        i: int = 0
+        while i < len(self._shared_cells):
+            if self._shared_cells[i].load() != 0:
+                return False
+            i = i + 1
+        k_i: int = 0
+        while k_i < len(self._shared_key_cells):
+            if self._shared_key_cells[k_i].load() != 0:
+                return False
+            k_i = k_i + 1
+        return True
 
-    def read_shared_key_cell_raw(self, index: int) -> int:
-        if index < 0 or index >= len(self._shared_key_cells):
-            raise ConfigurationError("Shared key cell index out of range")
-        return self._shared_key_cells[index].load()
+    def shared_capacity_bytes(self) -> int:
+        if not self._shared_attached:
+            return 0
+        return len(self._shared_cells) * 6
+
+    def shared_used_bytes(self) -> int:
+        if not self._shared_attached or not self._shared_alive.load():
+            return 0
+        return self._shared_len.add(0)
+
+    def shared_usage_permille(self) -> int:
+        cap: int = self.shared_capacity_bytes()
+        if cap <= 0:
+            return 0
+        used: int = self.shared_used_bytes()
+        if used <= 0:
+            return 0
+        return (used * 1000) // cap
 
     def export_shared_handle(self, max_words: int = 512) -> str:
         # Initializes process-wide shared atomic state cells so multiple OS threads
@@ -310,6 +341,7 @@ class KeyRing:
         st: KeyRingState = self._read_consistent_state()
         if not self._shared_attached:
             self._shared_alive = nox.atomic.new_bool(True)
+            self._shared_readers = nox.atomic.new_int(0)
             self._shared_len = nox.atomic.new_int(0)
             key_cells: list[nox.atomic.AtomicInt] = []
             k_i: int = 0
@@ -350,23 +382,45 @@ class KeyRing:
                 cell_parts = cell_parts + ","
             cell_parts = cell_parts + str(self._shared_cells[idx].handle)
             idx = idx + 1
-        return str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle) + "|" + str(self._shared_len.handle) + "|" + str(self._shared_alive.handle) + "|" + key_parts + "|" + cell_parts
+        return str(self._write_lock.handle) + "|" + str(self._seq.handle) + "|" + str(self._atomic_version.handle) + "|" + str(self._shared_len.handle) + "|" + str(self._shared_alive.handle) + "|" + str(self._shared_readers.handle) + "|" + key_parts + "|" + cell_parts
 
     def attach_shared_handle(self, handle_str: str) -> None:
         parts: list[str] = nox.strings.split(handle_str, "|")
-        if len(parts) != 7:
+        if len(parts) != 8:
             raise ConfigurationError("Invalid shared KeyRing handle format")
         lock_h: int = _parse_handle_int(parts[0])
         seq_h: int = _parse_handle_int(parts[1])
         ver_h: int = _parse_handle_int(parts[2])
         len_h: int = _parse_handle_int(parts[3])
         alive_h: int = _parse_handle_int(parts[4])
-        key_cell_strs: list[str] = nox.strings.split(parts[5], ",")
+        readers_h: int = _parse_handle_int(parts[5])
+        if lock_h <= 0 or seq_h <= 0 or ver_h <= 0 or len_h <= 0 or alive_h <= 0 or readers_h <= 0:
+            raise ConfigurationError("Invalid zero or negative atomic handle identifier")
+        key_cell_strs: list[str] = nox.strings.split(parts[6], ",")
         if len(key_cell_strs) != SHARED_KEY_WORDS:
             raise ConfigurationError("Invalid shared key cell handle count")
-        cell_strs: list[str] = nox.strings.split(parts[6], ",")
-        if len(cell_strs) == 0:
-            raise ConfigurationError("Empty shared cell handle list")
+        cell_strs: list[str] = nox.strings.split(parts[7], ",")
+        if len(cell_strs) < 64 or len(cell_strs) > 8192:
+            raise ConfigurationError("Invalid shared data cell handle count")
+
+        # Validate all integer handles before touching any state on self
+        key_h_list: list[int] = []
+        kh_i: int = 0
+        while kh_i < len(key_cell_strs):
+            kh_val: int = _parse_handle_int(key_cell_strs[kh_i])
+            if kh_val <= 0:
+                raise ConfigurationError("Invalid shared key cell handle identifier")
+            key_h_list.append(kh_val)
+            kh_i = kh_i + 1
+
+        cell_h_list: list[int] = []
+        ch_i: int = 0
+        while ch_i < len(cell_strs):
+            ch_val: int = _parse_handle_int(cell_strs[ch_i])
+            if ch_val <= 0:
+                raise ConfigurationError("Invalid shared data cell handle identifier")
+            cell_h_list.append(ch_val)
+            ch_i = ch_i + 1
 
         alive_atom: nox.atomic.AtomicBool = nox.atomic.from_bool_handle(alive_h)
         if not alive_atom.load():
@@ -375,8 +429,8 @@ class KeyRing:
         key_cells: list[nox.atomic.AtomicInt] = []
         k_i: int = 0
         key_words: list[int] = []
-        while k_i < len(key_cell_strs):
-            kc: nox.atomic.AtomicInt = nox.atomic.from_int_handle(_parse_handle_int(key_cell_strs[k_i]))
+        while k_i < len(key_h_list):
+            kc: nox.atomic.AtomicInt = nox.atomic.from_int_handle(key_h_list[k_i])
             key_cells.append(kc)
             key_words.append(kc.add(0))
             k_i = k_i + 1
@@ -386,8 +440,8 @@ class KeyRing:
 
         cells: list[nox.atomic.AtomicInt] = []
         i: int = 0
-        while i < len(cell_strs):
-            cells.append(nox.atomic.from_int_handle(_parse_handle_int(cell_strs[i])))
+        while i < len(cell_h_list):
+            cells.append(nox.atomic.from_int_handle(cell_h_list[i]))
             i = i + 1
 
         self._write_lock = nox.atomic.from_bool_handle(lock_h)
@@ -395,6 +449,7 @@ class KeyRing:
         self._atomic_version = nox.atomic.from_int_handle(ver_h)
         self._shared_len = nox.atomic.from_int_handle(len_h)
         self._shared_alive = alive_atom
+        self._shared_readers = nox.atomic.from_int_handle(readers_h)
         self._shared_key_cells = key_cells
         self._seal_key = seal_k
         self._shared_cells = cells
@@ -404,18 +459,26 @@ class KeyRing:
         _synced: KeyRingState = self._read_consistent_state()
 
     def zeroize_shared_state(self) -> None:
-        # Overwrites all shared state cells and shared HMAC key cells with zeros
-        # and marks the shared handle as permanently dead (_shared_alive = False)
-        # so any subsequent attached reader/writer fails closed immediately.
+        # Strictly requires acquiring the hardware writer lock (_write_lock) before
+        # modifying any shared cell. If another writer holds the lock and it cannot
+        # be acquired within the bounded spin window, fails closed with ConfigurationError
+        # without touching a single shared cell!
         if not self._shared_attached:
             return
         spins: int = 0
         locked: bool = False
-        while spins < MAX_SEQLOCK_ATTEMPTS:
+        while spins < 4096:
             if self._write_lock.compare_and_swap(False, True):
                 locked = True
                 break
             spins = spins + 1
+        if not locked:
+            raise ConfigurationError("Zeroization contention error: cannot zeroize shared state while writer lock is held")
+
+        # Enter Seqlock odd write phase with Acquire-Release RMW fence
+        cur_seq: int = self._seq.add(0)
+        if (cur_seq & 1) == 0:
+            self._seq.add(1)
         self._shared_alive.store(False)
         self._shared_len.store(0)
         i: int = 0
@@ -430,13 +493,25 @@ class KeyRing:
         self._state = KeyRingState(0, empty_keys, 0)
         self._seal_key = ""
         self._state_mac = ""
-        if locked:
-            self._write_lock.store(False)
+        # Seal Seqlock to next even value and release writer lock
+        self._seq.add(1)
+        self._write_lock.store(False)
+
+    def active_shared_readers(self) -> int:
+        if not self._shared_attached:
+            return 0
+        return self._shared_readers.add(0)
 
     def free_shared_handle(self) -> None:
         if self._shared_attached:
             if self._shared_alive.load():
                 self.zeroize_shared_state()
+            # Drain all active concurrent readers before deallocating underlying atomic cells
+            drain_spins: int = 0
+            while self._shared_readers.add(0) > 0 and drain_spins < 4096:
+                drain_spins = drain_spins + 1
+            if self._shared_readers.add(0) > 0:
+                raise ConfigurationError("Cannot free shared KeyRing handle while active readers are in flight")
             i: int = 0
             while i < len(self._shared_cells):
                 self._shared_cells[i].free()
@@ -447,15 +522,14 @@ class KeyRing:
                 k_i = k_i + 1
             self._shared_len.free()
             self._shared_alive.free()
+            self._shared_readers.free()
             self._shared_attached = False
 
-    def _read_consistent_state(self) -> KeyRingState:
+    def _read_consistent_state_inner(self) -> KeyRingState:
         # Seqlock + Hardware Acquire-Release RMW Reader Protocol
         # Uses self._seq.add(0) which compiles to 'ldaddal' on ARM64 and 'lock xadd' on x86_64:
         # - Acquire semantics on s1 prevent subsequent loads of _state / _shared_cells from floating above s1.
         # - Release semantics on s2 prevent prior loads of _state / _shared_cells from sinking below s2.
-        if self._shared_attached and not self._shared_alive.load():
-            raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
         attempts: int = 0
         while attempts < MAX_SEQLOCK_ATTEMPTS:
             if self._shared_attached and not self._shared_alive.load():
@@ -496,6 +570,24 @@ class KeyRing:
                 return st
             attempts = attempts + 1
         raise ConfigurationError("KeyRing read contention timeout: writer active in critical section")
+
+    def _read_consistent_state(self) -> KeyRingState:
+        if not self._shared_attached:
+            return self._read_consistent_state_inner()
+        # Register active reader in _shared_readers before checking _shared_alive
+        # so free_shared_handle() cannot deallocate cells while a reader is in flight.
+        self._shared_readers.add(1)
+        if not self._shared_alive.load():
+            self._shared_readers.add(-1)
+            raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
+        res: KeyRingState = self._state
+        try:
+            res = self._read_consistent_state_inner()
+        except Exception as err:
+            self._shared_readers.add(-1)
+            raise ConfigurationError(str(err))
+        self._shared_readers.add(-1)
+        return res
 
     def get_version(self) -> int:
         return self._read_consistent_state().version

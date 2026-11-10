@@ -798,3 +798,47 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.8` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.8` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 15 — `v1.0.9` Strict Lock-Guarded Zeroization, Active Reader Drain Protocol, Removal of Public Raw Key Cell APIs, Shared Capacity Telemetry & Multi-Iteration p50/p95 Benchmarks (SOL IX Analizi)
+
+**Amaç:** Dokuzuncu bağımsız teknik incelemede (GPT 6 SOL IX analizi) tespit edilen eşzamanlı sıfırlama (zeroization) kilit garantisi, aktif okuyucu ile `free_shared_handle()` yarışı, public ham hücre okuma API riski, paylaşımlı kapasite ölçümü ve gelişmiş benchmark/negatif handle test gereksinimlerini eksiksiz tamamlamak:
+1. **P0 — Kilit Alınmadan Zeroization Yapılmasını Engelleme (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `zeroize_shared_state()` içinde `_write_lock` alınamazsa (`not locked`) paylaşımlı hücrelerin hiçbirine dokunmadan derhal `ConfigurationError("Zeroization contention timeout: cannot zeroize shared state while another writer holds the lock")` fırlatmak; kilit başarıyla alındığında Seqlock tek sayılı (`odd`) faza girerek hücreleri sıfırlamak ve çift sayılı (`even`) mühürle çıkmak.
+2. **P1 — `free_shared_handle()` ile Aktif Okuyucu (Reader) Yarış Koruması ve Testi (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** Paylaşımlı duruma `_shared_readers: nox.atomic.AtomicInt` aktif okuyucu sayacı eklemek; `_read_consistent_state()` başında okuyucu sayacını artırıp çıkışta (`try/except` garantisiyle) azaltmak ve `free_shared_handle()` içinde `_shared_alive = False` yapıldıktan sonra tüm aktif okuyucuların (`_shared_readers.add(0) == 0`) kritik bölgeden çıkmasını bekleyerek use-after-free yarışını donanım seviyesinde engellemek; 4 paralel okuyucu OS thread'i ile yarış testini eklemek.
+3. **P1 — Ham HMAC Anahtarı / Veri Hücresi Okuma Metotlarını Public API’den Kaldırma (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `KeyRing` sınıfındaki `read_shared_cell_raw()` ve `read_shared_key_cell_raw()` public metotlarını tamamen kaldırmak; yerine hiçbir gizli veri döndürmeyen `is_shared_zeroized(self) -> bool` doğrulama metodunu ve yalnızca test modülünün beyaz-kutu doğrulamasında kullanılan özel `_debug_verify_shared_cells_zeroed(ring: KeyRing) -> bool` yardımcısını sağlamak.
+4. **P1 — Paylaşımlı Kapasite Kullanımını Ölçülebilir Yapma (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** Uzun süre çalışan Nyx ve Aether servislerinin rotasyon kapasitesini izleyebilmesi için `shared_capacity_bytes(self) -> int`, `shared_used_bytes(self) -> int` ve `shared_usage_permille(self) -> int` (`0..1000` binde doluluk oranı) metotlarını eklemek.
+5. **P2 — Hatalı veya Kısmen Oluşturulmuş Handle Temizliği ve Sınır Testleri (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** Bozuk, eksik parçalı, geçersiz sayısal kimlikli veya yanlış anahtar hücresi sayılı `attach_shared_handle()` çağrılarında hedef `KeyRing` durumunun bozulmadığını ve geçersiz `max_words` sınırlarının (`< 64` veya `> 8192`) reddedildiğini doğrulamak.
+6. **P2 — Warm-Up, Çoklu Tekrar, p50/p95 Gecikmeleri ve Anahtar Sayısı Ölçekleme Benchmarkları (`tests/benchmark_keyring_test.nox`):** Benchmark paketine ısınma (warm-up) turu, çoklu örneklem (sample) dizisi üzerinden sıralı `min` / `p50` / `p95` / `max` gecikme hesabı ve farklı anahtar sayılarıyla (`1`, `16`, `64` anahtar) ölçekleme ölçümleri ekleyerek `benchmark-results.json` çıktısını zenginleştirmek.
+
+## 0.15.1 — P0: Kilit Alınmadan Zeroization Yapılmasını Engelleme ve Seqlock Entegrasyonu (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `zeroize_shared_state()` içinde `_write_lock` alınamazsa (`not locked`) hiçbir paylaşımlı hücreye dokunmadan `ConfigurationError` fırlat.
+- [x] Kilit alındığında Seqlock `_seq.add(1)` ile tek sayılı yazma fazına gir, `_shared_alive.store(False)` yap, tüm `_shared_cells` ve `_shared_key_cells` hücrelerini sıfırla, `_seq.add(1)` ile çift sayıya çık ve `_write_lock.store(False)` ile kilidi bırak.
+- [x] `tests/concurrency_keyring_test.nox` içine başka bir yazar kilidi tutarken (`acquire_write_lock()`) `zeroize_shared_state()` çağrıldığında işlemin `ConfigurationError` ile reddedildiğini ve mevcut paylaşımlı durumun hiç bozulmadığını kanıtlayan **Test 15a** ekle.
+
+## 0.15.2 — P1: Aktif Okuyucu (Reader) Referans Sayacı ve `free_shared_handle()` Yarış Testi (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] Paylaşımlı handle yapısına 8. bileşen olarak `_shared_readers: nox.atomic.AtomicInt` ekle.
+- [x] `_read_consistent_state()` içinde paylaşımlı mod aktifken `_shared_readers.add(1)` ile giriş yap ve her çıkış yolunda (`return` veya `raise`) `_shared_readers.add(-1)` ile sayacı düşür.
+- [x] `free_shared_handle()` içinde `zeroize_shared_state()` sonrasında `_shared_readers.add(0) == 0` olana kadar aktif okuyucuların tamamlanmasını bekle ve ardından atomik hücreleri serbest bırak.
+- [x] `tests/concurrency_keyring_test.nox` içine 4 paralel OS okuyucu thread'i yoğun okuma yaparken owner thread'in `zeroize_shared_state()` + `free_shared_handle()` çağırdığı **Test 15b (Active Reader vs. Free Shared Handle Race)** testini ekle.
+
+## 0.15.3 — P1: Ham HMAC Anahtarı Hücresi Okuma Metotlarını Public API’den Kaldırma (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `KeyRing.read_shared_cell_raw()` ve `KeyRing.read_shared_key_cell_raw()` metotlarını `KeyRing` sınıfından tamamen kaldır.
+- [x] `KeyRing.is_shared_zeroized(self) -> bool` metodunu ekle (hiçbir ham hücre değeri döndürmeden tüm veri ve anahtar hücrelerinin `0` olduğunu doğrular).
+
+## 0.15.4 — P1: Paylaşımlı Kapasite Kullanım Telemetrisi (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `KeyRing.shared_capacity_bytes(self) -> int`, `KeyRing.shared_used_bytes(self) -> int` ve `KeyRing.shared_usage_permille(self) -> int` metotlarını ekle ve rotasyon/temizlik (`purge_expired_keys`) sonrasında kapasite kullanımının doğru güncellendiğini test et (**Test 15c**).
+
+## 0.15.5 — P2: Hatalı veya Kısmen Oluşturulmuş Handle Temizliği ve Sınır Testleri (`tests/concurrency_keyring_test.nox`)
+- [x] Bozuk formatlı, eksik segmentli, negatif/alfanümerik handle kimlikli ve yanlış anahtar hücre sayılı `attach_shared_handle()` çağrılarının hedef `KeyRing` nesnesini kirletmeden `ConfigurationError` ile reddedildiğini doğrulayan **Test 16** ekle.
+
+## 0.15.6 — P2: Warm-Up, Çoklu Tekrar, p50/p95 ve Anahtar Ölçekleme Benchmarkları (`tests/benchmark_keyring_test.nox`)
+- [x] `tests/benchmark_keyring_test.nox` dosyasını ısınma (warm-up) fazı, çoklu tekrar üzerinden `min` / `p50` / `p95` / `max` yüzdelik dilim hesabı ve `1`, `16`, `64` anahtarlı ölçekleme ölçümleriyle güncelle; sonuçları `benchmark-results.json` içine yaz.
+
+## 0.15.7 — Phase 15 Çıkış Kapısı ve `v1.0.9` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (18 test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.9` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.9` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.9` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

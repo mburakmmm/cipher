@@ -645,13 +645,11 @@ nox.test.assert_eq_str(attached_life_ring.get_signing_key("HS256").kid, "k-life-
 
 # 14c. Shared Memory Zeroization & Use-After-Free Fail-Closed Guard
 nox.test.assert_true(cap_ring.is_shared_alive(), "Shared handle is alive before zeroization")
-nox.test.assert_true(cap_ring.read_shared_cell_raw(0) != 0, "Shared data cell 0 is non-zero before zeroization")
-nox.test.assert_true(cap_ring.read_shared_key_cell_raw(0) != 0, "Shared key cell 0 is non-zero before zeroization")
+nox.test.assert_true(not cap_ring.is_shared_zeroized(), "Shared handle is not zeroized before zeroize_shared_state()")
 
 cap_ring.zeroize_shared_state()
 nox.test.assert_true(not cap_ring.is_shared_alive(), "Shared handle is marked dead after zeroize_shared_state()")
-nox.test.assert_eq_int(cap_ring.read_shared_cell_raw(0), 0, "Shared data cell 0 overwritten with 0 on zeroization")
-nox.test.assert_eq_int(cap_ring.read_shared_key_cell_raw(0), 0, "Shared key cell 0 overwritten with 0 on zeroization")
+nox.test.assert_true(cap_ring.is_shared_zeroized(), "All shared data and key cells verified zeroed via boolean-only is_shared_zeroized()")
 
 # Any read or write on an attached KeyRing after zeroization MUST fail closed with ConfigurationError!
 uaf_read_rejected: bool = False
@@ -677,5 +675,164 @@ except ConfigurationError:
 nox.test.assert_true(uaf_attach_rejected, "Attaching a zeroized shared handle fails closed immediately")
 
 cap_ring.free_shared_handle()
+
+# ==============================================================================
+# Test 15: P0 Lock-Guarded Zeroization, P1 Active Reader vs. free_shared_handle()
+# Race, and P1 Shared Capacity Telemetry (0.15.1, 0.15.2, 0.15.3, 0.15.4)
+# ==============================================================================
+
+# 15a. P0 Strict Lock-Guarded Zeroization Contention:
+# Prove that if the writer lock is held by another writer, zeroize_shared_state()
+# refuses to touch any shared cell and raises ConfigurationError!
+lock_guard_ring: KeyRing = KeyRing(trust_domain="tenant-zlock")
+lock_guard_ring.add_key(KeyRef("k-zl-0", "HS256", "super-secret-zlock-key-material-32", trust_domain="tenant-zlock", state=STATE_ACTIVE_SIGNING))
+zlock_h: str = lock_guard_ring.export_shared_handle(max_words=256)
+zlock_reader: KeyRing = KeyRing(trust_domain="tenant-zlock")
+zlock_reader.attach_shared_handle(zlock_h)
+
+# Simulate active writer holding the hardware lock:
+nox.test.assert_true(lock_guard_ring.acquire_write_lock(), "Acquired writer lock to simulate active writer")
+zeroize_while_locked_rejected: bool = False
+try:
+    lock_guard_ring.zeroize_shared_state()
+except ConfigurationError:
+    zeroize_while_locked_rejected = True
+nox.test.assert_true(zeroize_while_locked_rejected, "zeroize_shared_state() fails closed when writer lock is held")
+nox.test.assert_true(lock_guard_ring.is_shared_alive(), "Shared state remains alive when zeroization is rejected due to lock contention")
+nox.test.assert_true(not lock_guard_ring.is_shared_zeroized(), "Shared cells remain untouched when zeroization is rejected")
+
+# Release writer lock and verify attached reader still reads k-zl-0 without corruption:
+lock_guard_ring.release_write_lock()
+nox.test.assert_eq_str(zlock_reader.get_signing_key("HS256").kid, "k-zl-0", "Attached reader reads intact key after rejected contended zeroization")
+
+# Now zeroize cleanly with lock available:
+lock_guard_ring.zeroize_shared_state()
+nox.test.assert_true(lock_guard_ring.is_shared_zeroized(), "Shared state zeroized cleanly once writer lock is available")
+lock_guard_ring.free_shared_handle()
+
+# 15b. P1 Active Reader Drain vs. free_shared_handle() Concurrent OS Thread Race:
+async def concurrent_reader_race_worker(shared_h: str) -> int:
+    r_ring: KeyRing = KeyRing(trust_domain="tenant-free-race")
+    try:
+        r_ring.attach_shared_handle(shared_h)
+    except ConfigurationError:
+        return 0
+    valid_reads: int = 0
+    iter_i: int = 0
+    while iter_i < 80:
+        try:
+            sk: KeyRef = r_ring.get_signing_key("HS256")
+            if sk.kid != "k-fr-0" and sk.kid != "k-fr-1":
+                return -1
+            valid_reads = valid_reads + 1
+        except ConfigurationError:
+            # Expected once owner calls zeroize_shared_state() / free_shared_handle()
+            break
+        iter_i = iter_i + 1
+    return valid_reads
+
+async def run_reader_vs_free_race_test() -> None:
+    owner_ring: KeyRing = KeyRing(trust_domain="tenant-free-race")
+    owner_ring.add_key(KeyRef("k-fr-0", "HS256", "super-secret-free-race-key-00-32b!", trust_domain="tenant-free-race", state=STATE_ACTIVE_SIGNING))
+    race_h: str = owner_ring.export_shared_handle(max_words=256)
+
+    rt1: ThreadHandle[int] = nox.thread.start(concurrent_reader_race_worker, race_h)
+    rt2: ThreadHandle[int] = nox.thread.start(concurrent_reader_race_worker, race_h)
+    rt3: ThreadHandle[int] = nox.thread.start(concurrent_reader_race_worker, race_h)
+    rt4: ThreadHandle[int] = nox.thread.start(concurrent_reader_race_worker, race_h)
+
+    # Perform a rotation and concurrent zeroize_shared_state() while 4 OS reader threads are actively reading
+    owner_ring.rotate(KeyRef("k-fr-1", "HS256", "super-secret-free-race-key-01-32b!", trust_domain="tenant-free-race", state=STATE_PREPARED), overlap_seconds=300, clock_time_sec=4000)
+    owner_ring.zeroize_shared_state()
+
+    rc1: int = await rt1.join()
+    rc2: int = await rt2.join()
+    rc3: int = await rt3.join()
+    rc4: int = await rt4.join()
+    nox.test.assert_true(rc1 >= 0 and rc2 >= 0 and rc3 >= 0 and rc4 >= 0, "Zero corrupted/invalid reads across 4 concurrent OS reader threads during zeroize_shared_state()")
+    nox.test.assert_eq_int(owner_ring.active_shared_readers(), 0, "All 4 concurrent OS reader threads drained cleanly")
+
+    # Verify active reader drain guard on free_shared_handle(): if a reader is still in flight (_shared_readers > 0),
+    # free_shared_handle() refuses to free C pointers until the reader drains.
+    owner_ring._shared_readers.add(1)
+    free_while_reader_active_rejected: bool = False
+    try:
+        owner_ring.free_shared_handle()
+    except ConfigurationError:
+        free_while_reader_active_rejected = True
+    nox.test.assert_true(free_while_reader_active_rejected, "free_shared_handle() refuses to free atomic cells while active_shared_readers() > 0")
+    owner_ring._shared_readers.add(-1)
+    owner_ring.free_shared_handle()
+
+t_free_race: Task[None] = spawn run_reader_vs_free_race_test()
+await t_free_race
+
+# 15c. P1 Shared Capacity Telemetry (shared_capacity_bytes, shared_used_bytes, shared_usage_permille):
+tel_ring: KeyRing = KeyRing(trust_domain="tenant-telemetry")
+nox.test.assert_eq_int(tel_ring.shared_capacity_bytes(), 0, "Unshared KeyRing has 0 shared_capacity_bytes")
+nox.test.assert_eq_int(tel_ring.shared_used_bytes(), 0, "Unshared KeyRing has 0 shared_used_bytes")
+nox.test.assert_eq_int(tel_ring.shared_usage_permille(), 0, "Unshared KeyRing has 0 shared_usage_permille")
+
+tel_ring.add_key(KeyRef("k-tel-0", "HS256", "super-secret-telemetry-key-00-32b", trust_domain="tenant-telemetry", state=STATE_ACTIVE_SIGNING))
+_tel_h: str = tel_ring.export_shared_handle(max_words=128)
+nox.test.assert_eq_int(tel_ring.shared_capacity_bytes(), 768, "128 words == 768 bytes capacity")
+used_1: int = tel_ring.shared_used_bytes()
+perm_1: int = tel_ring.shared_usage_permille()
+nox.test.assert_true(used_1 > 50 and used_1 < 768, "shared_used_bytes reflects 1-key canonical state size")
+nox.test.assert_true(perm_1 > 0 and perm_1 < 1000, "shared_usage_permille in valid 1..999 range")
+
+tel_ring.rotate(KeyRef("k-tel-1", "HS256", "super-secret-telemetry-key-01-32b", trust_domain="tenant-telemetry", state=STATE_PREPARED), overlap_seconds=100, clock_time_sec=2000)
+used_2: int = tel_ring.shared_used_bytes()
+nox.test.assert_true(used_2 > used_1, "shared_used_bytes increases after rotation adds 2nd key")
+
+tel_ring.purge_expired_keys(current_time_sec=2200)
+used_after_purge: int = tel_ring.shared_used_bytes()
+nox.test.assert_true(used_after_purge < used_2, "shared_used_bytes decreases after purge_expired_keys compacts state")
+tel_ring.free_shared_handle()
+
+# ==============================================================================
+# Test 16: P2 Malformed / Partially Constructed Shared Handle Rejection & Cleanup (0.15.5)
+# ==============================================================================
+clean_ring: KeyRing = KeyRing(trust_domain="tenant-clean")
+clean_ring.add_key(KeyRef("k-clean-0", "HS256", "super-secret-clean-key-material-32", trust_domain="tenant-clean", state=STATE_ACTIVE_SIGNING))
+
+bad_handles: list[str] = [
+    "",
+    "1|2|3",
+    "1|2|3|4|5|6|7",
+    "0|1|2|3|4|5|1,2,3,4,5,6,7,8,9,10,11|1",
+    "abc|1|2|3|4|5|1,2,3,4,5,6,7,8,9,10,11|1",
+    "1|2|3|4|5|6|1,2,3|1,2,3",
+    "1|2|3|4|5|6|1,2,3,4,5,6,7,8,9,10,11|1,2,3"
+]
+bh_i: int = 0
+while bh_i < len(bad_handles):
+    bh_rejected: bool = False
+    try:
+        clean_ring.attach_shared_handle(bad_handles[bh_i])
+    except ConfigurationError:
+        bh_rejected = True
+    nox.test.assert_true(bh_rejected, "Malformed shared handle rejected: index " + str(bh_i))
+    bh_i = bh_i + 1
+
+# Verify out-of-range max_words in export_shared_handle() are rejected without side effects:
+low_mw_rejected: bool = False
+try:
+    clean_ring.export_shared_handle(max_words=16)
+except ConfigurationError:
+    low_mw_rejected = True
+nox.test.assert_true(low_mw_rejected, "export_shared_handle(max_words=16) rejected")
+
+high_mw_rejected: bool = False
+try:
+    clean_ring.export_shared_handle(max_words=16384)
+except ConfigurationError:
+    high_mw_rejected = True
+nox.test.assert_true(high_mw_rejected, "export_shared_handle(max_words=16384) rejected")
+
+# Prove clean_ring remains completely uncorrupted and operational after all failed handle operations:
+nox.test.assert_true(not clean_ring.is_shared_alive(), "clean_ring remains unattached after failed handle operations")
+nox.test.assert_eq_int(clean_ring.get_version(), 1, "clean_ring version preserved at 1")
+nox.test.assert_eq_str(clean_ring.get_signing_key("HS256").kid, "k-clean-0", "clean_ring signing key preserved")
 
 print("concurrency_keyring_test passed!")
