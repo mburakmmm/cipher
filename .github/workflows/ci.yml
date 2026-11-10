@@ -55,6 +55,14 @@ jobs:
         run: |
           noxc test
 
+      - name: Upload KeyRing Benchmark Results Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.os }}
+          path: benchmark-results.json
+          if-no-files-found: ignore
+
       - name: Verify Native Package Manager Fetch & Consumer Integration (Linux / macOS)
         if: runner.os != 'Windows'
         run: |

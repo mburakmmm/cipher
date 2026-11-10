@@ -1,5 +1,6 @@
 # Cipher — KeyRing Seqlock Snapshot Read, Seal Verification & Rotation Benchmark Suite
 
+import nox.fs
 import nox.test
 import nox.time
 from cipher import KeyRef, KeyRing, KeyRingState, STATE_ACTIVE_SIGNING, STATE_PREPARED
@@ -64,5 +65,19 @@ while s_idx <= 10:
 shared_sync_ms: int = t3.elapsed_ms()
 sh_ring.free_shared_handle()
 nox.test.assert_true(shared_sync_ms < 10000, "10 cross-thread shared atomic state round-trips completed well within budget")
+
+# 5. Export structured JSON benchmark artifact for CI tracking (0.14.6)
+bench_json: str = "{\n"
+bench_json = bench_json + "  \"suite\": \"cipher_keyring_benchmark\",\n"
+bench_json = bench_json + "  \"version\": \"1.0.8\",\n"
+bench_json = bench_json + "  \"metrics\": {\n"
+bench_json = bench_json + "    \"seqlock_get_signing_key_500_ms\": " + str(read_sign_ms) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_verification_key_500_ms\": " + str(read_ver_ms) + ",\n"
+bench_json = bench_json + "    \"atomic_rotate_30_ms\": " + str(rot_ms) + ",\n"
+bench_json = bench_json + "    \"cross_thread_shared_sync_10_ms\": " + str(shared_sync_ms) + "\n"
+bench_json = bench_json + "  }\n"
+bench_json = bench_json + "}\n"
+nox.fs.write_string("benchmark-results.json", bench_json)
+nox.test.assert_true(nox.fs.exists("benchmark-results.json"), "benchmark-results.json artifact written")
 
 print("benchmark_keyring_test passed! (sign_500=" + str(read_sign_ms) + "ms, verify_500=" + str(read_ver_ms) + "ms, rotate_30=" + str(rot_ms) + "ms, shared_sync_10=" + str(shared_sync_ms) + "ms)")

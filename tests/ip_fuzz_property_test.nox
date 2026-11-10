@@ -1,5 +1,6 @@
 # Cipher — Property-Based & Adversarial Fuzz Test Suite for IPv4/IPv6 Parsers & SSRF Policy
 
+import nox.test
 import nox.url
 from cipher import EncodingError, IPv4Address, IPv6Address, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, verify_resolved_ip
 
@@ -460,5 +461,50 @@ while v6_fuzz_i < 400:
         raise Exception("Property 5 is_safe_jwks_url mismatch on IPv6 URL: " + v6_url)
 
     v6_fuzz_i = v6_fuzz_i + 1
+
+# ==============================================================================
+# Property 6: RFC 3986 / RFC 4291 / RFC 5952 / RFC 6890 Standard Test Vector
+# Differential Verification & nox.url.parse Cross-Validation (0.14.5)
+# ==============================================================================
+def _verify_rfc4291_vector(vec_str: str, h0: int, h1: int, h2: int, h3: int, h4: int, h5: int, h6: int, h7: int, expect_restricted: bool, expect_url_safe: bool) -> None:
+    p6: IPv6Address = parse_ipv6(vec_str)
+    nox.test.assert_eq_int(p6.hextets[0], h0, "RFC 4291 vector h0: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[1], h1, "RFC 4291 vector h1: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[2], h2, "RFC 4291 vector h2: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[3], h3, "RFC 4291 vector h3: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[4], h4, "RFC 4291 vector h4: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[5], h5, "RFC 4291 vector h5: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[6], h6, "RFC 4291 vector h6: " + vec_str)
+    nox.test.assert_eq_int(p6.hextets[7], h7, "RFC 4291 vector h7: " + vec_str)
+    nox.test.assert_true(is_restricted_ipv6_addr(p6) == expect_restricted, "RFC 6890 restriction policy match: " + vec_str)
+    nox.test.assert_true(verify_resolved_ip(vec_str) == (not expect_restricted), "verify_resolved_ip match on RFC vector: " + vec_str)
+
+    # Cross-validate against nox.url.parse RFC 3986 IP-literal bracketed host extraction
+    u_rfc: nox.url.URL = nox.url.parse("https://[" + vec_str + "]:8443/jwks.json")
+    nox.test.assert_true(len(u_rfc.host) > 0, "nox.url.parse extracted non-empty host for RFC vector: " + vec_str)
+    nox.test.assert_true(is_safe_jwks_url("https://[" + vec_str + "]:8443/jwks.json") == expect_url_safe, "is_safe_jwks_url matches URL policy expectation: " + vec_str)
+
+# RFC 4291 Section 2.2 Canonical Unicast Example (2001:DB8:0:0:8:800:200C:417A -> Restricted under RFC 3849 2001:db8::/32 documentation prefix)
+_verify_rfc4291_vector("2001:DB8:0:0:8:800:200C:417A", 8193, 3512, 0, 0, 8, 2048, 8204, 16762, True, False)
+_verify_rfc4291_vector("2001:db8::8:800:200c:417a", 8193, 3512, 0, 0, 8, 2048, 8204, 16762, True, False)
+# RFC 4291 Section 2.2 Global Unicast (2001:4860:4860::8888 -> Public Google DNS)
+_verify_rfc4291_vector("2001:4860:4860:0:0:0:0:8888", 8193, 18528, 18528, 0, 0, 0, 0, 34952, False, True)
+_verify_rfc4291_vector("2001:4860:4860::8888", 8193, 18528, 18528, 0, 0, 0, 0, 34952, False, True)
+# RFC 4291 Section 2.2 Multicast (FF01:0:0:0:0:0:0:101 -> Restricted ff00::/8)
+_verify_rfc4291_vector("FF01:0:0:0:0:0:0:101", 65281, 0, 0, 0, 0, 0, 0, 257, True, False)
+_verify_rfc4291_vector("FF01::101", 65281, 0, 0, 0, 0, 0, 0, 257, True, False)
+# RFC 4291 Section 2.2 Loopback & Unspecified
+_verify_rfc4291_vector("0:0:0:0:0:0:0:1", 0, 0, 0, 0, 0, 0, 0, 1, True, False)
+_verify_rfc4291_vector("::1", 0, 0, 0, 0, 0, 0, 0, 1, True, False)
+_verify_rfc4291_vector("0:0:0:0:0:0:0:0", 0, 0, 0, 0, 0, 0, 0, 0, True, False)
+_verify_rfc4291_vector("::", 0, 0, 0, 0, 0, 0, 0, 0, True, False)
+# RFC 4291 Section 2.2 Clause 3 Mixed IPv4-Embedded Representations (allowed in resolved IP when public, forbidden as raw URL host literal)
+_verify_rfc4291_vector("0:0:0:0:0:0:13.1.68.3", 0, 0, 0, 0, 0, 0, 3329, 17411, True, False)
+_verify_rfc4291_vector("::13.1.68.3", 0, 0, 0, 0, 0, 0, 3329, 17411, True, False)
+_verify_rfc4291_vector("0:0:0:0:0:FFFF:129.144.52.38", 0, 0, 0, 0, 0, 65535, 33168, 13350, False, False)
+_verify_rfc4291_vector("::FFFF:129.144.52.38", 0, 0, 0, 0, 0, 65535, 33168, 13350, False, False)
+# RFC 6890 / RFC 6052 Well-Known Prefix (64:ff9b::/96) & Discard Prefix (100::/64)
+_verify_rfc4291_vector("64:ff9b::192.0.2.33", 100, 65435, 0, 0, 0, 0, 49152, 545, True, False)
+_verify_rfc4291_vector("100::1", 256, 0, 0, 0, 0, 0, 0, 1, True, False)
 
 print("ip_fuzz_property_test passed!")

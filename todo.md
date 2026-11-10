@@ -751,3 +751,50 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.7` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.7` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 14 — `v1.0.8` Secret-Free Shared Handle Capability Model, UTF-8 Byte-Exact Canonical Packing, Configurable Shared Capacity & Key Compaction, Memory Zeroization & RFC Vector Differential Tests (SOL VIII Analizi)
+
+**Amaç:** Sekizinci bağımsız teknik incelemede (GPT 6 SOL VIII analizi) tespit edilen paylaşımlı handle güvenlik modeli, UTF-8 çok baytlı (multi-byte) serileştirme/paketleme, paylaşımlı kapasite yönetimi, bellek sıfırlama (zeroization) ve RFC vektör/CI benchmark artefakt bulgularını eksiksiz tamamlamak:
+1. **P0 & P1 — Paylaşımlı Handle Güvenlik Modeli ve `_seal_key` Gizliliği (`keyring.nox`, `docs/threat-model.md`, `docs/key-management.md`):** `export_shared_handle()` çıktısından düz metin `_seal_key` değerini tamamen kaldırmak; HMAC mühür anahtarını süreç içi ayrı `nox.atomic.AtomicInt` hücrelerinde (`_shared_key_cells`) saklayarak handle dizgesinde yalnızca sayısal hücre kimliklerini taşımak; `redact_shared_handle()` yardımcı fonksiyonunu sağlamak ve paylaşımlı handle güvenlik sözleşmesini belgelemek.
+2. **P1 — UTF-8 Bayt-Güvenli (Byte-Exact) Kanonik Serileştirme ve Atomik Kelime Paketleme (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** NOX 2.1'de `len(s)` karakter (codepoint) sayarken `nox.strings.byte_len(s)`, `nox.strings.byte_at(s, idx)` ve `nox.strings.char_from_byte(b)` ham UTF-8 baytları üzerinde çalışır. `_lp()`, `_CanonCursor.next_str()`, `_pack_shared_words()` ve `_unpack_shared_words()` fonksiyonlarını `nox.strings` UTF-8 bayt ilkelleriyle güncelleyerek Türkçe (`ğüşiöçİĞÜŞİÖÇ`) ve çok baytlı Unicode karakterlerin `%100` kayıpsız serileştirilmesini ve thread'ler arası aktarılmasını sağlamak.
+3. **P1 — Yapılandırılabilir Paylaşımlı State Kapasitesi ve Süresi Dolmuş Anahtar Sıkıştırma (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `export_shared_handle(max_words: int = 512)` ile paylaşımlı atomik kelime kapasitesini yapılandırılabilir hale getirmek ve uzun ömürlü `KeyRing` örneklerinde `RETIRED`, `REVOKED` veya süresi dolmuş (`retire_at > 0 and current_time_sec >= retire_at`) `VERIFY_ONLY` anahtarları atomik olarak temizleyen `purge_expired_keys(current_time_sec: int, expected_version: int = -1) -> int` API'sini eklemek.
+4. **P1 — Paylaşımlı Handle Yaşam Döngüsü, Bellek Sıfırlama (Zeroization) ve Use-After-Free Koruması (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** Paylaşımlı duruma `_shared_alive: nox.atomic.AtomicBool` bayrağı ve `zeroize_shared_state()` metodu eklemek; `free_shared_handle()` çağrıldığında tüm paylaşımlı veri ve anahtar hücrelerini `0` ile üzerine yazıp (zeroize) `_shared_alive` bayrağını `False` yapmak ve sonlandırılmış handle üzerinden okuma/yazma denemelerini fail-closed `ConfigurationError` ile reddetmek.
+5. **P2 — RFC 3986 / RFC 4291 / RFC 6890 Standart Vektör Tablosu ve `nox.url.parse` Karşılaştırması (`tests/ip_fuzz_property_test.nox`):** IP test paketine standart RFC test vektörleri ve `nox.url.parse` ayrıştırma karşılaştırma katmanı eklemek.
+6. **P2 — Benchmark Sonuçlarını CI Artefaktı Olarak Kaydetme (`tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`):** Benchmark metriklerini `benchmark-results.json` dosyasına yazmak ve GitHub Actions üzerinde CI artefaktı olarak yüklemek.
+
+## 0.14.1 — P0 & P1: Paylaşımlı Handle Güvenlik Modeli ve `_seal_key` Koruması (`keyring.nox`, `cipher.nox`, `docs/threat-model.md`, `docs/key-management.md`)
+- [x] `export_shared_handle()` çıktısından düz metin `self._seal_key` alanını kaldır; bunun yerine 64 karakterlik hex `_seal_key` değerini 11 adet `nox.atomic.AtomicInt` hücresine (`_shared_key_cells`) paketleyerek handle dizgesinde yalnızca sayısal hücre tanıtıcılarını taşı.
+- [x] `redact_shared_handle(handle_str: str) -> str` fonksiyonunu ekle ve dışa aktar (`KeyRingSharedHandle([REDACTED])`).
+- [x] `docs/threat-model.md` ve `docs/key-management.md` içinde `export_shared_handle()` / `attach_shared_handle()` / `zeroize_shared_state()` / `free_shared_handle()` güvenlik sözleşmesini (capability token modeli, loglama yasağı, yaşam döngüsü sahipliği) belgele.
+
+## 0.14.2 — P1: UTF-8 Bayt-Kesin (Byte-Exact) Kanonik Serileştirme ve Atomik Kelime Paketleme (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `_lp(val: str)` fonksiyonunda `len(val)` yerine `nox.strings.byte_len(val)` kullan.
+- [x] `_CanonCursor` sınıfında `nox.strings.byte_len(raw)`, `nox.strings.byte_at(raw, pos)` ve `nox.strings.char_from_byte(b)` kullanarak çok baytlı UTF-8 dizgelerin bayt sınırlarında kesintisiz ve kayıpsız ayrıştırılmasını sağla.
+- [x] `_pack_shared_words()` ve `_unpack_shared_words()` fonksiyonlarında `ord()`/`chr()` yerine `nox.strings.byte_len()`, `nox.strings.byte_at()` ve `nox.strings.char_from_byte()` kullanarak 0..255 ham UTF-8 baytlarını 6 baytlık `AtomicInt` kelimelerine kayıpsız paketle/çöz.
+- [x] `tests/concurrency_keyring_test.nox` içine Türkçe ve çok baytlı Unicode karakterler (`kid="k-ğüşiöç-İĞÜŞİÖÇ-01"`, `trust_domain="kiracı-güvenlik-αβγ"`) içeren çapraz-thread paylaşımlı state doğrulama testi ekle.
+
+## 0.14.3 — P1: Yapılandırılabilir Paylaşımlı State Kapasitesi ve Anahtar Sıkıştırma (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `export_shared_handle(self, max_words: int = 512) -> str` imzasıyla paylaşımlı atomik hücre kapasitesini yapılandırılabilir yap (min `64`, max `8192` kelime).
+- [x] `KeyRing.purge_expired_keys(self, current_time_sec: int, expected_version: int = -1) -> int` metodunu ekle: `STATE_RETIRED`, `STATE_REVOKED` veya `STATE_VERIFY_ONLY` olup `retire_at > 0 and current_time_sec >= retire_at` koşulunu sağlayan anahtarları Seqlock + CAS altında atomik olarak temizle ve temizlenen anahtar sayısını döndür.
+
+## 0.14.4 — P1: Paylaşımlı Handle Yaşam Döngüsü, Bellek Sıfırlama (Zeroization) ve Use-After-Free Koruması (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] Paylaşımlı atomik duruma `_shared_alive: nox.atomic.AtomicBool` hücresi ekle.
+- [x] `zeroize_shared_state(self) -> None` metodunu ekle: yazma kilidi altında tüm `_shared_cells` ve `_shared_key_cells` hücrelerini `0` ile sıfırla, `_shared_len.store(0)` yap ve `_shared_alive.store(False)` olarak işaretle.
+- [x] `free_shared_handle(self) -> None` çağrıldığında hücreleri serbest bırakmadan önce otomatik sıfırlama yap ve `_shared_alive == False` durumunda herhangi bir bağlı `KeyRing` okuma/yazma denemesini `ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")` ile fail-closed reddet.
+
+## 0.14.5 — P2: RFC 3986 / RFC 4291 / RFC 6890 Standart Vektör Tablosu ve `nox.url.parse` Differential Testleri (`tests/ip_fuzz_property_test.nox`)
+- [x] `tests/ip_fuzz_property_test.nox` içine standart RFC 3986 / RFC 4291 / RFC 6890 test vektörleri ve `nox.url.parse("https://[" + ipv6 + "]/jwks.json")` host çıkarımı ile Cipher IP ayrıştırıcılarını karşılaştıran **Property 6** katmanını ekle.
+
+## 0.14.6 — P2: Benchmark Sonuçlarını JSON Olarak Üretme ve CI Artefaktı Olarak Kaydetme (`tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`)
+- [x] `tests/benchmark_keyring_test.nox` içinde ölçülen metrikleri `benchmark-results.json` dosyasına yaz.
+- [x] `.github/workflows/ci.yml` ve `.github/workflows/release.yml` iş akışlarına `benchmark-results.json` dosyasını `actions/upload-artifact@v4` ile CI artefaktı olarak yükleyen adım ekle.
+
+## 0.14.7 — Phase 14 Çıkış Kapısı ve `v1.0.8` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (18 test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.8` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.8` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.8` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

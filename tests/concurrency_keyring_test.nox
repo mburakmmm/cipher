@@ -1,9 +1,10 @@
 import nox.atomic
+import nox.strings
 import nox.test
 import nox.thread
 from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing, KeyRingState, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical
+from keyring import KeyRing, KeyRingState, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical, redact_shared_handle
 from rotation import RotationReceipt
 
 # ==============================================================================
@@ -560,5 +561,121 @@ while rw_round <= 30:
     nox.test.assert_eq_int(r_ver_after_rev, r_state_after_rev.version, "Reader observes coherent version after revoke()")
 
     rw_round = rw_round + 1
+
+# ==============================================================================
+# Test 13: P1 UTF-8 Multi-Byte Canonical Serialization & Cross-Thread Shared Packing (0.14.2)
+# Verifies that Turkish multi-byte UTF-8 characters (ğüşiöçİĞÜŞİÖÇ) and Greek/Unicode
+# in kid and trust_domain are serialized, hashed, packed into 6-byte AtomicInt words,
+# unpacked across OS threads, and deserialized with 100% lossless byte-exact fidelity.
+# ==============================================================================
+async def utf8_shared_rotator_worker(shared_h: str) -> str:
+    u_ring: KeyRing = KeyRing(trust_domain="kiracı-güvenlik-αβγ")
+    u_ring.attach_shared_handle(shared_h)
+    init_signer: KeyRef = u_ring.get_signing_key("HS256")
+    next_utf8_k: KeyRef = KeyRef(
+        "k-ğüşiöç-İĞÜŞİÖÇ-02",
+        "HS256",
+        "süper-gizli-türkçe-anahtar-verisi-32bayt!",
+        trust_domain="kiracı-güvenlik-αβγ",
+        state=STATE_PREPARED
+    )
+    u_ring.rotate(next_utf8_k, overlap_seconds=600, clock_time_sec=9000, expected_version=1)
+    return init_signer.kid + "|" + u_ring.get_signing_key("HS256").kid
+
+async def run_utf8_multibyte_shared_test() -> None:
+    utf8_ring: KeyRing = KeyRing(trust_domain="kiracı-güvenlik-αβγ")
+    utf8_k1: KeyRef = KeyRef(
+        "k-ğüşiöç-İĞÜŞİÖÇ-01",
+        "HS256",
+        "süper-gizli-türkçe-anahtar-ilk-32bayt!!",
+        trust_domain="kiracı-güvenlik-αβγ",
+        state=STATE_ACTIVE_SIGNING
+    )
+    # Confirm multi-byte UTF-8 property: byte_len > codepoint len
+    nox.test.assert_true(nox.strings.byte_len(utf8_k1.kid) > len(utf8_k1.kid), "Turkish UTF-8 kid has byte_len > codepoint len")
+    utf8_ring.add_key(utf8_k1)
+
+    utf8_handle: str = utf8_ring.export_shared_handle(max_words=512)
+    uth: ThreadHandle[str] = nox.thread.start(utf8_shared_rotator_worker, utf8_handle)
+    worker_utf8_res: str = await uth.join()
+    nox.test.assert_eq_str(worker_utf8_res, "k-ğüşiöç-İĞÜŞİÖÇ-01|k-ğüşiöç-İĞÜŞİÖÇ-02", "Worker OS thread unpacked initial UTF-8 kid and rotated to new UTF-8 kid")
+
+    main_utf8_signer: KeyRef = utf8_ring.get_signing_key("HS256")
+    nox.test.assert_eq_str(main_utf8_signer.kid, "k-ğüşiöç-İĞÜŞİÖÇ-02", "Main thread unpacked rotated multi-byte UTF-8 kid losslessly")
+    nox.test.assert_eq_str(main_utf8_signer.trust_domain, "kiracı-güvenlik-αβγ", "Main thread unpacked multi-byte UTF-8 trust_domain losslessly")
+    old_utf8_ver: KeyRef = utf8_ring.get_verification_key("k-ğüşiöç-İĞÜŞİÖÇ-01", 9100)
+    nox.test.assert_eq_str(old_utf8_ver.state, STATE_VERIFY_ONLY, "Multi-byte UTF-8 verification key lookup succeeds after rotation")
+    utf8_ring.free_shared_handle()
+
+t_utf8: Task[None] = spawn run_utf8_multibyte_shared_test()
+await t_utf8
+
+# ==============================================================================
+# Test 14: P0/P1 Secret-Free Handle, Configurable Capacity, Key Compaction & Zeroization (0.14.1, 0.14.3, 0.14.4)
+# ==============================================================================
+cap_ring: KeyRing = KeyRing(trust_domain="tenant-lifecycle")
+cap_ring.add_key(KeyRef("k-life-0", "HS256", "super-secret-lifecycle-key-00-32b", trust_domain="tenant-lifecycle", state=STATE_ACTIVE_SIGNING))
+cap_ring.rotate(KeyRef("k-life-1", "HS256", "super-secret-lifecycle-key-01-32b", trust_domain="tenant-lifecycle", state=STATE_PREPARED), overlap_seconds=100, clock_time_sec=1000)
+cap_ring.rotate(KeyRef("k-life-2", "HS256", "super-secret-lifecycle-key-02-32b", trust_domain="tenant-lifecycle", state=STATE_PREPARED), overlap_seconds=500, clock_time_sec=1050)
+cap_ring.revoke("k-life-1")
+
+# Export with custom max_words=1024 capacity (6,144 bytes)
+raw_seal_key: str = cap_ring._seal_key
+nox.test.assert_eq_int(nox.strings.byte_len(raw_seal_key), 64, "Internal HMAC seal key is 64 hex bytes")
+cap_handle: str = cap_ring.export_shared_handle(max_words=1024)
+
+# 14a. Secret-Free Handle Verification: _seal_key must NEVER appear in export_shared_handle() string!
+nox.test.assert_true(not nox.strings.contains(cap_handle, raw_seal_key), "export_shared_handle() string contains ZERO plaintext _seal_key material")
+nox.test.assert_eq_str(redact_shared_handle(cap_handle), "KeyRingSharedHandle([REDACTED])", "redact_shared_handle() masks handle capability string")
+
+# Attach secondary reader ring to verify shared state before and after purge_expired_keys()
+attached_life_ring: KeyRing = KeyRing(trust_domain="tenant-lifecycle")
+attached_life_ring.attach_shared_handle(cap_handle)
+nox.test.assert_eq_int(attached_life_ring.get_state().key_count(), 3, "Attached ring sees 3 keys before compaction")
+
+# 14b. purge_expired_keys(current_time_sec=1200):
+# - k-life-0 (VERIFY_ONLY, retire_at=1100 <= 1200) -> PURGED
+# - k-life-1 (REVOKED)                             -> PURGED
+# - k-life-2 (ACTIVE_SIGNING)                      -> RETAINED
+purged_n: int = cap_ring.purge_expired_keys(current_time_sec=1200)
+nox.test.assert_eq_int(purged_n, 2, "purge_expired_keys removed 2 expired/revoked keys")
+nox.test.assert_eq_int(cap_ring.get_state().key_count(), 1, "Compacted KeyRing retains only 1 active key")
+nox.test.assert_eq_int(attached_life_ring.get_state().key_count(), 1, "Attached shared KeyRing immediately observes compacted 1-key state")
+nox.test.assert_eq_str(attached_life_ring.get_signing_key("HS256").kid, "k-life-2", "Active signing key k-life-2 preserved after compaction")
+
+# 14c. Shared Memory Zeroization & Use-After-Free Fail-Closed Guard
+nox.test.assert_true(cap_ring.is_shared_alive(), "Shared handle is alive before zeroization")
+nox.test.assert_true(cap_ring.read_shared_cell_raw(0) != 0, "Shared data cell 0 is non-zero before zeroization")
+nox.test.assert_true(cap_ring.read_shared_key_cell_raw(0) != 0, "Shared key cell 0 is non-zero before zeroization")
+
+cap_ring.zeroize_shared_state()
+nox.test.assert_true(not cap_ring.is_shared_alive(), "Shared handle is marked dead after zeroize_shared_state()")
+nox.test.assert_eq_int(cap_ring.read_shared_cell_raw(0), 0, "Shared data cell 0 overwritten with 0 on zeroization")
+nox.test.assert_eq_int(cap_ring.read_shared_key_cell_raw(0), 0, "Shared key cell 0 overwritten with 0 on zeroization")
+
+# Any read or write on an attached KeyRing after zeroization MUST fail closed with ConfigurationError!
+uaf_read_rejected: bool = False
+try:
+    attached_life_ring.get_signing_key("HS256")
+except ConfigurationError:
+    uaf_read_rejected = True
+nox.test.assert_true(uaf_read_rejected, "Attached KeyRing read fails closed after zeroize_shared_state()")
+
+uaf_write_rejected: bool = False
+try:
+    attached_life_ring.add_key(KeyRef("k-life-3", "HS256", "super-secret-lifecycle-key-03-32b", trust_domain="tenant-lifecycle", state=STATE_PREPARED))
+except ConfigurationError:
+    uaf_write_rejected = True
+nox.test.assert_true(uaf_write_rejected, "Attached KeyRing write fails closed after zeroize_shared_state()")
+
+uaf_attach_rejected: bool = False
+try:
+    late_ring: KeyRing = KeyRing(trust_domain="tenant-lifecycle")
+    late_ring.attach_shared_handle(cap_handle)
+except ConfigurationError:
+    uaf_attach_rejected = True
+nox.test.assert_true(uaf_attach_rejected, "Attaching a zeroized shared handle fails closed immediately")
+
+cap_ring.free_shared_handle()
 
 print("concurrency_keyring_test passed!")

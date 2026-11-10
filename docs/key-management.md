@@ -28,3 +28,18 @@ When rotating keys via `KeyRing.rotate(new_key, overlap_seconds)`:
 2. The former signing key transitions to `VERIFY_ONLY` with an expiration timestamp (`retire_at = now + overlap_seconds`).
 3. An immutable `RotationReceipt` is generated recording `old_kid`, `new_kid`, `overlap_seconds`, and rotation timestamp.
 4. Outstanding tokens issued under the old key remain valid until the overlap window closes.
+
+## 3. Expired Key Compaction (`purge_expired_keys`)
+
+Long-running services that rotate keys frequently can compact their `KeyRing` state atomically using `KeyRing.purge_expired_keys(current_time_sec: int, expected_version: int = -1) -> int`:
+- Removes all keys in `STATE_RETIRED` or `STATE_REVOKED`, as well as `STATE_VERIFY_ONLY` keys whose overlap window has elapsed (`retire_at > 0 and current_time_sec >= retire_at`).
+- Preserves all `STATE_ACTIVE_SIGNING`, `STATE_PREPARED`, and non-expired `STATE_VERIFY_ONLY` keys.
+- Executes under the hardware writer mutex, Seqlock, and version CAS, immediately propagating the compacted state to all attached shared OS threads and returning the number of purged keys.
+
+## 4. Cross-OS-Thread Shared Handle Lifecycle & Security Contract
+
+To share a `KeyRing` across NOX's shared-nothing OS threads (`nox.thread.start`):
+1. **Export (`export_shared_handle(max_words: int = 512) -> str`):** Allocates process-wide `nox.atomic` cells (`max_words` between `64` and `8192`, default `512` words = `3,072` bytes; up to `8192` words = `49,152` bytes). The returned string contains **only numeric atomic handle IDs** (`lock_h|seq_h|ver_h|len_h|alive_h|key_cells|data_cells`); no plaintext key material or `_seal_key` is ever present in the string.
+2. **Capability Protection (`redact_shared_handle`):** Treat the handle string as an in-process capability token. Never log raw handle strings; use `redact_shared_handle(handle_str)` (`"KeyRingSharedHandle([REDACTED])"`) in diagnostic logs.
+3. **Worker Attachment (`attach_shared_handle(handle_str)`):** Worker threads attach to the shared atomic cells and read/rotate keys under the hardware Acquire-Release Seqlock (`ldaddal`/`casal` on ARM64, `lock xadd`/`lock cmpxchg` on x86_64). All canonical field lengths and word packing operate on exact UTF-8 bytes (`nox.strings.byte_len`, `nox.strings.byte_at`, `nox.strings.char_from_byte`).
+4. **Deterministic Zeroization & Teardown (`zeroize_shared_state()` / `free_shared_handle()`):** Only the owning `KeyRing` that created the handle should call `free_shared_handle()` after worker threads have joined. `free_shared_handle()` automatically invokes `zeroize_shared_state()`, which overwrites all shared data cells and shared HMAC key cells with `0`, sets `_shared_len = 0`, and sets `_shared_alive = False`. Any subsequent read, write, or attach attempt on a zeroized handle fails closed immediately with `ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")`.

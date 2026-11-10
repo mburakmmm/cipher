@@ -4,6 +4,28 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL VIII Architecture Audit)
+- **Secret-Free Shared Handle Capability Security Model (`keyring.nox`, `cipher.nox`, `docs/threat-model.md`, `docs/key-management.md`):**
+  - Eliminated plaintext `self._seal_key` from `export_shared_handle()` output strings. The 64-byte hex HMAC seal key is now packed into 11 dedicated process-wide `nox.atomic.AtomicInt` memory cells (`_shared_key_cells`), and the exported handle string contains **only numeric atomic handle IDs** (`lock_h|seq_h|ver_h|len_h|alive_h|key_cell_handles|data_cell_handles`).
+  - Added and exported `redact_shared_handle(handle_str: str) -> str` returning `"KeyRingSharedHandle([REDACTED])"` to prevent capability token leakage in diagnostic logs.
+  - Documented the explicit in-process capability token security model and lifecycle contract in `docs/threat-model.md` and `docs/key-management.md`.
+- **UTF-8 Byte-Exact Canonical Serialization & Atomic Word Packing (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Upgraded `_lp(val: str)`, `_CanonCursor.next_str()`, `_pack_shared_words()`, and `_unpack_shared_words()` to use `nox.strings.byte_len()`, `nox.strings.byte_at()`, and `nox.strings.char_from_byte()` instead of codepoint-counting `len(s)` and `ord()`/`chr()`.
+  - Verified in **Test 13** (`tests/concurrency_keyring_test.nox`) that multi-byte UTF-8 characters (e.g., Turkish `kid="k-ğüşiöç-İĞÜŞİÖÇ-01"` / `"k-ğüşiöç-İĞÜŞİÖÇ-02"` and Greek/Turkish `trust_domain="kiracı-güvenlik-αβγ"`) serialize, hash, pack into 6-byte `AtomicInt` words, unpack across OS threads, and deserialize with 100% lossless byte-exact fidelity.
+- **Configurable Shared State Capacity & Atomic Key Compaction (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Updated `export_shared_handle(max_words: int = 512) -> str` to support configurable shared atomic capacity from `64` up to `8192` words (`49,152` bytes).
+  - Added `KeyRing.purge_expired_keys(current_time_sec: int, expected_version: int = -1) -> int` to atomically compact long-running keyrings by pruning `STATE_RETIRED`, `STATE_REVOKED`, and expired `STATE_VERIFY_ONLY` (`retire_at > 0 and current_time_sec >= retire_at`) keys under the Seqlock + CAS protocol (**Test 14b**).
+- **Deterministic Shared State Memory Zeroization & Use-After-Free Guard (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added `_shared_alive: nox.atomic.AtomicBool` and `zeroize_shared_state(self) -> None` to `KeyRing`.
+  - Calling `zeroize_shared_state()` or `free_shared_handle()` acquires the writer lock, overwrites every cell in `_shared_cells` and `_shared_key_cells` with `0`, sets `_shared_len.store(0)`, and flips `_shared_alive.store(False)`.
+  - Any subsequent read, write, or attach operation on a zeroized shared handle fails closed immediately with `ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")` (**Test 14c**).
+- **RFC 3986 / RFC 4291 / RFC 6890 Standard Test Vector Differential Verification (`tests/ip_fuzz_property_test.nox`):**
+  - Added **Property 6** verifying canonical RFC 4291 / RFC 6890 / RFC 6052 / RFC 6666 IPv6 test vectors (including compressed, uncompressed, and mixed IPv4-embedded forms) against `nox.url.parse` bracketed host extraction, `verify_resolved_ip`, and `is_safe_jwks_url`.
+- **Persisted JSON Benchmark Artifacts in CI (`tests/benchmark_keyring_test.nox`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`):**
+  - `tests/benchmark_keyring_test.nox` now exports structured latency metrics to `benchmark-results.json`, which is uploaded as a GitHub Actions build artifact (`actions/upload-artifact@v4`) across Linux, macOS, and Windows runners.
+
 ## [1.0.7] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL VII Architecture Audit)
