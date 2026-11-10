@@ -599,5 +599,5 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `./scripts/test-isolated-consumer.sh` çalıştırıldı ve başarıyla doğrulandı.
 - [x] `nox.json` versiyonu `1.0.4` yapıldı.
 - [x] `CHANGELOG.md` dosyasına `v1.0.4` sürüm notları eklendi.
-- [ ] Git commit, `v1.0.4` git tag push ve `noxc publish` çalıştır.
-- [ ] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+- [x] Git commit, `v1.0.4` git tag push ve `noxc publish` çalıştırıldı (`published: cipher updated in the registry as @mburakmmm`).
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığı ve `Cipher v1.0.4` GitHub Release'inin yayınlandığı doğrulandı.
