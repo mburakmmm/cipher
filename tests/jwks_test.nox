@@ -1,0 +1,54 @@
+import nox.test
+from errors import ConfigurationError, KeyUnavailableError, UnknownKeyError
+from jwk import JwkKey
+from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks
+
+# 1. SSRF Protection Tests
+nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://localhost/.well-known/jwks.json"), "localhost must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://127.0.0.1/jwks"), "127.0.0.1 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://169.254.169.254/latest/meta-data"), "AWS/GCP metadata must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://10.0.0.5/jwks"), "RFC 1918 10.0.0.0/8 must be rejected")
+nox.test.assert_true(not is_safe_jwks_url("https://192.168.1.50/jwks"), "RFC 1918 192.168.0.0/16 must be rejected")
+nox.test.assert_true(is_safe_jwks_url("https://auth.company.org/.well-known/jwks.json"), "Valid public HTTPS URL allowed")
+
+# Whitelist host check
+nox.test.assert_true(not is_safe_jwks_url("https://evil.org/jwks", allowed_host="auth.company.org"), "Non-whitelisted host rejected")
+nox.test.assert_true(is_safe_jwks_url("https://auth.company.org/jwks", allowed_host="auth.company.org"), "Whitelisted host allowed")
+
+# 2. JWKS Parsing and Key Retrieval
+rsa_jwks: str = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"k-2026-rsa\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\",\"alg\":\"RS256\"}]}"
+
+source: JwksKeySource = JwksKeySource("https://auth.company.org/jwks", cache_ttl_sec=300, stale_grace_sec=1200)
+source.feed_jwks(rsa_jwks, timestamp_sec=1700000000)
+
+# Retrieve key when cache is fresh (at 1700000100 <= 1700000300)
+k1: JwkKey = source.get_key("k-2026-rsa", current_time_sec=1700000100)
+nox.test.assert_eq_str(k1.kid, "k-2026-rsa", "Retrieved key kid matches")
+
+# 3. Cache Stale Tolerance during Outage (at 1700000500 > ttl but <= 1700001500)
+k_stale: JwkKey = source.get_key("k-2026-rsa", current_time_sec=1700000500)
+nox.test.assert_eq_str(k_stale.kid, "k-2026-rsa", "Stale key successfully returned during grace window")
+
+# Cache expired past stale window (at 1700002000 > 1700001500)
+expired_cache_failed: bool = False
+try:
+    source.get_key("k-2026-rsa", current_time_sec=1700002000)
+except KeyUnavailableError:
+    expired_cache_failed = True
+nox.test.assert_true(expired_cache_failed, "Expired cache past grace window rejected with KeyUnavailableError")
+
+# 4. Negative Caching against Fetch Storms
+source_fresh: JwksKeySource = JwksKeySource("https://auth.company.org/jwks", cache_ttl_sec=300)
+source_fresh.feed_jwks(rsa_jwks, timestamp_sec=1700000000)
+
+# First unknown kid lookup fails with UnknownKeyError and records negative cache
+unknown_failed: bool = False
+try:
+    source_fresh.get_key("unknown-hacker-kid", current_time_sec=1700000010)
+except UnknownKeyError:
+    unknown_failed = True
+nox.test.assert_true(unknown_failed, "Unknown kid fails with UnknownKeyError")
+
+# Subsequent lookup is blocked immediately by negative cache
+nox.test.assert_true(source_fresh.is_in_negative_cache("unknown-hacker-kid"), "Unknown kid is negative-cached")

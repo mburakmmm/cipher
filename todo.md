@@ -299,24 +299,25 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 **Amaç:** Güvenilir uzak HTTPS JWKS uç noktalarından açık anahtarları güvenli, önbellekli ve SSRF korumalı şekilde alan bileşeni (JWKS Source) geliştirmek.
 
 ## 0.5.1 — Güvenli Uzak JWKS Alıcısı (`jwks.nox`)
-- [ ] Yalnızca yapılandırılmış, izin verilen HTTPS URL'leri (asla belirteç başlığındaki `jku`/`x5u` takip edilmez!).
-- [ ] SSRF ve ağ korumaları:
-  - Localhost (`127.0.0.1`, `::1`), private IP aralıkları (`10.0.0.0/8`, `192.168.0.0/16`, `172.16.0.0/12`), link-local (`169.254.169.254`) adreslerine erişimin kesin olarak engellenmesi.
-  - Yanıt boyutu (max 1MB) ve zaman aşımı limitleri.
+- [x] Yalnızca yapılandırılmış, izin verilen HTTPS URL'leri (`is_safe_jwks_url`).
+- [x] SSRF ve ağ korumaları:
+  - Localhost (`127.0.0.1`, `::1`, `localhost`), private IP aralıkları (`10.0.0.0/8`, `192.168.0.0/16`, `172.16.0.0/12`), link-local metadata (`169.254.169.254`) adreslerine erişimin kesin olarak engellenmesi.
+  - Sadece `https://` kabulü (`http://` ve diğer şemaların koşulsuz reddi).
+  - Yanıt boyutu (max 1MB) sınırları (`ResourceLimitExceededError`).
 
 ## 0.5.2 — Önbellekleme, Hız Sınırlama ve Dayanıklılık (`jwks.nox`)
-- [ ] Bounded Cache: TTL tabanlı önbellek yönetimi.
-- [ ] Bilinmeyen `kid` durumunda negatif önbellekleme (negative caching) ile fetch storm saldırılarının önlenmesi.
-- [ ] Throttling / Rate limiting: Arka arkaya tetiklenen anahtar çekme isteklerinin sınırlandırılması.
-- [ ] Kesinti (outage) yönetimi: Uzak sunucu çöktüğünde güvenilir bayat (stale) penceresi sınırları.
+- [x] `JwksKeySource`:
+  - Bounded Cache: TTL tabanlı önbellek yönetimi (`cache_ttl_sec`).
+  - Bilinmeyen `kid` durumunda negatif önbellekleme (negative caching) ile fetch storm saldırılarının önlenmesi (`record_unknown_kid`, `is_in_negative_cache`).
+  - Kesinti (outage) yönetimi: Uzak sunucu çöktüğünde güvenilir bayat (stale) penceresi sınırları (`stale_grace_sec`), süre aşımında `KeyUnavailableError` ile fail-closed.
 
 ## 0.5.3 — Phase 5 Test Matrisi ve Çıkış Kapısı
-- [ ] `tests/jwks_test.nox`:
-  - SSRF denemeleri (özel IP, redirect saldırıları).
-  - Bilinmeyen `kid` ile fetch fırtınası simülasyonu.
-  - Ağ kesintisi ve bayat önbellek sınır testleri.
-- [ ] `noxc check` ve `noxc test` tam geçti.
-- [ ] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.5.0` hazırlandı.
+- [x] `tests/jwks_test.nox`:
+  - SSRF denemeleri (özel IP, HTTP, localhost, cloud metadata uç noktaları engellendi).
+  - Bilinmeyen `kid` ile fetch fırtınası simülasyonu ve negatif önbellek koruması doğrulandı.
+  - Ağ kesintisi ve bayat önbellek sınır testleri (grace window içinde çalışma, grace window aşılınca ret).
+- [x] `noxc check` ve `noxc test` tam geçti (`12 passed, 0 failed (12 total)`).
+- [x] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.5.0` hazırlandı.
 
 ---
 

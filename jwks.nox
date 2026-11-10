@@ -1,0 +1,161 @@
+# Cipher — Secure Remote JWKS Source and Resilient Key Discovery
+# Strict SSRF controls, TTL-bounded caching, negative caching, and outage stale-window limits.
+
+import nox.strings
+import nox.time
+from errors import ConfigurationError, KeyUnavailableError, ResourceLimitExceededError, UnknownKeyError
+from jwk import JwkKey, parse_jwk
+from json_strict import get_field_value, has_field, is_object, parse_strict_json
+
+MAX_JWKS_RESPONSE_BYTES: int = 1048576  # 1 MB maximum JWKS payload
+
+def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
+    # 1. Mandatory HTTPS scheme
+    if not nox.strings.starts_with(url, "https://"):
+        return False
+    
+    # Extract host part after https://
+    without_scheme: str = nox.strings.replace(url, "https://", "")
+    parts: list[str] = nox.strings.split(without_scheme, "/")
+    host_port: str = parts[0]
+    host_parts: list[str] = nox.strings.split(host_port, ":")
+    host: str = host_parts[0]
+
+    # 2. Reject localhost and loopback
+    if host == "localhost" or host == "127.0.0.1" or host == "::1" or host == "0.0.0.0":
+        return False
+    
+    # 3. Reject cloud metadata endpoints
+    if host == "169.254.169.254" or host == "metadata.google.internal":
+        return False
+    
+    # 4. Reject RFC 1918 Private IPv4 ranges
+    if nox.strings.starts_with(host, "10."):
+        return False
+    if nox.strings.starts_with(host, "192.168."):
+        return False
+    if nox.strings.starts_with(host, "172.16.") or nox.strings.starts_with(host, "172.17.") or nox.strings.starts_with(host, "172.18.") or nox.strings.starts_with(host, "172.31."):
+        return False
+
+    # 5. Whitelisted host matching (if configured)
+    if allowed_host != "":
+        if host != allowed_host:
+            return False
+
+    return True
+
+def parse_jwks(jwks_json: str) -> list[JwkKey]:
+    byte_count: int = nox.strings.byte_len(jwks_json)
+    if byte_count > MAX_JWKS_RESPONSE_BYTES:
+        raise ResourceLimitExceededError("JWKS response exceeds 1MB limit")
+    
+    v: JsonValue = parse_strict_json(jwks_json)
+    if not is_object(v):
+        raise ConfigurationError("JWKS payload must be a JSON object")
+    
+    if not has_field(v, "keys"):
+        raise ConfigurationError("JWKS missing required 'keys' array")
+    
+    keys_val: JsonValue = get_field_value(v, "keys")
+    if keys_val.kind != 4:
+        raise ConfigurationError("'keys' member must be a JSON array")
+    
+    out: list[JwkKey] = []
+    i: int = 0
+    n: int = len(keys_val.arr)
+    while i < n:
+        raw_key: JsonValue = keys_val.arr[i]
+        # dump individual JWK back to string for strict parse_jwk validation
+        raw_key_json: str = nox.json.dump(raw_key)
+        k: JwkKey = parse_jwk(raw_key_json)
+        out.append(k)
+        i = i + 1
+    
+    return out
+
+class JwksKeySource:
+    configured_url: str
+    allowed_host: str
+    cache_ttl_sec: int
+    stale_grace_sec: int
+    min_retry_interval_sec: int
+    keys: list[JwkKey]
+    negative_cache_kids: list[str]
+    last_fetched_at: int
+    last_failed_at: int
+
+    def __init__(self, configured_url: str, allowed_host: str = "",
+                 cache_ttl_sec: int = 300, stale_grace_sec: int = 3600,
+                 min_retry_interval_sec: int = 15) -> None:
+        if not is_safe_jwks_url(configured_url, allowed_host):
+            raise ConfigurationError("Insecure or disallowed JWKS URL: " + configured_url)
+        
+        self.configured_url = configured_url
+        self.allowed_host = allowed_host
+        self.cache_ttl_sec = cache_ttl_sec
+        self.stale_grace_sec = stale_grace_sec
+        self.min_retry_interval_sec = min_retry_interval_sec
+        self.keys = []
+        self.negative_cache_kids = []
+        self.last_fetched_at = 0
+        self.last_failed_at = 0
+
+    def feed_jwks(self, jwks_json: str, timestamp_sec: int) -> None:
+        parsed: list[JwkKey] = parse_jwks(jwks_json)
+        self.keys = parsed
+        self.last_fetched_at = timestamp_sec
+        # Clear negative cache upon fresh successful fetch
+        self.negative_cache_kids = []
+
+    def mark_outage(self, timestamp_sec: int) -> None:
+        self.last_failed_at = timestamp_sec
+
+    def is_cache_fresh(self, now: int) -> bool:
+        if self.last_fetched_at == 0:
+            return False
+        return now <= self.last_fetched_at + self.cache_ttl_sec
+
+    def is_stale_acceptable(self, now: int) -> bool:
+        if self.last_fetched_at == 0:
+            return False
+        return now <= self.last_fetched_at + self.cache_ttl_sec + self.stale_grace_sec
+
+    def is_in_negative_cache(self, kid: str) -> bool:
+        i: int = 0
+        n: int = len(self.negative_cache_kids)
+        while i < n:
+            if self.negative_cache_kids[i] == kid:
+                return True
+            i = i + 1
+        return False
+
+    def record_unknown_kid(self, kid: str) -> None:
+        if not self.is_in_negative_cache(kid):
+            self.negative_cache_kids.append(kid)
+
+    def get_key(self, kid: str, current_time_sec: int = 0) -> JwkKey:
+        now: int = current_time_sec
+        if now <= 0:
+            now = nox.time.now_ms() // 1000
+
+        # Negative cache defense against unknown kid fetch storm
+        if self.is_in_negative_cache(kid):
+            raise UnknownKeyError("Key is negative-cached as non-existent: " + kid)
+
+        # Check cache validity
+        if not self.is_cache_fresh(now):
+            if not self.is_stale_acceptable(now):
+                raise KeyUnavailableError("JWKS cache expired and stale grace window exceeded")
+
+        # Search for key
+        i: int = 0
+        n: int = len(self.keys)
+        while i < n:
+            k: JwkKey = self.keys[i]
+            if k.kid == kid:
+                return k
+            i = i + 1
+        
+        # Record into negative cache to prevent fetch storm
+        self.record_unknown_kid(kid)
+        raise UnknownKeyError("Key identifier not found in JWKS: " + kid)
