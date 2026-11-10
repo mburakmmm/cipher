@@ -1,6 +1,6 @@
 {
   "name": "cipher",
-  "version": "0.1.0-dev",
-  "entry": "examples/hs256_spike.nox",
+  "version": "1.0.0",
+  "entry": "examples/sentinel_adapter.nox",
   "requires": []
 }

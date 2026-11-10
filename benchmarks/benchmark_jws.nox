@@ -1,0 +1,30 @@
+# Cipher — JWS HS256 Micro-Benchmark
+
+import nox.time
+from jws import VerificationProfile, VerifiedJws, sign_hs256, verify_hs256
+
+secret: str = "benchmark-secret-key-material-at-least-32-bytes"
+payload: str = "{\"sub\":\"benchmark_user\",\"roles\":[\"admin\",\"auditor\"],\"active\":true}"
+profile: VerificationProfile = VerificationProfile(["HS256"], "bench-k")
+
+iterations: int = 1000
+
+# Benchmark Signing
+start_sign_ms: int = nox.time.now_ms()
+i: int = 0
+last_token: str = ""
+while i < iterations:
+    last_token = sign_hs256(payload, secret, kid="bench-k")
+    i = i + 1
+elapsed_sign_ms: int = nox.time.now_ms() - start_sign_ms
+
+# Benchmark Verification
+start_verif_ms: int = nox.time.now_ms()
+j: int = 0
+while j < iterations:
+    v: VerifiedJws = verify_hs256(last_token, secret, profile)
+    j = j + 1
+elapsed_verif_ms: int = nox.time.now_ms() - start_verif_ms
+
+print("JWS Sign iterations: " + str(iterations) + " in " + str(elapsed_sign_ms) + " ms")
+print("JWS Verify iterations: " + str(iterations) + " in " + str(elapsed_verif_ms) + " ms")

@@ -1,0 +1,54 @@
+# Cipher — Sentinel Architecture Boundary Example
+# Demonstrates strict separation: Valid Cryptographic Signature != Authorized Access
+
+import nox.test
+from claims import ClaimsProfile
+from jws import VerificationProfile
+from jwt import VerifiedJwt, encode_jwt_hs256, verify_jwt_hs256
+
+# Simulated Sentinel Policy Engine
+class SentinelSecurityPolicy:
+    required_role: str
+    required_tenant: str
+
+    def __init__(self, required_role: str, required_tenant: str) -> None:
+        self.required_role = required_role
+        self.required_tenant = required_tenant
+
+    def authorize_request(self, verified_jwt: VerifiedJwt) -> bool:
+        # Cipher verified signature & standard claims.
+        # Sentinel NOW decides authentication identity & authorization policy:
+        token_role: str = verified_jwt.claims.get_string_claim("role", default_val="")
+        token_tenant: str = verified_jwt.claims.get_string_claim("tenant_id", default_val="")
+
+        if token_tenant != self.required_tenant:
+            # Denied by Sentinel policy
+            return False
+        
+        if token_role != self.required_role:
+            # Denied by Sentinel policy
+            return False
+
+        return True
+
+# Scenario 1: Valid signature, but INSUFFICIENT PERMISSIONS (Denial by Sentinel)
+secret: str = "sentinel-master-secret-key-at-least-32-bytes"
+# Validly signed token for a read-only viewer
+viewer_claims: str = "{\"iss\":\"https://auth.enterprise.local\",\"sub\":\"user_789\",\"tenant_id\":\"tenant_corp\",\"role\":\"viewer\",\"exp\":2000000000}"
+token_viewer: str = encode_jwt_hs256(viewer_claims, secret, kid="k-2026")
+
+# 1. Cipher verifies cryptographic integrity
+verif_prof: VerificationProfile = VerificationProfile(["HS256"], "k-2026")
+claims_prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.enterprise.local", clock_time_sec=1700000000)
+
+verified_viewer: VerifiedJwt = verify_jwt_hs256(token_viewer, secret, verif_prof, claims_prof)
+print("Cipher Fact: Token signature is cryptographically VALID!")
+
+# 2. Sentinel evaluates authorization policy for an admin endpoint
+admin_policy: SentinelSecurityPolicy = SentinelSecurityPolicy(required_role="admin", required_tenant="tenant_corp")
+is_authorized: bool = admin_policy.authorize_request(verified_viewer)
+
+if not is_authorized:
+    print("Sentinel Decision: Request DENIED (403 Forbidden). Signature was valid, but authorization failed!")
+else:
+    print("Sentinel Decision: Request ALLOWED.")

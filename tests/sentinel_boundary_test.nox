@@ -1,0 +1,37 @@
+import nox.test
+from claims import ClaimsProfile
+from jws import VerificationProfile
+from jwt import VerifiedJwt, encode_jwt_hs256, verify_jwt_hs256
+
+class SentinelPolicy:
+    required_role: str
+    required_tenant: str
+
+    def __init__(self, required_role: str, required_tenant: str) -> None:
+        self.required_role = required_role
+        self.required_tenant = required_tenant
+
+    def is_access_granted(self, verified_jwt: VerifiedJwt) -> bool:
+        tenant: str = verified_jwt.claims.get_string_claim("tenant_id", default_val="")
+        role: str = verified_jwt.claims.get_string_claim("role", default_val="")
+        if tenant != self.required_tenant:
+            return False
+        if role != self.required_role:
+            return False
+        return True
+
+secret: str = "sentinel-master-secret-key-at-least-32-bytes"
+claims_json: str = "{\"iss\":\"https://auth.enterprise.local\",\"sub\":\"user_789\",\"tenant_id\":\"corp\",\"role\":\"guest\",\"exp\":2000000000}"
+token: str = encode_jwt_hs256(claims_json, secret, kid="k-1")
+
+# Cipher verification
+v_prof: VerificationProfile = VerificationProfile(["HS256"], "k-1")
+c_prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.enterprise.local", clock_time_sec=1700000000)
+verified: VerifiedJwt = verify_jwt_hs256(token, secret, v_prof, c_prof)
+
+# Cipher proves cryptographic integrity
+nox.test.assert_eq_str(verified.algorithm, "HS256", "Signature verified")
+
+# Sentinel denies because guest != admin
+policy: SentinelPolicy = SentinelPolicy(required_role="admin", required_tenant="corp")
+nox.test.assert_true(not policy.is_access_granted(verified), "Sentinel must deny access despite valid cryptographic signature")
