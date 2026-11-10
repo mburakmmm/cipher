@@ -1,0 +1,96 @@
+# Cipher — Key Reference and State Machine Contracts
+# Five-stage lifecycle: PREPARED -> ACTIVE_SIGNING -> VERIFY_ONLY -> RETIRED -> REVOKED
+
+import nox.strings
+import nox.time
+from errors import ConfigurationError, InvalidKeyError
+
+# Lifecycle state constants
+STATE_PREPARED: str = "PREPARED"
+STATE_ACTIVE_SIGNING: str = "ACTIVE_SIGNING"
+STATE_VERIFY_ONLY: str = "VERIFY_ONLY"
+STATE_RETIRED: str = "RETIRED"
+STATE_REVOKED: str = "REVOKED"
+
+class KeyRef:
+    kid: str
+    algorithm: str
+    use: str
+    state: str
+    trust_domain: str
+    secret_material: str
+    activated_at: int
+    retire_at: int
+
+    def __init__(self, kid: str, algorithm: str, secret_material: str,
+                 trust_domain: str = "default", use: str = "sig",
+                 state: str = "PREPARED", activated_at: int = 0,
+                 retire_at: int = 0) -> None:
+        if kid == "":
+            raise InvalidKeyError("Key kid cannot be empty")
+        if algorithm == "":
+            raise InvalidKeyError("Key algorithm cannot be empty")
+        if secret_material == "":
+            raise InvalidKeyError("Key secret_material cannot be empty")
+        
+        self.kid = kid
+        self.algorithm = algorithm
+        self.use = use
+        self.state = state
+        self.trust_domain = trust_domain
+        self.secret_material = secret_material
+        self.activated_at = activated_at
+        self.retire_at = retire_at
+
+    def can_sign(self) -> bool:
+        return self.state == STATE_ACTIVE_SIGNING and self.use == "sig"
+
+    def can_verify(self, current_time_sec: int = 0) -> bool:
+        if self.state == STATE_REVOKED:
+            return False
+        if self.state == STATE_RETIRED:
+            return False
+        if self.state == STATE_ACTIVE_SIGNING:
+            return True
+        if self.state == STATE_VERIFY_ONLY:
+            if self.retire_at > 0:
+                now: int = current_time_sec
+                if now <= 0:
+                    now = nox.time.now_ms() // 1000
+                if now > self.retire_at:
+                    return False
+            return True
+        return False
+
+    def transition_to(self, new_state: str) -> None:
+        # Terminal state: REVOKED can never transition
+        if self.state == STATE_REVOKED:
+            raise ConfigurationError("Revoked key cannot transition to any other state")
+        
+        # Valid state transitions
+        if new_state == STATE_REVOKED:
+            self.state = STATE_REVOKED
+            return
+        
+        if self.state == STATE_PREPARED:
+            if new_state == STATE_ACTIVE_SIGNING:
+                self.state = STATE_ACTIVE_SIGNING
+                return
+            raise ConfigurationError("PREPARED key can only transition to ACTIVE_SIGNING or REVOKED")
+        
+        if self.state == STATE_ACTIVE_SIGNING:
+            if new_state == STATE_VERIFY_ONLY:
+                self.state = STATE_VERIFY_ONLY
+                return
+            raise ConfigurationError("ACTIVE_SIGNING key can only transition to VERIFY_ONLY or REVOKED")
+        
+        if self.state == STATE_VERIFY_ONLY:
+            if new_state == STATE_RETIRED:
+                self.state = STATE_RETIRED
+                return
+            raise ConfigurationError("VERIFY_ONLY key can only transition to RETIRED or REVOKED")
+        
+        if self.state == STATE_RETIRED:
+            raise ConfigurationError("RETIRED key cannot transition back to active use")
+        
+        raise ConfigurationError("Unknown state transition from " + self.state + " to " + new_state)

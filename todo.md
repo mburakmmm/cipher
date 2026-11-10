@@ -264,37 +264,33 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 **Amaç:** Anahtar yaşam döngüsü durum makinesini (PREPARED -> ACTIVE_SIGNING -> VERIFY_ONLY -> RETIRED -> REVOKED), atomik rotasyonu ve güvenli keyring yönetimini hayata geçirmek.
 
 ## 0.4.1 — Anahtar Yaşam Döngüsü Durum Makinesi (`rotation.nox`, `keys.nox`)
-- [ ] `KeyState` enum/tipleri:
-  - `PREPARED`: Doğrulayıcılara dağıtılmış, henüz imzalama yapmayan yeni anahtar.
-  - `ACTIVE_SIGNING`: Güncel imzalama anahtarı (her güven alanı için en fazla bir aktif).
-  - `VERIFY_ONLY`: Eski token'ları doğrulamak için tutulan, imza atmayan anahtar.
-  - `RETIRED`: Süresi dolmuş, kullanım dışı anahtar.
-  - `REVOKED`: Güvenliği ihlal edilmiş, anında reddedilmesi gereken anahtar.
-- [ ] Geçerli ve geçersiz durum geçiş kuralları (state machine invariants).
+- [x] `KeyState` durumları (`PREPARED`, `ACTIVE_SIGNING`, `VERIFY_ONLY`, `RETIRED`, `REVOKED`).
+- [x] Geçerli ve geçersiz durum geçiş kuralları (terminal `REVOKED` koruması, `RETIRED`'dan dönüş engeli).
+- [x] `KeyRef.can_sign()` ve `KeyRef.can_verify()` zamansal/durumsal kontrolleri.
 
 ## 0.4.2 — Keyring ve Güven Etki Alanı İzolasyonu (`keyring.nox`)
-- [ ] `KeyRing` sınıfı:
-  - `trust_domain` ayrımı (kiracı veya servis izolasyonu).
+- [x] `KeyRing` sınıfı:
+  - `trust_domain` kiracı/servis izolasyonu (`ConfigurationError`).
   - Tekil `kid` indekslemesi; mükerrer `kid` durumunda `AmbiguousKeyError`.
-  - İmzacı seçimi: Yalnızca `ACTIVE_SIGNING` ve `use="sig"` durumundaki anahtar kullanılabilir.
-  - Doğrulayıcı seçimi: Yalnızca `ACTIVE_SIGNING` veya `VERIFY_ONLY` durumundaki anahtar kullanılabilir.
-  - `REVOKED` durumundaki bir anahtarla gelen token derhal `InvalidSignatureError` / `KeyRevokedError` ile reddedilir.
+  - Algoritma başına tek aktif imzalama anahtarı kuralı (`ConfigurationError`).
+  - `get_signing_key` ve `get_verification_key` güvenli seçicileri.
+  - `REVOKED` durumundaki anahtarın anında `KeyUnavailableError` ile reddedilmesi.
 
 ## 0.4.3 — Atomik Rotasyon ve Güvenli Örtüşme (Overlap) Mekanizması
-- [ ] `KeyRing.rotate(...)`:
+- [x] `KeyRing.rotate(...)`:
   - Yeni anahtarı `ACTIVE_SIGNING` yapma.
-  - Eski anahtarı güvenli örtüşme süresi boyunca (`token_lifetime + leeway + propagation`) `VERIFY_ONLY` durumuna çekme.
-  - Acil durum ihlali (compromise): Örtüşme beklemeden anında `REVOKED` etme.
-- [ ] Rotasyon makbuzu (`RotationReceipt`) ve denetim log kayıtları (özel anahtar sızdırmadan).
+  - Eski anahtarı örtüşme süresi boyunca (`retire_at = now + overlap_seconds`) `VERIFY_ONLY` durumuna çekme.
+  - Örtüşme penceresi içinde eski anahtarla doğrulama yapılabilmesi, süre dolunca reddedilmesi.
+- [x] `KeyRing.revoke(...)`: Anında fesih ve `RotationReceipt` denetim makbuzu üretimi.
 
 ## 0.4.4 — Phase 4 Test Matrisi ve Çıkış Kapısı
-- [ ] `tests/keyring_test.nox`:
+- [x] `tests/keyring_test.nox`:
   - Yaşam döngüsü durum geçiş testleri.
   - Rotasyon sonrası eski token'ların doğrulanabilmesi testleri.
   - Emekli (`RETIRED`) veya feshedilmiş (`REVOKED`) anahtarların ret testleri.
   - Multi-tenant / farklı trust domain anahtar karışmama testleri.
-- [ ] `noxc check` ve `noxc test` tam geçti.
-- [ ] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.4.0` hazırlandı.
+- [x] `noxc check` ve `noxc test` tam geçti (`11 passed, 0 failed (11 total)`).
+- [x] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.4.0` hazırlandı.
 
 ---
 

@@ -1,0 +1,16 @@
+# Cipher — Key Rotation Contracts and Audit Receipts
+
+class RotationReceipt:
+    old_kid: str
+    new_kid: str
+    overlap_seconds: int
+    rotated_at: int
+    trust_domain: str
+
+    def __init__(self, old_kid: str, new_kid: str, overlap_seconds: int,
+                 rotated_at: int, trust_domain: str) -> None:
+        self.old_kid = old_kid
+        self.new_kid = new_kid
+        self.overlap_seconds = overlap_seconds
+        self.rotated_at = rotated_at
+        self.trust_domain = trust_domain

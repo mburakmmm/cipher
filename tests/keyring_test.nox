@@ -1,0 +1,100 @@
+import nox.test
+from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError
+from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
+from keyring import KeyRing
+from rotation import RotationReceipt
+
+# 1. KeyRef state machine transitions
+key1: KeyRef = KeyRef("k1", "HS256", "secret-key-1-at-least-32-bytes-long", state="PREPARED")
+nox.test.assert_true(not key1.can_sign(), "PREPARED cannot sign")
+
+key1.transition_to(STATE_ACTIVE_SIGNING)
+nox.test.assert_true(key1.can_sign(), "ACTIVE_SIGNING can sign")
+
+key1.transition_to(STATE_VERIFY_ONLY)
+nox.test.assert_true(not key1.can_sign(), "VERIFY_ONLY cannot sign")
+nox.test.assert_true(key1.can_verify(), "VERIFY_ONLY can verify")
+
+# Negative: Invalid transition from RETIRED back to ACTIVE_SIGNING
+key1.transition_to(STATE_RETIRED)
+retired_transition_failed: bool = False
+try:
+    key1.transition_to(STATE_ACTIVE_SIGNING)
+except ConfigurationError:
+    retired_transition_failed = True
+nox.test.assert_true(retired_transition_failed, "Cannot transition from RETIRED back to active")
+
+# Revocation is permanent
+key1.transition_to(STATE_REVOKED)
+revoked_transition_failed: bool = False
+try:
+    key1.transition_to(STATE_PREPARED)
+except ConfigurationError:
+    revoked_transition_failed = True
+nox.test.assert_true(revoked_transition_failed, "REVOKED is terminal state")
+
+# 2. KeyRing trust domain & single active signer checks
+ring: KeyRing = KeyRing(trust_domain="tenant-a")
+
+# Negative: Cross-tenant key rejection
+foreign_key: KeyRef = KeyRef("k-foreign", "HS256", "secret-foreign-32-bytes-long", trust_domain="tenant-b")
+cross_tenant_rejected: bool = False
+try:
+    ring.add_key(foreign_key)
+except ConfigurationError:
+    cross_tenant_rejected = True
+nox.test.assert_true(cross_tenant_rejected, "Cross-tenant key rejected by KeyRing")
+
+# Add primary active key
+active_key: KeyRef = KeyRef("k-active-1", "HS256", "primary-secret-32-bytes-minimum", trust_domain="tenant-a", state="ACTIVE_SIGNING")
+ring.add_key(active_key)
+
+# Negative: Duplicate kid rejection
+dup_key: KeyRef = KeyRef("k-active-1", "HS256", "another-secret-32-bytes-minimum", trust_domain="tenant-a", state="PREPARED")
+dup_rejected: bool = False
+try:
+    ring.add_key(dup_key)
+except AmbiguousKeyError:
+    dup_rejected = True
+nox.test.assert_true(dup_rejected, "Duplicate kid rejected with AmbiguousKeyError")
+
+# Negative: Second active signer for same algorithm rejected
+second_active: KeyRef = KeyRef("k-active-2", "HS256", "second-secret-32-bytes-minimum", trust_domain="tenant-a", state="ACTIVE_SIGNING")
+dual_active_rejected: bool = False
+try:
+    ring.add_key(second_active)
+except ConfigurationError:
+    dual_active_rejected = True
+nox.test.assert_true(dual_active_rejected, "Dual active signers rejected for same algorithm")
+
+# 3. Atomic key rotation with bounded overlap
+new_key: KeyRef = KeyRef("k-active-2", "HS256", "second-secret-32-bytes-minimum", trust_domain="tenant-a", state="PREPARED")
+receipt: RotationReceipt = ring.rotate(new_key, overlap_seconds=3600, clock_time_sec=1700000000)
+
+nox.test.assert_eq_str(receipt.old_kid, "k-active-1", "Old key recorded in receipt")
+nox.test.assert_eq_str(receipt.new_kid, "k-active-2", "New key recorded in receipt")
+
+# Verify new key is now active signer
+current_signer: KeyRef = ring.get_signing_key("HS256")
+nox.test.assert_eq_str(current_signer.kid, "k-active-2", "New key is now active signer")
+
+# Verify old key can still verify during overlap (at 1700001000 < 1700003600)
+old_key_verif: KeyRef = ring.get_verification_key("k-active-1", current_time_sec=1700001000)
+nox.test.assert_eq_str(old_key_verif.kid, "k-active-1", "Old key verifies during overlap window")
+
+# Verify old key fails verification past overlap (at 1700005000 > 1700003600)
+past_overlap_rejected: bool = False
+try:
+    ring.get_verification_key("k-active-1", current_time_sec=1700005000)
+except KeyUnavailableError:
+    past_overlap_rejected = True
+nox.test.assert_true(past_overlap_rejected, "Expired overlap key rejected with KeyUnavailableError")
+
+# 4. Immediate revocation
+ring.revoke("k-active-2")
+revoked_check_failed: bool = False
+try:
+    ring.get_verification_key("k-active-2")
+except KeyUnavailableError:
+    revoked_check_failed = True
+nox.test.assert_true(revoked_check_failed, "Revoked key immediately rejected")
