@@ -1,0 +1,79 @@
+import nox.test
+from claims import Claims, ClaimsProfile, parse_claims, validate_claims
+from errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
+
+# Mock time reference: 1700000000
+now: int = 1700000000
+
+# 1. Positive: Valid temporal claims
+valid_payload: str = "{\"iss\":\"https://auth.example.com\",\"aud\":[\"api://users\",\"api://orders\"],\"exp\":1700003600,\"nbf\":1699990000,\"iat\":1699999000,\"sub\":\"user_99\"}"
+c: Claims = parse_claims(valid_payload)
+
+prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.example.com", leeway_seconds=10, clock_time_sec=now)
+prof.with_audience("api://users").with_required_claim("sub")
+
+validate_claims(c, prof)
+nox.test.assert_eq_str(c.iss, "https://auth.example.com", "iss matches")
+nox.test.assert_eq_str(c.sub, "user_99", "sub matches")
+nox.test.assert_eq_int(len(c.aud), 2, "2 audiences")
+
+# 2. Negative: Expired token
+expired_payload: str = "{\"exp\":1699999990,\"sub\":\"user_1\"}"
+c_exp: Claims = parse_claims(expired_payload)
+prof_exp: ClaimsProfile = ClaimsProfile(clock_time_sec=now, leeway_seconds=5)
+
+exp_rejected: bool = False
+try:
+    validate_claims(c_exp, prof_exp)
+except ExpiredTokenError:
+    exp_rejected = True
+nox.test.assert_true(exp_rejected, "Expired token must be rejected with ExpiredTokenError")
+
+# 3. Positive: Expired but within leeway
+prof_leeway: ClaimsProfile = ClaimsProfile(clock_time_sec=now, leeway_seconds=15)
+# exp is 1699999990, now is 1700000000 (difference 10s <= leeway 15s)
+validate_claims(c_exp, prof_leeway)
+
+# 4. Negative: Not yet valid (nbf constraint)
+future_nbf_payload: str = "{\"exp\":1700010000,\"nbf\":1700000100,\"sub\":\"user_1\"}"
+c_nbf: Claims = parse_claims(future_nbf_payload)
+nbf_rejected: bool = False
+try:
+    validate_claims(c_nbf, prof)
+except NotYetValidError:
+    nbf_rejected = True
+nox.test.assert_true(nbf_rejected, "Future nbf token rejected with NotYetValidError")
+
+# 5. Negative: Issuer mismatch
+prof_wrong_iss: ClaimsProfile = ClaimsProfile(expected_issuer="https://wrong-issuer.com", clock_time_sec=now)
+iss_rejected: bool = False
+try:
+    validate_claims(c, prof_wrong_iss)
+except InvalidIssuerError:
+    iss_rejected = True
+nox.test.assert_true(iss_rejected, "Issuer mismatch rejected with InvalidIssuerError")
+
+# 6. Negative: Audience mismatch
+prof_wrong_aud: ClaimsProfile = ClaimsProfile(clock_time_sec=now).with_audience("api://payments")
+aud_rejected: bool = False
+try:
+    validate_claims(c, prof_wrong_aud)
+except InvalidAudienceError:
+    aud_rejected = True
+nox.test.assert_true(aud_rejected, "Audience mismatch rejected with InvalidAudienceError")
+
+# 7. Positive: Single string audience
+single_aud_payload: str = "{\"aud\":\"api://single\",\"exp\":1700010000}"
+c_single_aud: Claims = parse_claims(single_aud_payload)
+prof_single: ClaimsProfile = ClaimsProfile(clock_time_sec=now).with_audience("api://single")
+validate_claims(c_single_aud, prof_single)
+nox.test.assert_eq_str(c_single_aud.aud[0], "api://single", "Single audience string parsed correctly")
+
+# 8. Negative: Missing required claim
+prof_req: ClaimsProfile = ClaimsProfile(clock_time_sec=now).with_required_claim("custom_org_id")
+req_rejected: bool = False
+try:
+    validate_claims(c, prof_req)
+except InvalidClaimsError:
+    req_rejected = True
+nox.test.assert_true(req_rejected, "Missing required claim rejected with InvalidClaimsError")

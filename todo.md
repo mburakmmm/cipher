@@ -174,58 +174,53 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 **Amaç:** RFC 7519 / RFC 8725 JWT claims profili doğrulamasını, zamansal/kimlik kontrollerini ve itsdangerous benzeri amaca bağlı imzalı opak belirteçleri (Signed Tokens) eklemek.
 
 ## 0.2.1 — Claims Profili ve Yapılandırma (`claims.nox`)
-- [ ] `ClaimsProfile` veri modeli:
-  - `expected_issuer: str` (opsiyonel / zorunlu).
-  - `accepted_audiences: list[str]` (opsiyonel / zorunlu).
-  - `required_claims: list[str]`.
-  - `leeway_seconds: int` (saat sapması toleransı, varsayılan 0-60 sn).
+- [x] `ClaimsProfile` veri modeli:
+  - `expected_issuer: str` (birebir eşleşme).
+  - `accepted_audiences: list[str]` (builder: `with_audience`).
+  - `required_claims: list[str]` (builder: `with_required_claim`).
+  - `leeway_seconds: int` (saat sapması toleransı).
   - `max_age_seconds: int` (azami belirteç ömrü).
   - `require_exp: bool` (varsayılan True).
-  - `expected_typ: str` (örn. `"JWT"`).
+  - `clock_time_sec: int` (deterministik test zaman enjeksiyonu).
 
 ## 0.2.2 — Zamansal ve Semantik Doğrulamalar (`claims.nox`)
-- [ ] `exp` (Expiration Time) doğrulaması:
-  - `exp <= now - leeway` durumunda `ExpiredTokenError`.
-  - Negatif veya taşan değerlerin reddi.
-- [ ] `nbf` (Not Before) doğrulaması:
-  - `nbf > now + leeway` durumunda `NotYetValidError`.
-- [ ] `iat` (Issued At) doğrulaması:
-  - Gelecekte basılmış belirteç kontrolü (`iat > now + leeway`).
-  - `max_age` aşımı kontrolü (`now - iat > max_age + leeway`).
-- [ ] `iss` (Issuer) tam dize eşleşmesi kontrolü.
-- [ ] `aud` (Audience) doğrulaması (tekil string veya array desteği, eşleşmeme durumunda `InvalidAudienceError`).
+- [x] `exp` (Expiration Time) doğrulaması (`ExpiredTokenError`).
+- [x] `nbf` (Not Before) doğrulaması (`NotYetValidError`).
+- [x] `iat` (Issued At) doğrulaması (gelecek zaman damgası ve `max_age` kontrolleri).
+- [x] `iss` (Issuer) tam dize eşleşmesi kontrolü (`InvalidIssuerError`).
+- [x] `aud` (Audience) doğrulaması (tekil string veya array desteği, `InvalidAudienceError`).
+- [x] `required_claims` tam varlık denetimi (`InvalidClaimsError`).
 
 ## 0.2.3 — Doğrulanmış Tipler Ayrımı (`jwt.nox`)
-- [ ] `VerifiedJwt` sınıfı:
-  - Yalnızca başarılı imza VE claims doğrulaması sonrası üretilebilir.
+- [x] `VerifiedJwt` sınıfı:
+  - Yalnızca başarılı imza VE claims doğrulaması sonrası üretilir.
   - Doğrulanmış payload, claims sözlüğü, kid, algorithm, issuer, audience.
   - Asla yetkilendirme (Sentinel) tipine örtük dönüştürülemez.
-- [ ] `UnverifiedJwt` sınıfı:
-  - Yalnızca hata ayıklama ve güvenilmeyen teşhis amaçlı.
-  - Verified tipleriyle hiçbir miras bağı veya ortak metod paylaşmaz.
-- [ ] `JwtIssuer` ve `JwtVerifier` kamu API'leri.
+- [x] `UnverifiedJwt` sınıfı:
+  - Yalnızca teşhis ve güvenilmeyen inceleme amaçlı.
+  - `VerifiedJwt` ile hiçbir miras ve ortak fonksiyon paylaşmaz.
+- [x] `JwtIssuer` ve `JwtVerifier` kamu motorları.
 
 ## 0.2.4 — Amaca Bağlı İmzalı Opak Belirteçler (`signed_token.nox`)
-- [ ] JWT olmayan, itsdangerous tarzı kompakt belirteç mekanizması.
-- [ ] Alan ayrımı (Domain Separation) formatı:
-  - `version: 1 byte` + `purpose: string` + `issued_at: int64` + `ttl: int64` + `key_id: string` + `payload_bytes`.
-- [ ] HMAC-SHA256 ile imzalama ve sabit zamanlı doğrulama.
-- [ ] Amaç uyuşmazlığında (`purpose mismatch`) kesin ret.
-- [ ] Süre aşımında (`ttl expired`) kesin ret.
-- [ ] Şifreli olmadığını (gizlilik sağlamadığını) açıkça belirten dokümantasyon ve API sözleşmesi.
+- [x] JWT olmayan, itsdangerous tarzı kompakt belirteç mekanizması (`cip_opk_v1` öneki).
+- [x] Alan ayrımı (Domain Separation) formatı:
+  - `"CIPHER-TOKEN-V1:" + purpose + ":" + issued_at + ":" + ttl + ":" + kid + ":" + payload_b64`.
+- [x] HMAC-SHA256 ile imzalama ve sabit zamanlı doğrulama.
+- [x] Amaç uyuşmazlığında (`InvalidClaimsError`) ve süre aşımında (`ExpiredTokenError`) kesin ret.
+- [x] Şifreli olmadığını (gizlilik sağlamadığını) açıkça belirten dokümantasyon ve sözleşme.
 
 ## 0.2.5 — Phase 2 Test Matrisi ve Çıkış Kapısı
-- [ ] `tests/claims_test.nox`:
+- [x] `tests/claims_test.nox`:
   - Zaman sınırları (`now - 1`, `now`, `now + 1`, `leeway` sınırları).
   - Eksik zorunlu claim testleri (`exp` eksikliği vb.).
   - Audience array ve string eşleşme varyasyonları.
-- [ ] `tests/jwt_test.nox`:
+- [x] `tests/jwt_test.nox`:
   - Tam döngü (encode -> verify -> inspect) testleri.
   - `VerifiedJwt` ve `UnverifiedJwt` ayrım testleri.
-- [ ] `tests/signed_token_test.nox`:
-  - Amaç uyuşmazlığı, süre aşımı, değiştirilmiş veri ve anahtar uyuşmazlığı testleri.
-- [ ] `noxc check` ve `noxc test` tam geçti.
-- [ ] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.2.0` hazırlandı.
+- [x] `tests/signed_token_test.nox`:
+  - Amaç uyuşmazlığı, süre aşımı, değiştirilmiş veri ve format bozukluğu testleri.
+- [x] `noxc check` ve `noxc test` tam geçti (`8 passed, 0 failed (8 total)`).
+- [x] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.2.0` hazırlandı.
 
 ---
 

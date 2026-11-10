@@ -1,0 +1,46 @@
+import nox.test
+from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError
+from signed_token import issue_signed_token, verify_signed_token
+
+secret: str = "opaque-token-signing-key-minimum-32-bytes-long"
+payload: str = "user_id=12345&action=reset_password"
+purpose: str = "password_reset"
+
+# 1. Issue and verify
+token: str = issue_signed_token(payload, purpose, secret, ttl_seconds=300)
+verified_payload: str = verify_signed_token(token, purpose, secret)
+nox.test.assert_eq_str(verified_payload, payload, "Verified payload matches original")
+
+# 2. Negative: Purpose mismatch rejection
+wrong_purpose_failed: bool = False
+try:
+    verify_signed_token(token, "email_verification", secret)
+except InvalidClaimsError:
+    wrong_purpose_failed = True
+nox.test.assert_true(wrong_purpose_failed, "Purpose mismatch must be rejected with InvalidClaimsError")
+
+# 3. Negative: Expired token rejection
+expired_failed: bool = False
+try:
+    # Clock injected into far future
+    verify_signed_token(token, purpose, secret, clock_time_sec=2500000000)
+except ExpiredTokenError:
+    expired_failed = True
+nox.test.assert_true(expired_failed, "Expired signed token must be rejected with ExpiredTokenError")
+
+# 4. Negative: Tampered signature rejection
+tampered_token: str = token + "corrupt"
+tamper_failed: bool = False
+try:
+    verify_signed_token(tampered_token, purpose, secret)
+except InvalidSignatureError:
+    tamper_failed = True
+nox.test.assert_true(tamper_failed, "Tampered signature rejected with InvalidSignatureError")
+
+# 5. Negative: Invalid token prefix or format
+prefix_failed: bool = False
+try:
+    verify_signed_token("jwt.like.token", purpose, secret)
+except MalformedTokenError:
+    prefix_failed = True
+nox.test.assert_true(prefix_failed, "Malformed signed token prefix rejected with MalformedTokenError")

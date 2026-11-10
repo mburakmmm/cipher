@@ -1,0 +1,47 @@
+import nox.test
+from claims import ClaimsProfile
+from errors import ExpiredTokenError, InvalidSignatureError
+from jws import VerificationProfile
+from jwt import UnverifiedJwt, VerifiedJwt, decode_unverified_jwt, encode_jwt_hs256, verify_jwt_hs256
+
+secret: str = "super-secret-jwt-signing-key-at-least-32-bytes"
+claims_json: str = "{\"iss\":\"https://auth.company.org\",\"sub\":\"user_alpha_7\",\"aud\":\"api://service\",\"exp\":2000000000,\"iat\":1700000000}"
+
+# 1. Encode JWT
+token: str = encode_jwt_hs256(claims_json, secret, kid="k-2026")
+
+# 2. Verify with valid profiles
+algs: list[str] = ["HS256"]
+verif_prof: VerificationProfile = VerificationProfile(algs, "k-2026")
+claims_prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.company.org", clock_time_sec=1700000000)
+claims_prof.with_audience("api://service").with_required_claim("sub")
+
+verified: VerifiedJwt = verify_jwt_hs256(token, secret, verif_prof, claims_prof)
+nox.test.assert_eq_str(verified.claims.sub, "user_alpha_7", "Verified subject matches")
+nox.test.assert_eq_str(verified.claims.iss, "https://auth.company.org", "Verified issuer matches")
+nox.test.assert_eq_str(verified.algorithm, "HS256", "Algorithm matches HS256")
+nox.test.assert_eq_str(verified.kid, "k-2026", "Key ID matches")
+
+# 3. Diagnostic unverified decode
+unverified: UnverifiedJwt = decode_unverified_jwt(token)
+nox.test.assert_eq_str(unverified.claims.sub, "user_alpha_7", "Unverified claims sub readable for diagnostics")
+nox.test.assert_eq_str(unverified.header.alg, "HS256", "Unverified header alg readable")
+
+# 4. Negative: Expired JWT verification failure
+claims_prof_future: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.company.org", clock_time_sec=2000000001)
+claims_prof_future.with_audience("api://service")
+
+expired_failed: bool = False
+try:
+    verify_jwt_hs256(token, secret, verif_prof, claims_prof_future)
+except ExpiredTokenError:
+    expired_failed = True
+nox.test.assert_true(expired_failed, "Expired JWT rejected during verification")
+
+# 5. Negative: Invalid secret leads to InvalidSignatureError
+bad_secret_failed: bool = False
+try:
+    verify_jwt_hs256(token, "wrong-secret-key-at-least-32-bytes-long", verif_prof, claims_prof)
+except InvalidSignatureError:
+    bad_secret_failed = True
+nox.test.assert_true(bad_secret_failed, "Invalid secret rejected with InvalidSignatureError")

@@ -1,0 +1,99 @@
+# Cipher — Purpose-Bound Signed Opaque Tokens (itsdangerous-style)
+# Domain-separated, purpose-bound tokens preventing cross-application token substitution.
+# NOTE: Signed does NOT mean encrypted. Payloads are integrity-protected but visible.
+
+import nox.strings
+import nox.time
+from encoding import decode_base64url, encode_base64url
+from errors import ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError
+from provider import CryptoProvider, DefaultCryptoProvider
+
+TOKEN_PREFIX: str = "cip_opk_v1"
+
+class SignedTokenIssuer:
+    provider: CryptoProvider
+
+    def __init__(self) -> None:
+        self.provider = DefaultCryptoProvider()
+
+    def with_provider(self, provider: CryptoProvider) -> SignedTokenIssuer:
+        self.provider = provider
+        return self
+
+    def issue(self, payload: str, purpose: str, secret: str, ttl_seconds: int,
+              kid: str = "default") -> str:
+        if purpose == "":
+            raise InvalidClaimsError("Purpose cannot be empty")
+        if ttl_seconds <= 0:
+            raise InvalidClaimsError("TTL must be positive")
+        
+        now_sec: int = nox.time.now_ms() // 1000
+        purpose_b64: str = encode_base64url(purpose)
+        kid_b64: str = encode_base64url(kid)
+        payload_b64: str = encode_base64url(payload)
+        
+        # Unambiguous domain-separated signing input
+        signing_input: str = "CIPHER-TOKEN-V1:" + purpose + ":" + str(now_sec) + ":" + str(ttl_seconds) + ":" + kid + ":" + payload_b64
+        sig_raw: str = self.provider.sign_hmac_sha256(secret, signing_input)
+        sig_b64: str = encode_base64url(sig_raw)
+        
+        return TOKEN_PREFIX + "." + purpose_b64 + "." + str(now_sec) + "." + str(ttl_seconds) + "." + kid_b64 + "." + payload_b64 + "." + sig_b64
+
+class SignedTokenVerifier:
+    provider: CryptoProvider
+
+    def __init__(self) -> None:
+        self.provider = DefaultCryptoProvider()
+
+    def with_provider(self, provider: CryptoProvider) -> SignedTokenVerifier:
+        self.provider = provider
+        return self
+
+    def verify(self, token: str, expected_purpose: str, secret: str,
+               clock_time_sec: int = 0) -> str:
+        parts: list[str] = nox.strings.split(token, ".")
+        # Format: prefix.purpose_b64.issued_at.ttl.kid_b64.payload_b64.sig_b64 (7 parts)
+        if len(parts) != 7:
+            raise MalformedTokenError("Signed token must have exactly 7 dot-separated segments")
+        
+        if parts[0] != TOKEN_PREFIX:
+            raise MalformedTokenError("Invalid signed token prefix: expected " + TOKEN_PREFIX)
+        
+        purpose: str = decode_base64url(parts[1])
+        if purpose != expected_purpose:
+            raise InvalidClaimsError("Token purpose mismatch: got '" + purpose + "', expected '" + expected_purpose + "'")
+        
+        issued_at: int = int(parts[2])
+        ttl: int = int(parts[3])
+        kid: str = decode_base64url(parts[4])
+        payload_b64: str = parts[5]
+        sig_b64: str = parts[6]
+        
+        # Check expiration
+        now: int = clock_time_sec
+        if now <= 0:
+            now = nox.time.now_ms() // 1000
+        
+        if now > issued_at + ttl:
+            raise ExpiredTokenError("Signed token has expired")
+        
+        # Verify HMAC signature over domain-separated signing input
+        signing_input: str = "CIPHER-TOKEN-V1:" + purpose + ":" + str(issued_at) + ":" + str(ttl) + ":" + kid + ":" + payload_b64
+        sig_raw: str = decode_base64url(sig_b64)
+        
+        is_valid: bool = self.provider.verify_hmac_sha256(secret, signing_input, sig_raw)
+        if not is_valid:
+            raise InvalidSignatureError("Signed token signature mismatch")
+        
+        return decode_base64url(payload_b64)
+
+# Ergonomic helper functions
+def issue_signed_token(payload: str, purpose: str, secret: str, ttl_seconds: int,
+                        kid: str = "default") -> str:
+    issuer: SignedTokenIssuer = SignedTokenIssuer()
+    return issuer.issue(payload, purpose, secret, ttl_seconds, kid)
+
+def verify_signed_token(token: str, expected_purpose: str, secret: str,
+                        clock_time_sec: int = 0) -> str:
+    verifier: SignedTokenVerifier = SignedTokenVerifier()
+    return verifier.verify(token, expected_purpose, secret, clock_time_sec)

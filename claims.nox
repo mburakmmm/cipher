@@ -1,0 +1,180 @@
+# Cipher — JWT Claims Validation and Profile Engine (RFC 7519 / RFC 8725)
+# Enforces strict temporal boundaries, issuer/audience matches, and duplicate-safe claims parsing.
+
+import nox.strings
+import nox.time
+from errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
+from json_strict import get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
+
+class ClaimsProfile:
+    expected_issuer: str
+    accepted_audiences: list[str]
+    required_claims: list[str]
+    leeway_seconds: int
+    max_age_seconds: int
+    require_exp: bool
+    clock_time_sec: int
+
+    def __init__(self, expected_issuer: str = "", leeway_seconds: int = 0,
+                 max_age_seconds: int = 0, require_exp: bool = True,
+                 clock_time_sec: int = 0) -> None:
+        if leeway_seconds < 0:
+            raise InvalidClaimsError("Clock leeway cannot be negative")
+        if max_age_seconds < 0:
+            raise InvalidClaimsError("max_age_seconds cannot be negative")
+        self.expected_issuer = expected_issuer
+        self.accepted_audiences = []
+        self.required_claims = []
+        self.leeway_seconds = leeway_seconds
+        self.max_age_seconds = max_age_seconds
+        self.require_exp = require_exp
+        self.clock_time_sec = clock_time_sec
+
+    def with_audience(self, aud: str) -> ClaimsProfile:
+        self.accepted_audiences.append(aud)
+        return self
+
+    def with_required_claim(self, claim: str) -> ClaimsProfile:
+        self.required_claims.append(claim)
+        return self
+
+    def get_current_time(self) -> int:
+        if self.clock_time_sec > 0:
+            return self.clock_time_sec
+        return nox.time.now_ms() // 1000
+
+class Claims:
+    iss: str
+    sub: str
+    aud: list[str]
+    exp: int
+    nbf: int
+    iat: int
+    jti: str
+    raw_json: str
+    json_val: JsonValue
+
+    def __init__(self, iss: str, sub: str, aud: list[str], exp: int, nbf: int,
+                 iat: int, jti: str, raw_json: str, json_val: JsonValue) -> None:
+        self.iss = iss
+        self.sub = sub
+        self.aud = aud
+        self.exp = exp
+        self.nbf = nbf
+        self.iat = iat
+        self.jti = jti
+        self.raw_json = raw_json
+        self.json_val = json_val
+
+    def has_claim(self, key: str) -> bool:
+        return has_field(self.json_val, key)
+
+    def get_string_claim(self, key: str, default_val: str = "") -> str:
+        return get_string_field(self.json_val, key, default_val=default_val, required=False)
+
+    def get_int_claim(self, key: str, default_val: int = 0) -> int:
+        return get_int_field(self.json_val, key, default_val=default_val, required=False)
+
+def _parse_audience_field(v: JsonValue) -> list[str]:
+    out: list[str] = []
+    if not has_field(v, "aud"):
+        return out
+    aud_val: JsonValue = get_field_value(v, "aud")
+    # If aud is a single string (RFC 7519 §4.1.3)
+    if aud_val.kind == 3:
+        out.append(aud_val.s)
+        return out
+    # If aud is an array of strings
+    if aud_val.kind == 4:
+        i: int = 0
+        n: int = len(aud_val.arr)
+        while i < n:
+            item: JsonValue = aud_val.arr[i]
+            if item.kind != 3:
+                raise InvalidClaimsError("All audience array elements must be strings")
+            out.append(item.s)
+            i = i + 1
+        return out
+    raise InvalidClaimsError("The 'aud' claim must be either a string or an array of strings")
+
+def parse_claims(raw_json: str) -> Claims:
+    v: JsonValue = parse_strict_json(raw_json)
+    if not is_object(v):
+        raise InvalidClaimsError("JWT payload must be a JSON object")
+
+    iss: str = get_string_field(v, "iss", default_val="", required=False)
+    sub: str = get_string_field(v, "sub", default_val="", required=False)
+    jti: str = get_string_field(v, "jti", default_val="", required=False)
+    aud: list[str] = _parse_audience_field(v)
+    
+    exp: int = get_int_field(v, "exp", default_val=-1, required=False)
+    nbf: int = get_int_field(v, "nbf", default_val=-1, required=False)
+    iat: int = get_int_field(v, "iat", default_val=-1, required=False)
+
+    return Claims(iss, sub, aud, exp, nbf, iat, jti, raw_json, v)
+
+def validate_claims(token_claims: Claims, profile: ClaimsProfile) -> None:
+    now: int = profile.get_current_time()
+    leeway: int = profile.leeway_seconds
+
+    # 1. exp validation
+    if profile.require_exp:
+        if token_claims.exp < 0:
+            raise InvalidClaimsError("Missing required 'exp' expiration claim")
+    
+    if token_claims.exp >= 0:
+        if token_claims.exp < 0:
+            raise InvalidClaimsError("Expiration time 'exp' cannot be negative")
+        if now >= token_claims.exp + leeway:
+            raise ExpiredTokenError("Token expired at " + str(token_claims.exp) + " (current: " + str(now) + ")")
+
+    # 2. nbf validation
+    if token_claims.nbf >= 0:
+        if now < token_claims.nbf - leeway:
+            raise NotYetValidError("Token not valid before " + str(token_claims.nbf) + " (current: " + str(now) + ")")
+
+    # 3. iat validation
+    if token_claims.iat >= 0:
+        if token_claims.iat > now + leeway:
+            raise InvalidClaimsError("Token issued in the future (iat=" + str(token_claims.iat) + ", current=" + str(now) + ")")
+        if profile.max_age_seconds > 0:
+            if now - token_claims.iat > profile.max_age_seconds + leeway:
+                raise ExpiredTokenError("Token age exceeds maximum allowed age of " + str(profile.max_age_seconds) + " seconds")
+
+    # 4. iss (issuer) validation
+    if profile.expected_issuer != "":
+        if token_claims.iss == "":
+            raise InvalidIssuerError("Token missing 'iss' claim (expected: " + profile.expected_issuer + ")")
+        if token_claims.iss != profile.expected_issuer:
+            raise InvalidIssuerError("Issuer mismatch: got '" + token_claims.iss + "', expected '" + profile.expected_issuer + "'")
+
+    # 5. aud (audience) validation
+    num_expected_aud: int = len(profile.accepted_audiences)
+    if num_expected_aud > 0:
+        num_token_aud: int = len(token_claims.aud)
+        if num_token_aud == 0:
+            raise InvalidAudienceError("Token missing 'aud' claim")
+        matched: bool = False
+        i: int = 0
+        while i < num_expected_aud:
+            target_aud: str = profile.accepted_audiences[i]
+            j: int = 0
+            while j < num_token_aud:
+                if token_claims.aud[j] == target_aud:
+                    matched = True
+                    break
+                j = j + 1
+            if matched:
+                break
+            i = i + 1
+        if not matched:
+            raise InvalidAudienceError("No matching audience found in accepted list")
+
+    # 6. required_claims validation
+    req_len: int = len(profile.required_claims)
+    k: int = 0
+    while k < req_len:
+        req_key: str = profile.required_claims[k]
+        if not token_claims.has_claim(req_key):
+            raise InvalidClaimsError("Token missing required claim: " + req_key)
+        k = k + 1

@@ -1,0 +1,93 @@
+# Cipher — Standards-Compliant JSON Web Token (JWT) Implementation (RFC 7519 / RFC 8725)
+# Explicit trust context, strict claims profile validation, and verified vs unverified separation.
+
+import nox.strings
+from claims import Claims, ClaimsProfile, parse_claims, validate_claims
+from encoding import decode_base64url
+from errors import MalformedTokenError
+from jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header
+
+class VerifiedJwt:
+    claims: Claims
+    header: ProtectedHeader
+    raw_token: str
+    raw_signing_input: str
+    algorithm: str
+    kid: str
+
+    def __init__(self, claims: Claims, header: ProtectedHeader,
+                 raw_token: str, raw_signing_input: str) -> None:
+        self.claims = claims
+        self.header = header
+        self.raw_token = raw_token
+        self.raw_signing_input = raw_signing_input
+        self.algorithm = header.alg
+        self.kid = header.kid
+
+class UnverifiedJwt:
+    header: ProtectedHeader
+    claims: Claims
+    raw_token: str
+
+    def __init__(self, header: ProtectedHeader, claims: Claims, raw_token: str) -> None:
+        self.header = header
+        self.claims = claims
+        self.raw_token = raw_token
+
+class JwtIssuer:
+    signer: JwsSigner
+
+    def __init__(self) -> None:
+        self.signer = JwsSigner()
+
+    def with_signer(self, signer: JwsSigner) -> JwtIssuer:
+        self.signer = signer
+        return self
+
+    def encode_hs256(self, claims_json: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
+        # Sign payload using strict JWS HS256 engine
+        return self.signer.sign_hs256(claims_json, secret, kid, typ)
+
+class JwtVerifier:
+    jws_verifier: JwsVerifier
+
+    def __init__(self) -> None:
+        self.jws_verifier = JwsVerifier()
+
+    def with_jws_verifier(self, verifier: JwsVerifier) -> JwtVerifier:
+        self.jws_verifier = verifier
+        return self
+
+    def verify_hs256(self, token: str, secret: str,
+                     verification_profile: VerificationProfile,
+                     claims_profile: ClaimsProfile) -> VerifiedJwt:
+        # Step 1: Cryptographic signature and compact header verification
+        verified_jws: VerifiedJws = self.jws_verifier.verify_hs256(token, secret, verification_profile)
+        
+        # Step 2: Parse and strictly validate claims profile
+        claims: Claims = parse_claims(verified_jws.payload)
+        validate_claims(claims, claims_profile)
+        
+        return VerifiedJwt(claims, verified_jws.header, token, verified_jws.raw_signing_input)
+
+# Ergonomic helper functions
+def encode_jwt_hs256(claims_json: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
+    issuer: JwtIssuer = JwtIssuer()
+    return issuer.encode_hs256(claims_json, secret, kid, typ)
+
+def verify_jwt_hs256(token: str, secret: str,
+                      verification_profile: VerificationProfile,
+                      claims_profile: ClaimsProfile) -> VerifiedJwt:
+    verifier: JwtVerifier = JwtVerifier()
+    return verifier.verify_hs256(token, secret, verification_profile, claims_profile)
+
+# Explicitly unsafe diagnostic decode (no verification!)
+def decode_unverified_jwt(token: str) -> UnverifiedJwt:
+    parts: list[str] = nox.strings.split(token, ".")
+    if len(parts) != 3:
+        raise MalformedTokenError("JWT must contain exactly 3 dot-separated segments")
+    header_json: str = decode_base64url(parts[0])
+    payload_json: str = decode_base64url(parts[1])
+    header: ProtectedHeader = parse_protected_header(header_json)
+    claims: Claims = parse_claims(payload_json)
+    return UnverifiedJwt(header, claims, token)
