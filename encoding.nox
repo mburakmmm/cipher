@@ -4,7 +4,7 @@
 from nox.base64 import Base64Error
 import nox.base64
 import nox.strings
-from errors import EncodingError, ResourceLimitExceededError
+from cipher.errors import EncodingError, ResourceLimitExceededError
 
 MAX_SEGMENT_BYTES: int = 65536  # 64 KB maximum for a single compact JWS segment
 

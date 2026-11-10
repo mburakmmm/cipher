@@ -4,6 +4,26 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-11-10
+
+### Fixed & Hardened (Technical SOL V Architecture Audit)
+- **Hardware-Backed Atomic CAS & Writer Mutex in `KeyRing` (`keyring.nox`, `nox.atomic`):**
+  - Replaced check-then-act version comparisons with genuine CPU-level atomic primitives (`_write_lock: nox.atomic.AtomicBool` and `_atomic_version: nox.atomic.AtomicInt` backed by `nox_atomic_cas`).
+  - `_commit_state()` acquires the hardware writer mutex (`_write_lock.compare_and_swap(False, True)`) and executes an atomic compare-and-swap on the version cell (`_atomic_version.compare_and_swap(base_ver, base_ver + 1)`), eliminating the T1-T6 race window between concurrent writers and proving zero lost updates at the hardware level.
+  - Verified with both deterministic contention tests and a 4-thread parallel OS worker stress test (`nox.thread.start`) in `tests/concurrency_keyring_test.nox`.
+- **Deep `KeyRingState` Immutability & Removal of Mutable Alias (`keyring.nox`):**
+  - Removed the `self.keys` compatibility alias from `KeyRing` so external callers cannot retain a direct reference to internal key arrays.
+  - Encapsulated `KeyRingState` keys in `_keys: list[KeyRef]` with deep defensive cloning (`KeyRef.clone()`) on both construction and inspection (`get_keys()`, `key_count()`, `get_state()`).
+- **Decoupled IPv4/IPv6 Syntactic Parsing & SSRF Security Policy (`jwks.nox`):**
+  - Separated syntactic IP parsing (`parse_ipv4(s) -> IPv4Address`, `parse_ipv6(s) -> IPv6Address`) from SSRF policy evaluation (`is_restricted_ipv4_addr(addr)`, `is_restricted_ipv6_addr(addr)`).
+  - Fixed RFC 4291 IPv4-mapped IPv6 expansion: embedded 32-bit IPv4 suffixes (e.g. `::ffff:8.8.8.8`, `::ffff:127.0.0.1`) are parsed via `parse_ipv4` and expanded into **two** 16-bit hextets (`(o0 << 8) | o1`, `(o2 << 8) | o3`), computing `::` zero-compression across the remaining 6 hextets (`[0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808]`).
+  - Expanded IPv6 transition range protections to cover IPv4-compatible (`::/96`), IPv4-translated (`::ffff:0:0:0/96`), NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`), Teredo (`2001::/23`), and RFC 9637 documentation (`3fff::/20`).
+- **Strict Invalid IP Rejection in `verify_resolved_ip()` (`jwks.nox`, `tests/jwks_test.nox`):**
+  - `verify_resolved_ip(ip_str: str) -> bool` now enforces syntactic validity first via `parse_ipv4` / `parse_ipv6`. Any malformed IP string (e.g. `"1.2.3"`, `"127.0.0.1.5"`, `"999.999.999.999"`, `"0177.0.0.1"`, `"2001::db8::1"`, `"fe80::1%eth0"`, hostnames, or empty strings) raises `EncodingError` internally and returns `False` immediately.
+- **Native NOX Package Manager (`noxc add` + `noxc fetch`) Compatibility (`*.nox`, `scripts/test-isolated-consumer.sh`):**
+  - Standardized internal module imports to `from cipher.<module> import ...` across all library files, enabling external projects to install Cipher directly via `noxc add cipher` and `noxc fetch` without copying source files.
+  - Updated `scripts/test-isolated-consumer.sh` and CI workflows (`.github/workflows/ci.yml`, `.github/workflows/release.yml`) to execute end-to-end `noxc init`, `noxc add`, `noxc fetch`, `nox.lock` SHA verification, and consumer execution on every run.
+
 ## [1.0.4] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL IV Architecture Audit)

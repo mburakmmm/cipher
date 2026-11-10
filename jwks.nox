@@ -5,12 +5,32 @@ import nox.strings
 import nox.time
 from nox.url import URL, UrlError
 import nox.url
-from errors import ConfigurationError, KeyUnavailableError, ResourceLimitExceededError, UnknownKeyError
-from jwk import JwkKey, parse_jwk
-from json_strict import get_field_value, has_field, is_object, parse_strict_json
+from cipher.errors import ConfigurationError, EncodingError, KeyUnavailableError, ResourceLimitExceededError, UnknownKeyError
+from cipher.jwk import JwkKey, parse_jwk
+from cipher.json_strict import get_field_value, has_field, is_object, parse_strict_json
 
 MAX_JWKS_RESPONSE_BYTES: int = 1048576  # 1 MB maximum JWKS payload
 MAX_NEGATIVE_CACHE_ENTRIES: int = 256    # Maximum negative cache capacity to prevent memory exhaustion
+
+class IPv4Address:
+    o0: int
+    o1: int
+    o2: int
+    o3: int
+
+    def __init__(self, o0: int, o1: int, o2: int, o3: int) -> None:
+        self.o0 = o0
+        self.o1 = o1
+        self.o2 = o2
+        self.o3 = o3
+
+class IPv6Address:
+    hextets: list[int]
+
+    def __init__(self, hextets: list[int]) -> None:
+        if len(hextets) != 8:
+            raise EncodingError("IPv6Address requires exactly 8 16-bit hextets")
+        self.hextets = hextets
 
 def _hex_to_uint16(s: str) -> int:
     n: int = len(s)
@@ -42,197 +62,43 @@ def _substr(s: str, start: int, end: int) -> str:
         i = i + 1
     return res
 
-def _is_restricted_ipv6(host: str) -> bool:
-    clean: str = host
-    if nox.strings.starts_with(clean, "[") and nox.strings.ends_with(clean, "]"):
-        clean = nox.strings.replace(nox.strings.replace(clean, "[", ""), "]", "")
-    clean = nox.strings.lower(clean)
-
-    # Must contain at least one colon to be IPv6
-    if not nox.strings.contains(clean, ":"):
-        return False
-
-    # 1. Check for IPv4-mapped or embedded IPv4 address (e.g. ::ffff:192.168.1.1)
-    if nox.strings.contains(clean, "."):
-        last_colon: int = -1
-        c_i: int = len(clean) - 1
-        while c_i >= 0:
-            if clean[c_i] == ":":
-                last_colon = c_i
-                break
-            c_i = c_i - 1
-        if last_colon >= 0:
-            v4_part: str = _substr(clean, last_colon + 1, len(clean))
-            if _is_restricted_ipv4(v4_part):
-                return True
-            v6_prefix: str = _substr(clean, 0, last_colon + 1)
-            if v6_prefix == "::ffff:" or v6_prefix == "0:0:0:0:0:ffff:":
-                return True
-
-    # 2. Check for double colon '::'
-    double_colon_count: int = 0
-    i: int = 0
-    n: int = len(clean)
-    while i < n - 1:
-        if clean[i] == ":" and clean[i + 1] == ":":
-            double_colon_count = double_colon_count + 1
-            i = i + 1
-        i = i + 1
-    if double_colon_count > 1:
-        return True  # Invalid IPv6 format fails closed
-
-    # 3. Parse hextets with expansion of '::'
-    hextets: list[int] = []
-    if double_colon_count == 1:
-        parts: list[str] = nox.strings.split(clean, "::")
-        left_str: str = parts[0]
-        right_str: str = parts[1]
-
-        left_segs: list[str] = []
-        if left_str != "":
-            left_segs = nox.strings.split(left_str, ":")
-
-        right_segs: list[str] = []
-        if right_str != "":
-            right_segs = nox.strings.split(right_str, ":")
-
-        valid_right: list[str] = []
-        r_i: int = 0
-        while r_i < len(right_segs):
-            if not nox.strings.contains(right_segs[r_i], "."):
-                valid_right.append(right_segs[r_i])
-            r_i = r_i + 1
-
-        total_present: int = len(left_segs) + len(valid_right)
-        if total_present > 7:
-            return True  # Too many hextets fails closed
-        zeros_to_insert: int = 8 - total_present
-
-        l_idx: int = 0
-        while l_idx < len(left_segs):
-            val: int = _hex_to_uint16(left_segs[l_idx])
-            if val < 0:
-                return True
-            hextets.append(val)
-            l_idx = l_idx + 1
-
-        z_idx: int = 0
-        while z_idx < zeros_to_insert:
-            hextets.append(0)
-            z_idx = z_idx + 1
-
-        r_idx: int = 0
-        while r_idx < len(valid_right):
-            val: int = _hex_to_uint16(valid_right[r_idx])
-            if val < 0:
-                return True
-            hextets.append(val)
-            r_idx = r_idx + 1
-    else:
-        segs: list[str] = nox.strings.split(clean, ":")
-        if len(segs) != 8:
-            return True  # Invalid segment count fails closed
-        s_idx: int = 0
-        while s_idx < 8:
-            val: int = _hex_to_uint16(segs[s_idx])
-            if val < 0:
-                return True
-            hextets.append(val)
-            s_idx = s_idx + 1
-
-    if len(hextets) < 8:
-        return True
-
-    h0: int = hextets[0]
-    h1: int = hextets[1]
-    h2: int = hextets[2]
-    h3: int = hextets[3]
-    h4: int = hextets[4]
-    h5: int = hextets[5]
-    h6: int = hextets[6]
-    h7: int = hextets[7]
-
-    # Loopback (::1)
-    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0 and h6 == 0 and h7 == 1:
-        return True
-
-    # Unspecified (::)
-    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0 and h6 == 0 and h7 == 0:
-        return True
-
-    # IPv4-mapped (::ffff:0:0/96)
-    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 65535:
-        b0: int = (h6 >> 8) & 255
-        b1: int = h6 & 255
-        b2: int = (h7 >> 8) & 255
-        b3: int = h7 & 255
-        v4_syn: str = str(b0) + "." + str(b1) + "." + str(b2) + "." + str(b3)
-        if _is_restricted_ipv4(v4_syn):
-            return True
-
-    # RFC 4193 Unique Local Addresses (fc00::/7 -> 0xfc00 to 0xfdff)
-    # Bitmask: (h0 & 0xfe00) == 0xfc00 (65024, 64512)
-    if (h0 & 65024) == 64512:
-        return True
-
-    # RFC 4291 Link-Local Unicast (fe80::/10 -> 0xfe80 to 0xfebf)
-    # Bitmask: (h0 & 0xffc0) == 0xfe80 (65472, 65152)
-    if (h0 & 65472) == 65152:
-        return True
-
-    # RFC 3879 Site-Local Unicast (fec0::/10)
-    # Bitmask: (h0 & 0xffc0) == 0xfec0 (65472, 65216)
-    if (h0 & 65472) == 65216:
-        return True
-
-    # RFC 4291 Multicast (ff00::/8 -> 0xff00 to 0xffff)
-    # Bitmask: (h0 & 0xff00) == 0xff00 (65280, 65280)
-    if (h0 & 65280) == 65280:
-        return True
-
-    # RFC 6666 Discard Prefix (100::/64)
-    if h0 == 256 and h1 == 0 and h2 == 0 and h3 == 0:
-        return True
-
-    # RFC 3849 Documentation Prefix (2001:db8::/32)
-    if h0 == 8193 and h1 == 3512:
-        return True
-
-    # RFC 5180 Benchmark Prefix (2001:2::/48)
-    if h0 == 8193 and h1 == 2 and h2 == 0:
-        return True
-
-    return False
-
-def _is_restricted_ipv4(host: str) -> bool:
-    octets: list[str] = nox.strings.split(host, ".")
+def parse_ipv4(s: str) -> IPv4Address:
+    if s == "":
+        raise EncodingError("Empty IPv4 address")
+    octets: list[str] = nox.strings.split(s, ".")
     if len(octets) != 4:
-        return False
-    
-    b0: int = 0
-    b1: int = 0
-    b2: int = 0
-    b3: int = 0
-    try:
-        idx: int = 0
-        while idx < 4:
-            seg: str = octets[idx]
-            if len(seg) == 0:
-                return True
-            if len(seg) > 1 and nox.strings.starts_with(seg, "0"):
-                return True
-            idx = idx + 1
-        
-        b0 = int(octets[0])
-        b1 = int(octets[1])
-        b2 = int(octets[2])
-        b3 = int(octets[3])
-    except ValueError:
-        return True
-    
-    if b0 < 0 or b0 > 255 or b1 < 0 or b1 > 255 or b2 < 0 or b2 > 255 or b3 < 0 or b3 > 255:
-        return True
-    
+        raise EncodingError("IPv4 address must contain exactly 4 dot-separated octets")
+
+    vals: list[int] = []
+    idx: int = 0
+    while idx < 4:
+        seg: str = octets[idx]
+        seg_len: int = len(seg)
+        if seg_len == 0 or seg_len > 3:
+            raise EncodingError("Invalid IPv4 octet length")
+        # Reject leading zeros (prevents octal IP representation ambiguity)
+        if seg_len > 1 and seg[0] == "0":
+            raise EncodingError("Leading zeros not permitted in IPv4 octets")
+        val: int = 0
+        c_i: int = 0
+        while c_i < seg_len:
+            code: int = ord(seg[c_i])
+            if code < 48 or code > 57:
+                raise EncodingError("Non-digit character in IPv4 octet")
+            val = val * 10 + (code - 48)
+            c_i = c_i + 1
+        if val < 0 or val > 255:
+            raise EncodingError("IPv4 octet out of range 0..255")
+        vals.append(val)
+        idx = idx + 1
+
+    return IPv4Address(vals[0], vals[1], vals[2], vals[3])
+
+def is_restricted_ipv4_addr(addr: IPv4Address) -> bool:
+    b0: int = addr.o0
+    b1: int = addr.o1
+    b2: int = addr.o2
+
     # 1. RFC 1122 'This host / Current network' (0.0.0.0/8)
     if b0 == 0:
         return True
@@ -245,7 +111,7 @@ def _is_restricted_ipv4(host: str) -> bool:
     # 4. RFC 1122 Loopback (127.0.0.0/8)
     if b0 == 127:
         return True
-    # 5. RFC 3927 Link-Local (169.254.0.0/16)
+    # 5. RFC 3927 Link-Local / Cloud Metadata (169.254.0.0/16)
     if b0 == 169 and b1 == 254:
         return True
     # 6. RFC 1918 Private Class B (172.16.0.0/12)
@@ -263,7 +129,7 @@ def _is_restricted_ipv4(host: str) -> bool:
     # 10. RFC 1918 Private Class C (192.168.0.0/16)
     if b0 == 192 and b1 == 168:
         return True
-    # 11. RFC 2544 Network Interconnect Benchmark (198.18.0.0/15: 198.18.0.0 - 198.19.255.255)
+    # 11. RFC 2544 Network Interconnect Benchmark (198.18.0.0/15)
     if b0 == 198 and (b1 == 18 or b1 == 19):
         return True
     # 12. RFC 5737 TEST-NET-2 (198.51.100.0/24)
@@ -272,35 +138,244 @@ def _is_restricted_ipv4(host: str) -> bool:
     # 13. RFC 5737 TEST-NET-3 (203.0.113.0/24)
     if b0 == 203 and b1 == 0 and b2 == 113:
         return True
-    # 14. RFC 5771 Multicast (224.0.0.0/4)
-    if b0 >= 224 and b0 <= 239:
+    # 14. RFC 5771 Multicast (224.0.0.0/4) & RFC 1112 Reserved / Broadcast (240.0.0.0/4)
+    if b0 >= 224:
         return True
-    # 15. RFC 1112 Reserved / Limited Broadcast (240.0.0.0/4)
-    if b0 >= 240:
+
+    return False
+
+def parse_ipv6(s: str) -> IPv6Address:
+    if s == "":
+        raise EncodingError("Empty IPv6 address")
+    clean: str = s
+    if nox.strings.starts_with(clean, "["):
+        if not nox.strings.ends_with(clean, "]"):
+            raise EncodingError("Unclosed bracket in IPv6 address")
+        clean = _substr(clean, 1, len(clean) - 1)
+    elif nox.strings.ends_with(clean, "]"):
+        raise EncodingError("Unmatched closing bracket in IPv6 address")
+
+    clean = nox.strings.lower(clean)
+    n: int = len(clean)
+    if n < 2:
+        raise EncodingError("IPv6 address too short")
+
+    # Reject zone identifiers (%eth0, %25) and whitespace
+    if nox.strings.contains(clean, "%") or nox.strings.contains(clean, " "):
+        raise EncodingError("Zone identifiers and whitespace are forbidden in IPv6 addresses")
+
+    if not nox.strings.contains(clean, ":"):
+        raise EncodingError("IPv6 address must contain colons")
+
+    if nox.strings.contains(clean, ":::"):
+        raise EncodingError("Invalid triple colon ':::' in IPv6 address")
+
+    # Reject single leading or trailing colon (unless part of '::')
+    if clean[0] == ":" and clean[1] != ":":
+        raise EncodingError("IPv6 address cannot start with a single colon")
+    if clean[n - 1] == ":" and clean[n - 2] != ":":
+        raise EncodingError("IPv6 address cannot end with a single colon")
+
+    halves: list[str] = nox.strings.split(clean, "::")
+    if len(halves) > 2:
+        raise EncodingError("Multiple '::' zero-compressions are invalid in IPv6")
+
+    hextets: list[int] = []
+    if len(halves) == 2:
+        left_str: str = halves[0]
+        right_str: str = halves[1]
+
+        left_segs: list[str] = []
+        if left_str != "":
+            left_segs = nox.strings.split(left_str, ":")
+
+        right_segs: list[str] = []
+        if right_str != "":
+            right_segs = nox.strings.split(right_str, ":")
+
+        left_vals: list[int] = []
+        l_i: int = 0
+        while l_i < len(left_segs):
+            lv: int = _hex_to_uint16(left_segs[l_i])
+            if lv < 0:
+                raise EncodingError("Invalid hextet in left side of IPv6 address")
+            left_vals.append(lv)
+            l_i = l_i + 1
+
+        # Parse right segments; ONLY the final segment may be an embedded IPv4 address (contributing 2 hextets)
+        right_vals: list[int] = []
+        r_i: int = 0
+        r_len: int = len(right_segs)
+        while r_i < r_len:
+            r_seg: str = right_segs[r_i]
+            if nox.strings.contains(r_seg, "."):
+                if r_i != r_len - 1:
+                    raise EncodingError("Embedded IPv4 must be the final segment of an IPv6 address")
+                v4: IPv4Address = parse_ipv4(r_seg)
+                # RFC 4291: Embedded 32-bit IPv4 occupies exactly TWO 16-bit hextets
+                right_vals.append((v4.o0 << 8) | v4.o1)
+                right_vals.append((v4.o2 << 8) | v4.o3)
+            else:
+                rv: int = _hex_to_uint16(r_seg)
+                if rv < 0:
+                    raise EncodingError("Invalid hextet in right side of IPv6 address")
+                right_vals.append(rv)
+            r_i = r_i + 1
+
+        total_hextets: int = len(left_vals) + len(right_vals)
+        if total_hextets > 7:
+            raise EncodingError("Too many hextets in '::'-compressed IPv6 address")
+        zeros_needed: int = 8 - total_hextets
+
+        idx1: int = 0
+        while idx1 < len(left_vals):
+            hextets.append(left_vals[idx1])
+            idx1 = idx1 + 1
+        idx_z: int = 0
+        while idx_z < zeros_needed:
+            hextets.append(0)
+            idx_z = idx_z + 1
+        idx2: int = 0
+        while idx2 < len(right_vals):
+            hextets.append(right_vals[idx2])
+            idx2 = idx2 + 1
+    else:
+        segs: list[str] = nox.strings.split(clean, ":")
+        s_i: int = 0
+        s_len: int = len(segs)
+        while s_i < s_len:
+            seg_str: str = segs[s_i]
+            if nox.strings.contains(seg_str, "."):
+                if s_i != s_len - 1:
+                    raise EncodingError("Embedded IPv4 must be the final segment of an IPv6 address")
+                v4_full: IPv4Address = parse_ipv4(seg_str)
+                hextets.append((v4_full.o0 << 8) | v4_full.o1)
+                hextets.append((v4_full.o2 << 8) | v4_full.o3)
+            else:
+                sv: int = _hex_to_uint16(seg_str)
+                if sv < 0:
+                    raise EncodingError("Invalid hextet in IPv6 address")
+                hextets.append(sv)
+            s_i = s_i + 1
+
+        if len(hextets) != 8:
+            raise EncodingError("Uncompressed IPv6 address must evaluate to exactly 8 hextets")
+
+    return IPv6Address(hextets)
+
+def is_restricted_ipv6_addr(addr: IPv6Address) -> bool:
+    h0: int = addr.hextets[0]
+    h1: int = addr.hextets[1]
+    h2: int = addr.hextets[2]
+    h3: int = addr.hextets[3]
+    h4: int = addr.hextets[4]
+    h5: int = addr.hextets[5]
+    h6: int = addr.hextets[6]
+    h7: int = addr.hextets[7]
+
+    # 1. Unspecified (::/128) and Loopback (::1/128) and IPv4-Compatible (::/96, deprecated RFC 4291)
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 0:
         return True
-    
+
+    # 2. IPv4-Mapped IPv6 (::ffff:0:0/96 -> h0..h4 == 0, h5 == 0xffff)
+    # Evaluates the embedded 32-bit IPv4 address (h6, h7) against the 14 restricted IPv4 CIDRs
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 0 and h5 == 65535:
+        mapped_v4: IPv4Address = IPv4Address((h6 >> 8) & 255, h6 & 255, (h7 >> 8) & 255, h7 & 255)
+        return is_restricted_ipv4_addr(mapped_v4)
+
+    # 3. IPv4-Translated (::ffff:0:0:0/96, RFC 2765 SIIT)
+    if h0 == 0 and h1 == 0 and h2 == 0 and h3 == 0 and h4 == 65535 and h5 == 0:
+        return True
+
+    # 4. NAT64 Well-Known Prefix (64:ff9b::/96 RFC 6052) & Local-Use NAT64 (64:ff9b:1::/48 RFC 8215)
+    if h0 == 100 and h1 == 65435:
+        return True
+
+    # 5. 6to4 Tunneling (2002::/16 RFC 3056)
+    if h0 == 8194:
+        return True
+
+    # 6. RFC 4193 Unique Local Addresses (fc00::/7 -> 0xfc00 to 0xfdff)
+    # Bitmask: (h0 & 0xfe00) == 0xfc00 (65024, 64512)
+    if (h0 & 65024) == 64512:
+        return True
+
+    # 7. RFC 4291 Link-Local Unicast (fe80::/10 -> 0xfe80 to 0xfebf)
+    # Bitmask: (h0 & 0xffc0) == 0xfe80 (65472, 65152)
+    if (h0 & 65472) == 65152:
+        return True
+
+    # 8. RFC 3879 Site-Local Unicast (fec0::/10)
+    # Bitmask: (h0 & 0xffc0) == 0xfec0 (65472, 65216)
+    if (h0 & 65472) == 65216:
+        return True
+
+    # 9. RFC 4291 Multicast (ff00::/8 -> 0xff00 to 0xffff)
+    # Bitmask: (h0 & 0xff00) == 0xff00 (65280, 65280)
+    if (h0 & 65280) == 65280:
+        return True
+
+    # 10. RFC 6666 Discard-Only Prefix (100::/64)
+    if h0 == 256 and h1 == 0 and h2 == 0 and h3 == 0:
+        return True
+
+    # 11. RFC 2928 IETF Protocol Assignments & Teredo (2001::/23 -> h0 == 0x2001, (h1 & 0xfe00) == 0)
+    if h0 == 8193 and (h1 & 65024) == 0:
+        return True
+
+    # 12. RFC 3849 Documentation Prefix (2001:db8::/32) & RFC 9637 (3fff::/20)
+    if (h0 == 8193 and h1 == 3512) or (h0 == 16383 and (h1 & 61440) == 0):
+        return True
+
+    return False
+
+def _is_restricted_ipv6(host: str) -> bool:
+    try:
+        v6: IPv6Address = parse_ipv6(host)
+        return is_restricted_ipv6_addr(v6)
+    except EncodingError:
+        return True  # Invalid IPv6 syntax fails closed as restricted
+
+def _is_restricted_ipv4(host: str) -> bool:
+    try:
+        v4: IPv4Address = parse_ipv4(host)
+        return is_restricted_ipv4_addr(v4)
+    except EncodingError:
+        return True  # Invalid IPv4 syntax fails closed as restricted
+
+def _looks_like_ipv4_literal(host: str) -> bool:
+    # A host with dots whose last label starts with a digit or consists only of digits/dots
+    # cannot be a valid DNS hostname (RFC 1123 TLD cannot be numeric) and must be parsed as IPv4.
+    parts: list[str] = nox.strings.split(host, ".")
+    if len(parts) == 0:
+        return False
+    last: str = parts[len(parts) - 1]
+    if last == "":
+        return True
+    first_c: int = ord(last[0])
+    if first_c >= 48 and first_c <= 57:
+        return True
     return False
 
 def verify_resolved_ip(ip_str: str) -> bool:
-    clean_ip: str = ip_str
-    if nox.strings.starts_with(clean_ip, "[") and nox.strings.ends_with(clean_ip, "]"):
-        clean_ip = nox.strings.replace(nox.strings.replace(clean_ip, "[", ""), "]", "")
-    clean_ip = nox.strings.lower(clean_ip)
-
-    if clean_ip == "":
+    if ip_str == "":
         return False
-
-    if nox.strings.contains(clean_ip, ":"):
-        if _is_restricted_ipv6(clean_ip):
+    if nox.strings.contains(ip_str, ":"):
+        try:
+            v6: IPv6Address = parse_ipv6(ip_str)
+            if is_restricted_ipv6_addr(v6):
+                return False
+            return True
+        except EncodingError:
             return False
-        return True
-
-    if nox.strings.contains(clean_ip, "."):
-        if _is_restricted_ipv4(clean_ip):
+    else:
+        try:
+            v4: IPv4Address = parse_ipv4(ip_str)
+            if is_restricted_ipv4_addr(v4):
+                return False
+            return True
+        except EncodingError:
             return False
-        return True
-
-    return False
 
 def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
     # 1. Standard RFC 3986 URL parsing via nox.url
@@ -320,7 +395,7 @@ def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
     
     host: str = u.host
     if nox.strings.starts_with(host, "[") and nox.strings.ends_with(host, "]"):
-        host = nox.strings.replace(nox.strings.replace(host, "[", ""), "]", "")
+        host = _substr(host, 1, len(host) - 1)
     
     host = nox.strings.lower(host)
     if host == "":
@@ -330,7 +405,7 @@ def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
     if host == "localhost" or host == "0.0.0.0" or host == "metadata.google.internal":
         return False
 
-    # 5. Reject alternative hexadecimal or octal IP representations
+    # 5. Reject alternative hexadecimal IP representations
     if nox.strings.contains(host, "0x"):
         return False
     
@@ -348,14 +423,25 @@ def is_safe_jwks_url(url: str, allowed_host: str = "") -> bool:
         if is_pure_digits:
             return False
 
-    # 6. Structural IPv6 bitmask validation
+    # 6. Decoupled IPv6 syntax parsing & SSRF policy validation
     if nox.strings.contains(host, ":"):
-        if _is_restricted_ipv6(host):
+        try:
+            v6: IPv6Address = parse_ipv6(host)
+            # Disallow IPv4-mapped IPv6 literals directly in JWKS URLs or if mapped IP is restricted
+            if v6.hextets[0] == 0 and v6.hextets[1] == 0 and v6.hextets[2] == 0 and v6.hextets[3] == 0 and v6.hextets[4] == 0 and v6.hextets[5] == 65535:
+                return False
+            if is_restricted_ipv6_addr(v6):
+                return False
+        except EncodingError:
             return False
 
-    # 7. Structural IPv4 CIDR filtering (covers 14 restricted blocks including CGNAT and Benchmark)
-    if nox.strings.contains(host, "."):
-        if _is_restricted_ipv4(host):
+    # 7. Decoupled IPv4 syntax parsing & 14-CIDR SSRF policy validation
+    if nox.strings.contains(host, ".") and _looks_like_ipv4_literal(host):
+        try:
+            v4: IPv4Address = parse_ipv4(host)
+            if is_restricted_ipv4_addr(v4):
+                return False
+        except EncodingError:
             return False
 
     # 8. Whitelisted host matching (if configured)

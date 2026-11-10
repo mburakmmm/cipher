@@ -1,59 +1,104 @@
 # Cipher — KeyRing & Safe Key Lifecycle Management
-# Enforces trust domain isolation, unique kid indexing, zero dual-active signers, and atomic rotation.
+# Enforces trust domain isolation, unique kid indexing, zero dual-active signers,
+# deep snapshot immutability, and hardware-backed atomic CAS + writer mutex rotation.
 
+import nox.atomic
 import nox.strings
 import nox.time
-from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
-from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
-from rotation import RotationReceipt
+from cipher.errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
+from cipher.keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
+from cipher.rotation import RotationReceipt
 
 class KeyRingState:
     version: int
-    keys: list[KeyRef]
+    _keys: list[KeyRef]
     created_at: int
 
     def __init__(self, version: int, keys: list[KeyRef], created_at: int = 0) -> None:
         self.version = version
-        self.keys = keys
+        # Deep defensive clone on construction: caller cannot retain mutable handle to internal list or KeyRefs
+        cloned: list[KeyRef] = []
+        i: int = 0
+        n: int = len(keys)
+        while i < n:
+            cloned.append(keys[i].clone())
+            i = i + 1
+        self._keys = cloned
         self.created_at = created_at
+
+    def get_keys(self) -> list[KeyRef]:
+        # Return deep defensive clone on every inspection: external mutations never corrupt snapshot
+        snap: list[KeyRef] = []
+        i: int = 0
+        n: int = len(self._keys)
+        while i < n:
+            snap.append(self._keys[i].clone())
+            i = i + 1
+        return snap
+
+    def key_count(self) -> int:
+        return len(self._keys)
 
 class KeyRing:
     trust_domain: str
     state: KeyRingState
-    keys: list[KeyRef]  # Direct snapshot alias for backward compatibility
+    _write_lock: nox.atomic.AtomicBool
+    _atomic_version: nox.atomic.AtomicInt
 
     def __init__(self, trust_domain: str = "default") -> None:
         self.trust_domain = trust_domain
         initial_keys: list[KeyRef] = []
         self.state = KeyRingState(0, initial_keys, 0)
-        self.keys = initial_keys
+        self._write_lock = nox.atomic.new_bool(False)
+        self._atomic_version = nox.atomic.new_int(0)
 
     def get_version(self) -> int:
-        return self.state.version
+        return self._atomic_version.load()
+
+    def get_state(self) -> KeyRingState:
+        s: KeyRingState = self.state
+        return KeyRingState(s.version, s.get_keys(), s.created_at)
 
     def get_snapshot(self) -> list[KeyRef]:
-        curr_keys: list[KeyRef] = self.state.keys
-        snap: list[KeyRef] = []
-        i: int = 0
-        n: int = len(curr_keys)
-        while i < n:
-            snap.append(curr_keys[i].clone())
-            i = i + 1
-        return snap
+        return self.state.get_keys()
+
+    def acquire_write_lock(self) -> bool:
+        return self._write_lock.compare_and_swap(False, True)
+
+    def release_write_lock(self) -> None:
+        self._write_lock.store(False)
+
+    def _commit_state(self, base_ver: int, new_state: KeyRingState) -> None:
+        # 1. Hardware Atomic Writer Mutex Acquisition (nox_atomic_cas on AtomicBool)
+        if not self._write_lock.compare_and_swap(False, True):
+            raise ConfigurationError("Concurrent modification in progress: writer mutex lock contention")
+
+        # 2. Hardware Atomic Compare-And-Swap on Version (nox_atomic_cas on AtomicInt)
+        # Eliminates the T1-T6 check-then-act race window at the CPU instruction level.
+        if not self._atomic_version.compare_and_swap(base_ver, base_ver + 1):
+            self._write_lock.store(False)
+            raise ConfigurationError("Concurrent modification detected: atomic CAS version mismatch (expected " + str(base_ver) + ")")
+
+        # 3. Single-reference publication under exclusive writer mutex
+        self.state = new_state
+
+        # 4. Release Hardware Writer Mutex
+        self._write_lock.store(False)
 
     def add_key(self, key: KeyRef, expected_version: int = -1) -> None:
+        base_ver: int = self._atomic_version.load()
         base_state: KeyRingState = self.state
 
         # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and base_state.version != expected_version:
-            raise ConfigurationError("KeyRing version mismatch (CAS failed): expected " + str(expected_version) + ", current is " + str(base_state.version))
+        if expected_version >= 0 and base_ver != expected_version:
+            raise ConfigurationError("KeyRing version mismatch (CAS failed): expected " + str(expected_version) + ", current is " + str(base_ver))
 
         # Cross-tenant trust domain boundary check
         if key.trust_domain != self.trust_domain:
             raise ConfigurationError("Key trust domain mismatch: key is '" + key.trust_domain + "', keyring is '" + self.trust_domain + "'")
         
         # Unique kid enforcement
-        curr_keys: list[KeyRef] = base_state.keys
+        curr_keys: list[KeyRef] = base_state.get_keys()
         i: int = 0
         n: int = len(curr_keys)
         while i < n:
@@ -70,7 +115,7 @@ class KeyRing:
                     raise ConfigurationError("Keyring already has an active signing key for algorithm: " + key.algorithm)
                 j = j + 1
         
-        # Immutable RCU publish
+        # Prepare immutable RCU snapshot
         new_snap: list[KeyRef] = []
         k_idx: int = 0
         while k_idx < n:
@@ -78,28 +123,22 @@ class KeyRing:
             k_idx = k_idx + 1
         new_snap.append(key.clone())
 
-        # Atomic commit & lost-update detection:
-        if self.state.version != base_state.version:
-            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
-
-        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, nox.time.now_ms() // 1000)
-        self.state = new_state
-        self.keys = new_snap
+        new_state: KeyRingState = KeyRingState(base_ver + 1, new_snap, nox.time.now_ms() // 1000)
+        self._commit_state(base_ver, new_state)
 
     def get_signing_key(self, algorithm: str) -> KeyRef:
-        snap: list[KeyRef] = self.state.keys
+        snap: list[KeyRef] = self.state.get_keys()
         i: int = 0
         n: int = len(snap)
         while i < n:
             k: KeyRef = snap[i]
             if k.algorithm == algorithm and k.can_sign():
-                # Defensive cloning: Caller cannot mutate internal snapshot state
                 return k.clone()
             i = i + 1
         raise KeyUnavailableError("No active signing key available for algorithm: " + algorithm)
 
     def get_verification_key(self, kid: str, current_time_sec: int = 0) -> KeyRef:
-        snap: list[KeyRef] = self.state.keys
+        snap: list[KeyRef] = self.state.get_keys()
         i: int = 0
         n: int = len(snap)
         while i < n:
@@ -109,18 +148,18 @@ class KeyRing:
                     raise KeyUnavailableError("Key has been revoked: " + kid)
                 if not k.can_verify(current_time_sec):
                     raise KeyUnavailableError("Key is retired or past its overlap window: " + kid)
-                # Defensive cloning: Caller cannot mutate internal snapshot state
                 return k.clone()
             i = i + 1
         raise UnknownKeyError("Key not found in keyring: " + kid)
 
     def rotate(self, new_key: KeyRef, overlap_seconds: int = 3600,
                clock_time_sec: int = 0, expected_version: int = -1) -> RotationReceipt:
+        base_ver: int = self._atomic_version.load()
         base_state: KeyRingState = self.state
 
         # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and base_state.version != expected_version:
-            raise ConfigurationError("KeyRing rotation CAS failed: expected version " + str(expected_version) + ", current is " + str(base_state.version))
+        if expected_version >= 0 and base_ver != expected_version:
+            raise ConfigurationError("KeyRing rotation CAS failed: expected version " + str(expected_version) + ", current is " + str(base_ver))
 
         now: int = clock_time_sec
         if now <= 0:
@@ -131,7 +170,7 @@ class KeyRing:
             raise ConfigurationError("Key trust domain mismatch: key is '" + new_key.trust_domain + "', keyring is '" + self.trust_domain + "'")
         
         # Check duplicate kid in existing keyring
-        curr_keys: list[KeyRef] = base_state.keys
+        curr_keys: list[KeyRef] = base_state.get_keys()
         i: int = 0
         n: int = len(curr_keys)
         while i < n:
@@ -155,7 +194,7 @@ class KeyRing:
                 break
             j = j + 1
         
-        # 2. Immutable RCU Snapshot Commit phase
+        # 2. Prepare Immutable RCU Snapshot
         new_snap: list[KeyRef] = []
         k_i: int = 0
         while k_i < n:
@@ -175,24 +214,20 @@ class KeyRing:
         activated_new.activated_at = now
         new_snap.append(activated_new)
 
-        # Atomic commit & lost-update detection:
-        if self.state.version != base_state.version:
-            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
-
-        # Single-step atomic reference publication of entire state (version + keys together)
-        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, now)
-        self.state = new_state
-        self.keys = new_snap
+        # 3. Hardware-atomic CAS & Mutex commit
+        new_state: KeyRingState = KeyRingState(base_ver + 1, new_snap, now)
+        self._commit_state(base_ver, new_state)
         return RotationReceipt(old_kid, new_key.kid, overlap_seconds, now, self.trust_domain)
 
     def revoke(self, kid: str, expected_version: int = -1) -> None:
+        base_ver: int = self._atomic_version.load()
         base_state: KeyRingState = self.state
 
         # Optimistic concurrency check (CAS)
-        if expected_version >= 0 and base_state.version != expected_version:
-            raise ConfigurationError("KeyRing revoke CAS failed: expected version " + str(expected_version) + ", current is " + str(base_state.version))
+        if expected_version >= 0 and base_ver != expected_version:
+            raise ConfigurationError("KeyRing revoke CAS failed: expected version " + str(expected_version) + ", current is " + str(base_ver))
 
-        curr_keys: list[KeyRef] = base_state.keys
+        curr_keys: list[KeyRef] = base_state.get_keys()
         found: bool = False
         new_snap: list[KeyRef] = []
         k_i: int = 0
@@ -210,11 +245,6 @@ class KeyRing:
         if not found:
             raise UnknownKeyError("Cannot revoke unknown key: " + kid)
 
-        # Atomic commit & lost-update detection:
-        if self.state.version != base_state.version:
-            raise ConfigurationError("Concurrent modification detected: keyring state changed during preparation")
-
-        # Single-step atomic reference publication of entire state (version + keys together)
-        new_state: KeyRingState = KeyRingState(base_state.version + 1, new_snap, nox.time.now_ms() // 1000)
-        self.state = new_state
-        self.keys = new_snap
+        # Hardware-atomic CAS & Mutex commit
+        new_state: KeyRingState = KeyRingState(base_ver + 1, new_snap, nox.time.now_ms() // 1000)
+        self._commit_state(base_ver, new_state)

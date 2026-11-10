@@ -1,1 +1,1 @@
-from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks, verify_resolved_ip
+from jwks import IPv4Address, IPv6Address, JwksKeySource, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, verify_resolved_ip

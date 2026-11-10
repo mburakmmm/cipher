@@ -2,10 +2,10 @@
 # Strict verification over exact ASCII bytes with verifier-controlled algorithm allowlists.
 
 import nox.strings
-from encoding import decode_base64url, encode_base64url
-from errors import DisallowedAlgorithmError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
-from json_strict import get_bool_field, get_string_field, get_string_list_field, has_field, parse_strict_json
-from provider import CryptoProvider, DefaultCryptoProvider
+from cipher.encoding import decode_base64url, encode_base64url
+from cipher.errors import DisallowedAlgorithmError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
+from cipher.json_strict import get_bool_field, get_string_field, get_string_list_field, has_field, parse_strict_json
+from cipher.provider import CryptoProvider, DefaultCryptoProvider
 
 MAX_TOKEN_BYTES: int = 131072  # 128 KB total compact JWS limit
 

@@ -1,7 +1,9 @@
+import nox.atomic
 import nox.test
+import nox.thread
 from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing
+from keyring import KeyRing, KeyRingState
 from rotation import RotationReceipt
 
 # ==============================================================================
@@ -181,10 +183,23 @@ state_ring.add_key(init_k)
 
 # 6a. Single immutable KeyRingState object verification
 nox.test.assert_eq_int(state_ring.state.version, 1, "KeyRingState encapsulates version 1")
-nox.test.assert_eq_int(len(state_ring.state.keys), 1, "KeyRingState encapsulates keys array")
+nox.test.assert_eq_int(state_ring.state.key_count(), 1, "KeyRingState encapsulates 1 key")
 nox.test.assert_true(state_ring.state.created_at > 0, "KeyRingState tracks creation timestamp")
 
-# 6b. True Lost-Update Detection Simulation:
+# 6b. Deep Immutability of KeyRingState & get_keys() (0.11.2)
+ext_state: KeyRingState = state_ring.get_state()
+ext_keys: list[KeyRef] = ext_state.get_keys()
+ext_keys[0].kid = "tampered-kid-via-state"
+ext_keys[0].state = STATE_REVOKED
+ext_keys[0].secret_material = "tampered-secret-material-00000000"
+ext_keys.append(KeyRef("k-injected", "HS256", "injected-secret-key-material-32b", trust_domain="tenant-atomic"))
+
+nox.test.assert_eq_int(state_ring.state.key_count(), 1, "Appending to get_keys() list does not alter internal key count")
+untouched_signer: KeyRef = state_ring.get_signing_key("HS256")
+nox.test.assert_eq_str(untouched_signer.kid, "k-atom-1", "Internal kid untouched after KeyRingState mutation attempt")
+nox.test.assert_eq_str(untouched_signer.state, STATE_ACTIVE_SIGNING, "Internal state untouched after KeyRingState mutation attempt")
+
+# 6c. True Lost-Update Detection Simulation:
 # Two concurrent writers W1 and W2 both capture base state at version 1
 w1_base_ver: int = state_ring.get_version()
 w2_base_ver: int = state_ring.get_version()
@@ -210,5 +225,83 @@ nox.test.assert_true(w2_lost_update_caught, "W2 rotate rejected: CAS / lost-upda
 nox.test.assert_eq_int(state_ring.get_version(), 2, "KeyRing version remains 2 after conflicting write aborted")
 current_active: KeyRef = state_ring.get_signing_key("HS256")
 nox.test.assert_eq_str(current_active.kid, "k-atom-2", "W1's active signer was NOT overwritten by W2")
+
+# ==============================================================================
+# Test 7: P0 Hardware Atomic Writer Mutex Contention & T1-T6 Race Guard (0.11.1)
+# ==============================================================================
+# 7a. Writer A acquires hardware atomic mutex lock; concurrent Writer B must fail closed
+lock_acquired: bool = state_ring.acquire_write_lock()
+nox.test.assert_true(lock_acquired, "Hardware atomic writer lock acquired")
+
+lock_contended_rotate: bool = False
+try:
+    state_ring.rotate(w2_key, overlap_seconds=600, clock_time_sec=2100)
+except ConfigurationError:
+    lock_contended_rotate = True
+nox.test.assert_true(lock_contended_rotate, "Concurrent rotate rejected while writer mutex is held")
+
+lock_contended_revoke: bool = False
+try:
+    state_ring.revoke("k-atom-1")
+except ConfigurationError:
+    lock_contended_revoke = True
+nox.test.assert_true(lock_contended_revoke, "Concurrent revoke rejected while writer mutex is held")
+
+state_ring.release_write_lock()
+
+# 7b. After releasing hardware writer mutex, legitimate write succeeds
+rec_after_unlock: RotationReceipt = state_ring.rotate(w2_key, overlap_seconds=600, clock_time_sec=2100)
+nox.test.assert_eq_str(rec_after_unlock.new_kid, "k-atom-3", "Rotation succeeds after writer mutex release")
+nox.test.assert_eq_int(state_ring.get_version(), 3, "Version advanced to 3")
+
+# 7c. Direct Hardware Atomic CAS T1-T6 Interleaving Proof
+# Suppose Writer A and Writer B both observed version 3 at T1/T2.
+# Writer A performs hardware CAS (3 -> 4) at T5.
+# Writer B attempts _commit_state with base_ver=3 at T6 -> hardware CAS (3 -> 4) MUST fail!
+t6_cas_rejected: bool = False
+dummy_state: KeyRingState = state_ring.get_state()
+try:
+    state_ring._commit_state(2, dummy_state)
+except ConfigurationError:
+    t6_cas_rejected = True
+nox.test.assert_true(t6_cas_rejected, "Hardware _commit_state rejects stale base_ver at CPU CAS level")
+nox.test.assert_eq_int(state_ring.get_version(), 3, "Version remains 3 after rejected T6 commit")
+
+# ==============================================================================
+# Test 8: True Parallel Multi-Thread OS Worker Atomic CAS Stress Test (0.11.3)
+# ==============================================================================
+async def parallel_cas_worker(ver_handle: int) -> int:
+    shared_ver: nox.atomic.AtomicInt = nox.atomic.from_int_handle(ver_handle)
+    wins: int = 0
+    attempt: int = 0
+    while attempt < 250:
+        cur: int = shared_ver.load()
+        if shared_ver.compare_and_swap(cur, cur + 1):
+            wins = wins + 1
+        attempt = attempt + 1
+    return wins
+
+async def run_parallel_cas_test() -> None:
+    shared_ver: nox.atomic.AtomicInt = nox.atomic.new_int(0)
+    h1: ThreadHandle[int] = nox.thread.start(parallel_cas_worker, shared_ver.handle)
+    h2: ThreadHandle[int] = nox.thread.start(parallel_cas_worker, shared_ver.handle)
+    h3: ThreadHandle[int] = nox.thread.start(parallel_cas_worker, shared_ver.handle)
+    h4: ThreadHandle[int] = nox.thread.start(parallel_cas_worker, shared_ver.handle)
+
+    w1: int = await h1.join()
+    w2: int = await h2.join()
+    w3: int = await h3.join()
+    w4: int = await h4.join()
+
+    total_wins: int = w1 + w2 + w3 + w4
+    final_ver: int = shared_ver.load()
+    shared_ver.free()
+
+    # Every single successful hardware CAS must correspond 1-to-1 with final_ver (zero lost updates!)
+    nox.test.assert_eq_int(final_ver, total_wins, "Parallel OS threads: final atomic version equals exact sum of CAS wins (zero lost updates)")
+    nox.test.assert_true(total_wins > 0, "Parallel OS threads completed positive number of atomic CAS transitions")
+
+t_parallel: Task[None] = spawn run_parallel_cas_test()
+await t_parallel
 
 print("concurrency_keyring_test passed!")

@@ -3,8 +3,8 @@
 
 import nox.strings
 import nox.time
-from errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
-from json_strict import get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
+from cipher.errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
+from cipher.json_strict import get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
 
 class ClaimsProfile:
     expected_issuer: str

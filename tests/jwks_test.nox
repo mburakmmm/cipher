@@ -1,7 +1,7 @@
 import nox.test
-from errors import ConfigurationError, KeyUnavailableError, UnknownKeyError
+from errors import ConfigurationError, EncodingError, KeyUnavailableError, UnknownKeyError
 from jwk import JwkKey
-from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks, verify_resolved_ip
+from jwks import IPv4Address, IPv6Address, JwksKeySource, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, verify_resolved_ip
 
 # 1. SSRF Protection Tests
 nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
@@ -143,4 +143,53 @@ nox.test.assert_true(not verify_resolved_ip("ff02::1"), "Resolved IPv6 multicast
 # Public routable IPs must pass verify_resolved_ip
 nox.test.assert_true(verify_resolved_ip("93.184.216.34"), "Valid public IPv4 address accepted")
 nox.test.assert_true(verify_resolved_ip("2606:2800:220:1:248:1893:25c8:1946"), "Valid public IPv6 address accepted")
+
+# ==============================================================================
+# 8. Decoupled IPv4/IPv6 Parser & 2-Hextet IPv4-Mapped Expansion Tests (0.11.4)
+# ==============================================================================
+# 8a. ::ffff:8.8.8.8 must expand to [0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808]
+v6_mapped_pub: IPv6Address = parse_ipv6("::ffff:8.8.8.8")
+nox.test.assert_eq_int(len(v6_mapped_pub.hextets), 8, "Parsed IPv6 has exactly 8 hextets")
+nox.test.assert_eq_int(v6_mapped_pub.hextets[0], 0, "h0 is 0")
+nox.test.assert_eq_int(v6_mapped_pub.hextets[4], 0, "h4 is 0")
+nox.test.assert_eq_int(v6_mapped_pub.hextets[5], 65535, "h5 is 0xffff")
+nox.test.assert_eq_int(v6_mapped_pub.hextets[6], 2056, "h6 is 0x0808 (8.8)")
+nox.test.assert_eq_int(v6_mapped_pub.hextets[7], 2056, "h7 is 0x0808 (8.8)")
+nox.test.assert_true(not is_restricted_ipv6_addr(v6_mapped_pub), "::ffff:8.8.8.8 is not a restricted IP")
+nox.test.assert_true(verify_resolved_ip("::ffff:8.8.8.8"), "verify_resolved_ip accepts ::ffff:8.8.8.8")
+
+# 8b. ::ffff:127.0.0.1 must expand to [0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001] and be restricted
+v6_mapped_loop: IPv6Address = parse_ipv6("::ffff:127.0.0.1")
+nox.test.assert_eq_int(v6_mapped_loop.hextets[5], 65535, "h5 is 0xffff")
+nox.test.assert_eq_int(v6_mapped_loop.hextets[6], 32512, "h6 is 0x7f00 (127.0)")
+nox.test.assert_eq_int(v6_mapped_loop.hextets[7], 1, "h7 is 0x0001 (0.1)")
+nox.test.assert_true(is_restricted_ipv6_addr(v6_mapped_loop), "::ffff:127.0.0.1 is restricted")
+nox.test.assert_true(not verify_resolved_ip("::ffff:127.0.0.1"), "verify_resolved_ip rejects ::ffff:127.0.0.1")
+nox.test.assert_true(not verify_resolved_ip("::ffff:7f00:1"), "verify_resolved_ip rejects hex form ::ffff:7f00:1")
+nox.test.assert_true(not verify_resolved_ip("0:0:0:0:0:ffff:192.168.1.1"), "verify_resolved_ip rejects uncompressed IPv4-mapped private IP")
+
+# 8c. NAT64, 6to4, Teredo, IPv4-Compatible transition ranges
+nox.test.assert_true(not verify_resolved_ip("64:ff9b::127.0.0.1"), "NAT64 loopback rejected")
+nox.test.assert_true(not verify_resolved_ip("64:ff9b::8.8.8.8"), "NAT64 prefix rejected")
+nox.test.assert_true(not verify_resolved_ip("2002:7f00:1::1"), "6to4 tunnel address rejected")
+nox.test.assert_true(not verify_resolved_ip("2001:0000:4136:e378:8000:63bf:3fff:fdd2"), "Teredo tunnel address rejected")
+nox.test.assert_true(not verify_resolved_ip("::127.0.0.1"), "IPv4-compatible ::127.0.0.1 rejected")
+
+# ==============================================================================
+# 9. Strict Invalid IP Rejection in verify_resolved_ip & Parsers (0.11.5)
+# ==============================================================================
+nox.test.assert_true(not verify_resolved_ip(""), "Empty IP string rejected")
+nox.test.assert_true(not verify_resolved_ip("1.2.3"), "3-octet malformed IPv4 rejected")
+nox.test.assert_true(not verify_resolved_ip("127.0.0.1.5"), "5-octet malformed IPv4 rejected")
+nox.test.assert_true(not verify_resolved_ip("999.999.999.999"), "Out-of-range IPv4 octets rejected")
+nox.test.assert_true(not verify_resolved_ip("0177.0.0.1"), "Octal leading-zero IPv4 rejected")
+nox.test.assert_true(not verify_resolved_ip("0x7f.0.0.1"), "Hex IPv4 rejected")
+nox.test.assert_true(not verify_resolved_ip("not-an-ip.example.com"), "Hostname passed to verify_resolved_ip rejected")
+nox.test.assert_true(not verify_resolved_ip("2001::db8::1"), "Multiple '::' in IPv6 rejected")
+nox.test.assert_true(not verify_resolved_ip("2001:db8:::1"), "Triple colon ':::' in IPv6 rejected")
+nox.test.assert_true(not verify_resolved_ip("fe80::1%eth0"), "IPv6 zone identifier '%eth0' rejected")
+nox.test.assert_true(not verify_resolved_ip("gggg::1"), "Non-hex characters in IPv6 rejected")
+nox.test.assert_true(not verify_resolved_ip("1:2:3:4:5:6:7:8.8.8.8"), "9-hextet overflow in embedded IPv4 rejected")
+nox.test.assert_true(not verify_resolved_ip("1:2:3:4:5:6::8.8.8.8"), "8-hextet with redundant '::' in embedded IPv4 rejected")
+
 

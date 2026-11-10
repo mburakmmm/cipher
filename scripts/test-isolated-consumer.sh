@@ -1,48 +1,68 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Cipher — Isolated External Consumer Integration Test
-# Validates that an independent application outside the repository can consume
-# Cipher public APIs cleanly without depending on the development repo state.
+# Cipher — Native Package Manager (noxc add + noxc fetch) Consumer Verification
+# Validates that an independent external application with zero copied source
+# files can install Cipher via 'noxc add' and 'noxc fetch', lock the commit SHA
+# in 'nox.lock', and consume all public APIs cleanly.
 # ==============================================================================
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP_DIR="$(mktemp -d /tmp/cipher_isolated_consumer_XXXXXX)"
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cipher_pkg_consumer_XXXXXX")"
 
 cleanup() {
-    echo "==> Cleaning up isolated consumer test directory: ${TMP_DIR}"
-    rm -rf "${TMP_DIR}"
+    echo "==> Cleaning up isolated consumer test workspace: ${TMP_ROOT}"
+    rm -rf "${TMP_ROOT}"
 }
 trap cleanup EXIT
 
-echo "==> Setting up isolated consumer project in: ${TMP_DIR}"
-mkdir -p "${TMP_DIR}"
+PKG_STAGING="${TMP_ROOT}/cipher_pkg"
+CONSUMER_DIR="${TMP_ROOT}/consumer_app"
+NOX_HOME_DIR="${TMP_ROOT}/nox_home"
 
-# 1. Vendor / copy cipher library modules and package hierarchy to isolated environment
-cp "${REPO_ROOT}"/*.nox "${TMP_DIR}/"
-cp -r "${REPO_ROOT}/cipher" "${TMP_DIR}/"
+mkdir -p "${PKG_STAGING}/cipher" "${CONSUMER_DIR}" "${NOX_HOME_DIR}"
 
-# 2. Write consumer application nox.json
-cat << 'EOF' > "${TMP_DIR}/nox.json"
-{
-  "name": "isolated_consumer_app",
-  "entry": "main.nox"
-}
-EOF
+# 1. Stage current working tree as a clean git repository for 'noxc fetch'
+cp "${REPO_ROOT}/nox.json" "${PKG_STAGING}/"
+cp "${REPO_ROOT}"/*.nox "${PKG_STAGING}/"
+cp "${REPO_ROOT}/cipher"/*.nox "${PKG_STAGING}/cipher/"
 
-# 3. Write consumer application code
-cat << 'EOF' > "${TMP_DIR}/main.nox"
-from cipher import ClaimsProfile, JwkKey, KeyRef, KeyRing, STATE_ACTIVE_SIGNING, VerificationProfile, VerifiedJwt, encode_jwt_hs256, issue_signed_token, parse_jwk, verify_jwt_hs256, verify_signed_token
+git -C "${PKG_STAGING}" init -q -b main
+git -C "${PKG_STAGING}" config user.name "Cipher Package Probe"
+git -C "${PKG_STAGING}" config user.email "probe@cipher.nox"
+git -C "${PKG_STAGING}" add .
+git -C "${PKG_STAGING}" commit -q -m "stage cipher package for native fetch test"
+EXPECTED_SHA="$(git -C "${PKG_STAGING}" rev-parse HEAD)"
 
-print("==> [Isolated Consumer] Starting integration test...")
+echo "==> Initializing independent consumer project in: ${CONSUMER_DIR}"
+cd "${CONSUMER_DIR}"
+NOX_HOME="${NOX_HOME_DIR}" noxc init . >/dev/null
+
+echo "==> Adding and fetching cipher package via native NOX package manager..."
+NOX_HOME="${NOX_HOME_DIR}" noxc add cipher "${PKG_STAGING}" --ref main >/dev/null
+NOX_HOME="${NOX_HOME_DIR}" noxc fetch
+
+# Verify nox.lock contains the exact resolved commit SHA
+if ! grep -q "\"resolved\": \"${EXPECTED_SHA}\"" "${CONSUMER_DIR}/nox.lock"; then
+    echo "ERROR: nox.lock did not record expected resolved commit SHA (${EXPECTED_SHA})!"
+    cat "${CONSUMER_DIR}/nox.lock"
+    exit 1
+fi
+echo "==> Verified nox.lock resolved SHA: ${EXPECTED_SHA}"
+
+# 2. Write consumer application code (zero copied .nox files in CONSUMER_DIR!)
+cat << 'EOF' > "${CONSUMER_DIR}/main.nox"
+from cipher.cipher import ClaimsProfile, JwkKey, KeyRef, KeyRing, STATE_ACTIVE_SIGNING, STATE_PREPARED, VerificationProfile, VerifiedJwt, encode_jwt_hs256, issue_signed_token, parse_jwk, verify_jwt_hs256, verify_resolved_ip, verify_signed_token
+
+print("==> [Native Package Consumer] Starting integration test...")
 
 secret: str = "isolated-consumer-production-secret-at-least-32-bytes"
 
 # 1. JWT Encoding & Strict Verification
 payload_json: str = "{\"sub\":\"usr_isolated_99\",\"iss\":\"https://id.enterprise.org\",\"aud\":\"https://api.enterprise.org\",\"exp\":1700003600,\"typ\":\"JWT\"}"
 token: str = encode_jwt_hs256(payload_json, secret, kid="k-iso-1")
-print("[Isolated Consumer] Encoded Token successfully")
+print("[Native Package Consumer] Encoded Token successfully")
 
 c_prof: ClaimsProfile = ClaimsProfile(
     expected_issuer="https://id.enterprise.org",
@@ -55,7 +75,7 @@ verified: VerifiedJwt = verify_jwt_hs256(token, secret, v_prof, c_prof)
 
 if verified.claims.sub != "usr_isolated_99":
     raise Exception("Subject claim mismatch in isolated consumer!")
-print("[Isolated Consumer] Verified JWT sub: " + verified.claims.sub)
+print("[Native Package Consumer] Verified JWT sub: " + verified.claims.sub)
 
 # 2. Signed Opaque Token
 raw_data: str = "secure_session_payload_42"
@@ -63,24 +83,30 @@ sig_tok: str = issue_signed_token(raw_data, "web_session", secret, ttl_seconds=3
 v_data: str = verify_signed_token(sig_tok, "web_session", secret)
 if v_data != raw_data:
     raise Exception("Payload mismatch in signed token!")
-print("[Isolated Consumer] Verified Signed Token payload: " + v_data)
+print("[Native Package Consumer] Verified Signed Token payload: " + v_data)
 
-# 3. KeyRing & Rotation
+# 3. KeyRing Hardware Atomic Rotation & State
 ring: KeyRing = KeyRing(trust_domain="enterprise-prod")
 k_ref: KeyRef = KeyRef("k-iso-1", "HS256", secret, trust_domain="enterprise-prod", state=STATE_ACTIVE_SIGNING)
-ring.add_key(k_ref)
+ring.add_key(k_ref, expected_version=0)
+k_next: KeyRef = KeyRef("k-iso-2", "HS256", "next-isolated-consumer-production-secret-32b", trust_domain="enterprise-prod", state=STATE_PREPARED)
+ring.rotate(k_next, overlap_seconds=300, clock_time_sec=1700000000, expected_version=1)
 active_k: KeyRef = ring.get_signing_key("HS256")
-if active_k.kid != "k-iso-1":
-    raise Exception("KeyRing active signer mismatch!")
-print("[Isolated Consumer] KeyRing active signer: " + active_k.kid)
+if active_k.kid != "k-iso-2" or ring.get_version() != 2:
+    raise Exception("KeyRing active signer or atomic version mismatch!")
+print("[Native Package Consumer] KeyRing rotated active signer: " + active_k.kid + " (version " + str(ring.get_version()) + ")")
+
+# 4. Decoupled IP Parser & Resolved IP Verification
+if not verify_resolved_ip("::ffff:8.8.8.8") or verify_resolved_ip("::ffff:127.0.0.1") or verify_resolved_ip("1.2.3"):
+    raise Exception("verify_resolved_ip validation failed in consumer!")
+print("[Native Package Consumer] Verified decoupled IP SSRF policy")
 
 print("Isolated Consumer verification SUCCESS!")
 EOF
 
-# 4. Compile and execute isolated consumer app
-echo "==> Compiling and running isolated consumer via noxc run..."
-cd "${TMP_DIR}"
-OUTPUT="$(noxc run main.nox)"
+# 3. Compile and execute isolated consumer app using fetched package cache
+echo "==> Compiling and running consumer via noxc run..."
+OUTPUT="$(NOX_HOME="${NOX_HOME_DIR}" noxc run main.nox)"
 echo "${OUTPUT}"
 
 if ! echo "${OUTPUT}" | grep -q "Isolated Consumer verification SUCCESS!"; then
@@ -88,4 +114,4 @@ if ! echo "${OUTPUT}" | grep -q "Isolated Consumer verification SUCCESS!"; then
     exit 1
 fi
 
-echo "==> Isolated consumer integration test PASSED successfully!"
+echo "==> Native package consumer integration test PASSED successfully!"

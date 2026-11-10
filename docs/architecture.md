@@ -48,20 +48,17 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 
 ## 3. Resilience, SSRF & Atomic Rollback Invariants
 
-### KeyRing Unified State & Atomic Rollback
-`KeyRing` manages key lifecycle and rotation through an immutable `KeyRingState` model:
-1. **Unified State Encapsulation:** `keys`, `version`, and `created_at` are encapsulated within a single immutable `KeyRingState` object. Single-reference assignment (`self.state = new_state`) ensures versions and key snapshots are published simultaneously and atomically.
-2. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated. Any mismatch raises typed exceptions immediately without mutating existing signers.
-3. **Commit & Lost-Update Guard:** Immediately before state publication, KeyRing verifies `self.state.version == base_state.version`. If an interleaved writer committed changes during preparation, the operation aborts with `ConfigurationError("Concurrent modification detected")`, preventing lost updates.
+### KeyRing Unified State, Deep Immutability & Hardware Atomic CAS
+`KeyRing` manages key lifecycle and rotation through a deeply immutable `KeyRingState` model backed by `nox.atomic` primitives:
+1. **Deeply Immutable `KeyRingState`:** Internal keys are stored in `_keys: list[KeyRef]` with defensive cloning on both construction and inspection (`get_keys()`). No direct mutable reference to the internal key array is exposed (`self.keys` alias was removed).
+2. **Pre-commit Validation:** The incoming key's `trust_domain`, state, and uniqueness of `kid` are validated on cloned snapshots before any state transition.
+3. **Hardware Atomic Writer Mutex & CAS (`_commit_state`):** State commits acquire a hardware-backed writer lock (`_write_lock: nox.atomic.AtomicBool` via `nox_atomic_cas`) and execute a CPU-level atomic compare-and-swap on the version cell (`_atomic_version: nox.atomic.AtomicInt` via `compare_and_swap(base_ver, base_ver + 1)`). This eliminates the check-then-act race window at the hardware level and guarantees zero lost updates across concurrent writers.
 
-### SSRF & Negative Cache Boundaries
-`is_safe_jwks_url()` and `verify_resolved_ip()` enforce strict destination validation:
-- Rejects non-HTTPS schemes unconditionally.
-- Rejects all loopback addresses (`127.0.0.0/8`, `::1`, `localhost`, `0.0.0.0`).
-- Rejects link-local and cloud metadata (`169.254.0.0/16`, `fe80::`, metadata endpoints).
-- Rejects RFC 6598 CGNAT (`100.64.0.0/10`) and RFC 2544 Benchmark (`198.18.0.0/15`).
-- Evaluates structural IPv6 bitmasks for RFC 4193 ULA (`fc00::/7`), RFC 4291 Link-Local (`fe80::/10`), Multicast (`ff00::/8`), and documentation prefixes.
-- Programmatic post-resolution verification via `verify_resolved_ip(ip_str: str) -> bool` prevents TOCTOU DNS rebinding SSRF.
+### Decoupled IP Syntax Parsing, SSRF Policy & Negative Cache Boundaries
+`jwks.nox` strictly separates syntactic IP parsing from SSRF security policy evaluation:
+- **Syntactic Layer (`parse_ipv4` -> `IPv4Address`, `parse_ipv6` -> `IPv6Address`):** Enforces exact 4-octet decimal IPv4 syntax (rejecting octal leading zeros, hex, and out-of-range octets) and RFC 4291 8-hextet IPv6 expansion (correctly accounting for embedded 32-bit IPv4 suffixes such as `::ffff:8.8.8.8` as two 16-bit hextets, and rejecting multiple `::`, zone IDs `%`, or malformed segments with `EncodingError`).
+- **SSRF Policy Layer (`is_restricted_ipv4_addr`, `is_restricted_ipv6_addr`):** Evaluates validated address structures against all 14 non-routable IPv4 CIDR blocks (`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` CGNAT, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15` Benchmark, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4+`) and IPv6 special/transition ranges (Loopback `::1`, Unspecified `::`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/23`, ULA `fc00::/7`, Link-Local `fe80::/10`, Site-Local `fec0::/10`, Multicast `ff00::/8`, Discard `100::/64`, Documentation `2001:db8::/32` & `3fff::/20`).
+- **Post-Resolution Verification (`verify_resolved_ip`):** Requires syntactic validity first (`parse_ipv4` / `parse_ipv6`), returning `false` on any malformed IP string before evaluating `!is_restricted_ipv4_addr` / `!is_restricted_ipv6_addr`.
 
 
 - Rejects all RFC 1918 private IPv4 ranges (`10.0.0.0/8`, `192.168.0.0/16`, and all 16 subnets of `172.16.0.0/12`).

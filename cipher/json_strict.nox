@@ -1,1 +1,1 @@
-from json_strict import JsonValue, get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
+from json_strict import JsonValue, get_bool_field, get_field_value, get_int_field, get_string_field, get_string_list_field, has_field, is_object, parse_strict_json

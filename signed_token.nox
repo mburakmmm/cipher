@@ -4,11 +4,11 @@
 
 import nox.strings
 import nox.time
-from encoding import decode_base64url, encode_base64url
-from errors import EncodingError, ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError, UnknownKeyError
-from keys import KeyRef
-from keyring import KeyRing
-from provider import CryptoProvider, DefaultCryptoProvider
+from cipher.encoding import decode_base64url, encode_base64url
+from cipher.errors import EncodingError, ExpiredTokenError, InvalidClaimsError, InvalidSignatureError, MalformedTokenError, UnknownKeyError
+from cipher.keys import KeyRef
+from cipher.keyring import KeyRing
+from cipher.provider import CryptoProvider, DefaultCryptoProvider
 
 TOKEN_PREFIX: str = "cip_opk_v1"
 

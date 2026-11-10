@@ -1,15 +1,15 @@
 # Cipher — NOX Cryptographic Tokens & Key Lifecycle Library
 # Public exports for compact JWS, JWT claims validation, signed tokens, JWK/JWKS, and KeyRing rotation.
 
-from claims import Claims, ClaimsProfile, parse_claims, validate_claims
-from encoding import bytes_to_hex, decode_base64url, encode_base64url, hex_to_bytes
-from errors import AmbiguousKeyError, CipherError, ConfigurationError, DisallowedAlgorithmError, EncodingError, ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, InvalidKeyError, InvalidSignatureError, InvalidTypeError, JsonFormatError, KeyUnavailableError, MalformedTokenError, NotYetValidError, ProviderFailureError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
-from jwk import JwkKey, parse_jwk
-from jwks import JwksKeySource, is_safe_jwks_url, parse_jwks, verify_resolved_ip
-from jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header, sign_hs256, sign_jws_hs256, verify_hs256, verify_jws_hs256
-from jwt import JwtIssuer, JwtVerifier, UnverifiedJwt, VerifiedJwt, decode_unverified_jwt, encode_jwt_hs256, verify_jwt_hs256
-from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing, KeyRingState
-from provider import CryptoProvider, DefaultCryptoProvider
-from rotation import RotationReceipt
-from signed_token import SignedTokenIssuer, SignedTokenVerifier, issue_signed_token, verify_signed_token
+from cipher.claims import Claims, ClaimsProfile, parse_claims, validate_claims
+from cipher.encoding import bytes_to_hex, decode_base64url, encode_base64url, hex_to_bytes
+from cipher.errors import AmbiguousKeyError, CipherError, ConfigurationError, DisallowedAlgorithmError, EncodingError, ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, InvalidKeyError, InvalidSignatureError, InvalidTypeError, JsonFormatError, KeyUnavailableError, MalformedTokenError, NotYetValidError, ProviderFailureError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
+from cipher.jwk import JwkKey, parse_jwk
+from cipher.jwks import IPv4Address, IPv6Address, JwksKeySource, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, verify_resolved_ip
+from cipher.jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header, sign_hs256, sign_jws_hs256, verify_hs256, verify_jws_hs256
+from cipher.jwt import JwtIssuer, JwtVerifier, UnverifiedJwt, VerifiedJwt, decode_unverified_jwt, encode_jwt_hs256, verify_jwt_hs256
+from cipher.keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_RETIRED, STATE_REVOKED, STATE_VERIFY_ONLY
+from cipher.keyring import KeyRing, KeyRingState
+from cipher.provider import CryptoProvider, DefaultCryptoProvider
+from cipher.rotation import RotationReceipt
+from cipher.signed_token import SignedTokenIssuer, SignedTokenVerifier, issue_signed_token, verify_signed_token

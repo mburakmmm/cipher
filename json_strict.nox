@@ -4,7 +4,7 @@
 from nox.json import JsonError
 import nox.json
 import nox.strings
-from errors import JsonFormatError, ResourceLimitExceededError
+from cipher.errors import JsonFormatError, ResourceLimitExceededError
 
 MAX_JSON_BYTES: int = 65536  # 64 KB limit for security-sensitive headers and payload structures
 

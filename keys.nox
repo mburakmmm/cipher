@@ -3,7 +3,7 @@
 
 import nox.strings
 import nox.time
-from errors import ConfigurationError, InvalidKeyError
+from cipher.errors import ConfigurationError, InvalidKeyError
 
 # Lifecycle state constants
 STATE_PREPARED: str = "PREPARED"

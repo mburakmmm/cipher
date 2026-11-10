@@ -2,10 +2,10 @@
 # Explicit trust context, strict claims profile validation, and verified vs unverified separation.
 
 import nox.strings
-from claims import Claims, ClaimsProfile, parse_claims, validate_claims
-from encoding import decode_base64url
-from errors import MalformedTokenError
-from jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header
+from cipher.claims import Claims, ClaimsProfile, parse_claims, validate_claims
+from cipher.encoding import decode_base64url
+from cipher.errors import MalformedTokenError
+from cipher.jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header
 
 class VerifiedJwt:
     claims: Claims

@@ -601,3 +601,55 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.4` sürüm notları eklendi.
 - [x] Git commit, `v1.0.4` git tag push ve `noxc publish` çalıştırıldı (`published: cipher updated in the registry as @mburakmmm`).
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığı ve `Cipher v1.0.4` GitHub Release'inin yayınlandığı doğrulandı.
+
+---
+
+# Phase 11 — `v1.0.5` Hardware Atomic CAS & Writer Lock, Decoupled IP Parser/SSRF Policy & Native Package Fetch (SOL V Analizi)
+
+**Amaç:** Beşinci bağımsız teknik incelemede (GPT 6 SOL V analizi) tespit edilen iki temel güvenlik garantisi boşluğunu ve mimari iyileştirmeleri eksiksiz tamamlamak:
+1. `KeyRing` içerisinde `nox.atomic` (`AtomicBool` writer mutex + `AtomicInt` donanım `compare_and_swap`) kullanarak gerçek donanım seviyesinde atomik CAS ve çoklu yazıcı koordinasyonu sağlamak, `KeyRingState` ve `KeyRing` içindeki dahili liste referanslarını dış mutasyonlara karşı tamamen kapatmak.
+2. IPv4/IPv6 sözdizimsel ayrıştırma katmanını (`parse_ipv4` -> `IPv4Address`, `parse_ipv6` -> `IPv6Address`) SSRF güvenlik politikası katmanından (`is_restricted_ipv4_addr`, `is_restricted_ipv6_addr`) tamamen ayırmak; `::ffff:8.8.8.8` gibi IPv4-mapped IPv6 adreslerinde 2-hextet genişletme hatasını gidermek ve `verify_resolved_ip()` fonksiyonunun geçersiz IP formatlarını kesin olarak reddetmesini sağlamak.
+3. `noxc add cipher` ve `noxc fetch` üzerinden gerçek bağımsız paket kurulumunu doğrulamak ve `v1.0.5` sürümünü yayınlamak.
+
+## 0.11.1 — P0: Gerçek Donanım Atomik CAS & Writer Mutex (`keyring.nox`, `nox.atomic`)
+- [x] `KeyRing` içerisine `nox.atomic.AtomicBool` (`_write_lock`) ve `nox.atomic.AtomicInt` (`_atomic_version`) eklendi.
+- [x] `add_key()`, `rotate()` ve `revoke()` metotlarında:
+  - Hazırlık aşaması başında `base_ver = self._atomic_version.load()` ve `base_state = self.state` okundu.
+  - Hazırlık tamamlandığında `_write_lock.compare_and_swap(False, True)` ile donanım atomik writer mutex kilidi alındı (çakışma durumunda fail-closed `ConfigurationError` fırlatıldı).
+  - Kritik bölge içinde `self._atomic_version.compare_and_swap(base_ver, base_ver + 1)` donanım atomik CAS komutuyla versiyon geçişi doğrulandı; başarısızsa kilit bırakılıp (`_write_lock.store(False)`) `ConfigurationError("Concurrent modification detected: atomic CAS version mismatch")` fırlatıldı.
+  - Başarılıysa `self.state = new_state` atanıp kilit bırakıldı (`_write_lock.store(False)`).
+- [x] Test amaçlı deterministik kilit/CAS simülasyon metotları (`acquire_write_lock`, `release_write_lock`, `_commit_state`) tanımlandı.
+
+## 0.11.2 — P1: `KeyRingState` Derin İmmutability & Dış Mutasyon Koruması (`keyring.nox`)
+- [x] `KeyRing` içindeki eski `self.keys` alanı kaldırıldı (dahili listeye dışarıdan doğrudan referans tutulması engellendi).
+- [x] `KeyRingState` içindeki liste `_keys: list[KeyRef]` olarak kapsüllendi; `__init__` içinde gelen liste derin klonlanarak (`KeyRef.clone()`) saklandı.
+- [x] `KeyRingState.get_keys(self) -> list[KeyRef]` metodu her çağrıda elemanların `.clone()` kopyalarını içeren yeni bir liste döndürecek şekilde uygulandı.
+- [x] `KeyRing.get_state(self) -> KeyRingState` metodu güvenli klonlanmış snapshot döndürecek şekilde eklendi.
+
+## 0.11.3 — P1: Gerçek Paralel/Eşzamanlı Writer & Atomik CAS Testleri (`tests/concurrency_keyring_test.nox`)
+- [x] `KeyRingState.get_keys()` ve `ring.get_state()` üzerinden yapılan dış mutasyonların dahili snapshot'ı etkilemediğini kanıtlayan test eklendi (Test 6b).
+- [x] Donanım `_write_lock` ve `_atomic_version.compare_and_swap` mekanizmasının T1-T6 yarış senaryosunu, aktif writer lock çakışmalarını (Test 7) ve 4 paralel OS iş parçacıklı (`nox.thread.start`) CAS yarışını (Test 8) deterministik olarak doğrulayan testler eklendi.
+
+## 0.11.4 — P0: IPv4/IPv6 Ayrıştırma (`parse_ipv4`, `parse_ipv6`) ve SSRF Güvenlik Politikasını Ayırma (`jwks.nox`)
+- [x] `IPv4Address` (`o0`, `o1`, `o2`, `o3`) ve `IPv6Address` (`hextets: list[int]`) yapısal sınıfları tanımlandı.
+- [x] `parse_ipv4(s: str) -> IPv4Address` fonksiyonu uygulandı (tam 4 oktet, `0..255` aralığı, leading zero/octal reddi, geçersiz formatlarda `EncodingError` fırlatma).
+- [x] `parse_ipv6(s: str) -> IPv6Address` fonksiyonu uygulandı:
+  - IPv4-gömülü son segment (`::ffff:8.8.8.8`, `::ffff:127.0.0.1`, `64:ff9b::192.0.2.1`) `parse_ipv4` ile ayrıştırılıp `(o0 << 8) | o1` ve `(o2 << 8) | o3` olarak **tam 2 hextet**'e dönüştürüldü ve `::` sıfır genişletmesi kalan **6 hextet** üzerinden doğru hesaplandı (`6 + 2 = 8 hextet`).
+  - Çoklu `::`, `:::`, tek `:` başlangıç/bitiş, `%` zone ID ve 8 hextet dışı uzunluklar `EncodingError` ile reddedildi.
+- [x] `is_restricted_ipv4_addr(addr: IPv4Address) -> bool` ve `is_restricted_ipv6_addr(addr: IPv6Address) -> bool` fonksiyonları yalnızca ayrıştırılmış ve doğrulanmış adres nesneleri üzerinde çalışacak şekilde ayrıldı (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32`, ULA `fc00::/7`, Link-Local `fe80::/10`, Site-Local `fec0::/10`, Multicast `ff00::/8`, Discard `100::/64`, Documentation `2001:db8::/32` & `3fff::/20`, Benchmark `2001:2::/48`).
+
+## 0.11.5 — P0 & P1: `verify_resolved_ip()` Geçersiz IP Reddi ve IPv4-Mapped IPv6 Vektörleri (`jwks.nox`, `tests/jwks_test.nox`)
+- [x] `verify_resolved_ip(ip_str: str) -> bool` fonksiyonu önce `parse_ipv6` / `parse_ipv4` ile sözdizimsel doğrulama yapacak, ayrıştırma hatasında (`EncodingError`) doğrudan `False` dönecek, geçerliyse `not is_restricted_ipv4_addr` / `not is_restricted_ipv6_addr` dönecek şekilde güncellendi.
+- [x] `tests/jwks_test.nox` içerisine `::ffff:8.8.8.8` (2-hextet genişletme doğrulaması), `::ffff:7f00:1` (hex formda IPv4-mapped loopback), NAT64, 6to4, Teredo ve geçersiz IP formatlarının (`"999.999.999.999"`, `"1.2.3"`, `"not-an-ip"`, `"2001::db8::1"`, `"fe80::1%eth0"`) `verify_resolved_ip` tarafından reddedildiği test vektörleri eklendi (Test 8 & Test 9).
+
+## 0.11.6 — P2: Gerçek `noxc add` + `noxc fetch` Bağımsız Paket Kurulumu (`*.nox`, `cipher/*.nox`, `scripts/test-isolated-consumer.sh`)
+- [x] Kök `.nox` modüllerinin iç importları `from cipher.<modül> import ...` yapısına kavuşturuldu ve `cipher/` alt diziniyle senkronize edildi.
+- [x] `scripts/test-isolated-consumer.sh` betiği gerçek `noxc init .`, `noxc add cipher <repo> --ref main`, `noxc fetch`, `nox.lock` SHA kontrolü ve `noxc run main.nox` ile doğrulandı.
+
+## 0.11.7 — Phase 11 Çıkış Kapısı ve `v1.0.5` Yayını
+- [x] `noxc test` ile tüm test matrisi çalıştırıldı (16 testin 16'sı da %100 geçti).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştırıldı ve doğrulandı.
+- [x] `nox.json` versiyonu `1.0.5` yapıldı.
+- [x] `CHANGELOG.md` dosyasına `v1.0.5` sürüm notları eklendi.
+- [ ] Git commit, `v1.0.5` git tag push ve `noxc publish` çalıştır.
+- [ ] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.

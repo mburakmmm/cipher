@@ -3,9 +3,9 @@
 
 import nox.crypto
 import nox.strings
-from encoding import decode_base64url, encode_base64url, hex_to_bytes, validate_base64url_syntax
-from errors import EncodingError, InvalidKeyError, JsonFormatError
-from json_strict import get_string_field, has_field, is_object, parse_strict_json
+from cipher.encoding import decode_base64url, encode_base64url, hex_to_bytes, validate_base64url_syntax
+from cipher.errors import EncodingError, InvalidKeyError, JsonFormatError
+from cipher.json_strict import get_string_field, has_field, is_object, parse_strict_json
 
 MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
 MAX_RSA_EXPONENT_CHARS: int = 11  # Upper bound for safe integer RSA public exponent (IEEE 754 53-bit safe integer limit; e.g. 65537 'AQAB' is 4 chars)
