@@ -448,3 +448,6 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
   - `nox.json` entry noktası `"cipher.nox"` yapıldı ve `tests/consumer_test.nox` tüketici testi eklendi.
   - Test sonucu: `14 passed, 0 failed (14 total)`.
   - Git tag `v1.0.1` push edildi ve `noxc publish https://github.com/mburakmmm/cipher` başarıyla yayınlandı (`published: cipher updated in the registry as @mburakmmm`).
+  - CI ve Release Gate iş akışları sertleştirildi (`env: NOX_VERSION: v2.1.0` pini ile GitHub API rate-limit ortadan kaldırıldı, macOS runner'ı `macos-15`'e geçirilerek kuyruk gecikmeleri çözüldü).
+  - GitHub Actions sonuçları: Hem **CI** (Ubuntu: 23s, Windows: 1m12s, macOS: 13s) hem de **Release Gate & Publish** (Ubuntu: 30s, macOS: 22s, Windows: 48s, Release Publish: 9s) %100 yeşil (`SUCCESS`) tamamlandı.
+  - GitHub Releases üzerinde `Cipher v1.0.1` resmi olarak yayımlandı.
