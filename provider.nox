@@ -1,0 +1,39 @@
+# Cipher — Cryptographic Provider Abstraction and Implementation
+# Interfacing verified OS CSPRNG and audited hashing/MAC primitives.
+
+import nox.crypto
+import nox.strings
+from encoding import hex_to_bytes
+from errors import InvalidKeyError, ProviderFailureError
+
+MIN_HMAC_KEY_BYTES: int = 32  # 256 bits minimum key length for HS256 (RFC 7518 §3.2)
+
+class CryptoProvider:
+    def sign_hmac_sha256(self, secret: str, data: str) -> str:
+        raise ProviderFailureError("sign_hmac_sha256 not implemented in base provider")
+
+    def verify_hmac_sha256(self, secret: str, data: str, expected_sig_raw: str) -> bool:
+        raise ProviderFailureError("verify_hmac_sha256 not implemented in base provider")
+
+    def secure_random_hex(self, n_bytes: int) -> str:
+        raise ProviderFailureError("secure_random_hex not implemented in base provider")
+
+class DefaultCryptoProvider(CryptoProvider):
+    def sign_hmac_sha256(self, secret: str, data: str) -> str:
+        key_len: int = nox.strings.byte_len(secret)
+        if key_len < MIN_HMAC_KEY_BYTES:
+            raise InvalidKeyError("HMAC secret key must be at least 32 bytes (256 bits)")
+        try:
+            hex_mac: str = nox.crypto.hmac_sha256(secret, data)
+            return hex_to_bytes(hex_mac)
+        except Exception as err:
+            raise ProviderFailureError("HMAC signing failed: " + str(err))
+
+    def verify_hmac_sha256(self, secret: str, data: str, expected_sig_raw: str) -> bool:
+        computed_sig_raw: str = self.sign_hmac_sha256(secret, data)
+        return nox.crypto.constant_time_eq(computed_sig_raw, expected_sig_raw)
+
+    def secure_random_hex(self, n_bytes: int) -> str:
+        if n_bytes <= 0:
+            raise ProviderFailureError("n_bytes must be greater than zero")
+        return nox.crypto.secure_random_hex(n_bytes)

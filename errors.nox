@@ -1,0 +1,86 @@
+# Cipher — Strongly-Typed Error Hierarchy
+# Strict fail-closed error contracts for cryptographic and claims validation.
+
+class CipherError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+# Format and parsing errors
+class MalformedTokenError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Malformed token: " + message)
+
+class EncodingError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Encoding error: " + message)
+
+class JsonFormatError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("JSON format error: " + message)
+
+# Cryptographic and algorithm errors
+class UnsupportedAlgorithmError(CipherError):
+    def __init__(self, alg: str) -> None:
+        super().__init__("Unsupported algorithm: " + alg)
+
+class DisallowedAlgorithmError(CipherError):
+    def __init__(self, alg: str) -> None:
+        super().__init__("Disallowed algorithm: " + alg)
+
+class InvalidSignatureError(CipherError):
+    def __init__(self, message: str = "Cryptographic signature verification failed") -> None:
+        super().__init__(message)
+
+class InvalidKeyError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Invalid key material: " + message)
+
+class UnknownKeyError(CipherError):
+    def __init__(self, kid: str) -> None:
+        super().__init__("Unknown key identifier: " + kid)
+
+class AmbiguousKeyError(CipherError):
+    def __init__(self, kid: str) -> None:
+        super().__init__("Ambiguous key identifier (multiple candidates found): " + kid)
+
+class KeyUnavailableError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Key unavailable: " + message)
+
+# Claims validation errors
+class InvalidClaimsError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Invalid claims: " + message)
+
+class ExpiredTokenError(InvalidClaimsError):
+    def __init__(self, message: str = "Token has expired") -> None:
+        super().__init__(message)
+
+class NotYetValidError(InvalidClaimsError):
+    def __init__(self, message: str = "Token is not yet valid (nbf constraint)") -> None:
+        super().__init__(message)
+
+class InvalidAudienceError(InvalidClaimsError):
+    def __init__(self, message: str = "Audience mismatch") -> None:
+        super().__init__(message)
+
+class InvalidIssuerError(InvalidClaimsError):
+    def __init__(self, message: str = "Issuer mismatch") -> None:
+        super().__init__(message)
+
+class InvalidTypeError(InvalidClaimsError):
+    def __init__(self, message: str = "Token type (typ) mismatch") -> None:
+        super().__init__(message)
+
+# Infrastructure and provider errors
+class ProviderFailureError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Cryptographic provider failure: " + message)
+
+class ConfigurationError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Configuration error: " + message)
+
+class ResourceLimitExceededError(CipherError):
+    def __init__(self, message: str) -> None:
+        super().__init__("Resource limit exceeded: " + message)

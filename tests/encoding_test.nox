@@ -1,0 +1,54 @@
+import nox.test
+from encoding import bytes_to_hex, decode_base64url, encode_base64url, hex_to_bytes
+from errors import EncodingError
+
+# 1. Roundtrip test
+plain: str = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+enc: str = encode_base64url(plain)
+dec: str = decode_base64url(enc)
+nox.test.assert_eq_str(dec, plain, "Base64URL roundtrip matches")
+
+# 2. Hex to raw bytes and back
+hex_in: str = "deadbeef0123456789abcdef"
+raw: str = hex_to_bytes(hex_in)
+hex_out: str = bytes_to_hex(raw)
+nox.test.assert_eq_str(hex_out, hex_in, "Hex conversions roundtrip matches")
+
+# 3. Negative tests: Reject '=' padding
+padded_rejected: bool = False
+try:
+    decode_base64url("eyJhbGciOiJIUzI1NiJ9==")
+except EncodingError:
+    padded_rejected = True
+nox.test.assert_true(padded_rejected, "Padding '=' must be strictly rejected")
+
+# 4. Negative tests: Reject '+' and '/'
+plus_rejected: bool = False
+try:
+    decode_base64url("abc+def")
+except EncodingError:
+    plus_rejected = True
+nox.test.assert_true(plus_rejected, "Standard base64 '+' must be rejected")
+
+slash_rejected: bool = False
+try:
+    decode_base64url("abc/def")
+except EncodingError:
+    slash_rejected = True
+nox.test.assert_true(slash_rejected, "Standard base64 '/' must be rejected")
+
+# 5. Negative tests: Reject whitespace
+ws_rejected: bool = False
+try:
+    decode_base64url("abc def")
+except EncodingError:
+    ws_rejected = True
+nox.test.assert_true(ws_rejected, "Whitespace must be rejected")
+
+# 6. Negative tests: Reject invalid characters
+invalid_char_rejected: bool = False
+try:
+    decode_base64url("abc@def")
+except EncodingError:
+    invalid_char_rejected = True
+nox.test.assert_true(invalid_char_rejected, "Invalid characters must be rejected")

@@ -1,0 +1,95 @@
+import nox.test
+from encoding import decode_base64url, encode_base64url
+from errors import DisallowedAlgorithmError, InvalidKeyError, InvalidSignatureError, JsonFormatError, MalformedTokenError, UnknownKeyError
+from jws import JwsSigner, JwsVerifier, VerificationProfile, VerifiedJws, sign_hs256, verify_hs256
+
+secret: str = "cipher-super-secure-production-test-key-32-bytes"
+payload: str = "{\"sub\":\"user_test_42\",\"role\":\"operator\"}"
+
+# 1. Positive: Sign and verify HS256 roundtrip
+algs: list[str] = ["HS256"]
+profile: VerificationProfile = VerificationProfile(algs, "key-2026")
+token: str = sign_hs256(payload, secret, kid="key-2026", typ="JWT")
+
+verified: VerifiedJws = verify_hs256(token, secret, profile)
+nox.test.assert_eq_str(verified.payload, payload, "Verified payload matches original")
+nox.test.assert_eq_str(verified.algorithm, "HS256", "Algorithm matches HS256")
+nox.test.assert_eq_str(verified.kid, "key-2026", "Key ID matches")
+
+# 2. RFC 7515 Section A.1 Official Test Vector
+rfc_token: str = "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+rfc_secret_b64: str = "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow"
+rfc_secret: str = decode_base64url(rfc_secret_b64)
+rfc_profile: VerificationProfile = VerificationProfile(algs, "")
+
+rfc_verified: VerifiedJws = verify_hs256(rfc_token, rfc_secret, rfc_profile)
+nox.test.assert_eq_str(rfc_verified.algorithm, "HS256", "RFC 7515 vector algorithm verified")
+nox.test.assert_true(nox.strings.contains(rfc_verified.payload, "joe"), "RFC 7515 vector payload contains joe")
+
+# 3. Negative: Tampered payload rejected
+tampered_payload_b64: str = encode_base64url("{\"sub\":\"attacker\"}")
+tampered_token: str = encode_base64url("{\"alg\":\"HS256\",\"kid\":\"key-2026\"}") + "." + tampered_payload_b64 + ".invalid_sig"
+
+tamper_rejected: bool = False
+try:
+    verify_hs256(tampered_token, secret, profile)
+except InvalidSignatureError:
+    tamper_rejected = True
+nox.test.assert_true(tamper_rejected, "Tampered token rejected with InvalidSignatureError")
+
+# 4. Negative: Segment count must be exactly 3
+wrong_segments_rejected: bool = False
+try:
+    verify_hs256("part1.part2", secret, profile)
+except MalformedTokenError:
+    wrong_segments_rejected = True
+nox.test.assert_true(wrong_segments_rejected, "Token with 2 parts rejected with MalformedTokenError")
+
+# 5. Negative: Unconditional rejection of alg=none
+none_header_b64: str = encode_base64url("{\"alg\":\"none\"}")
+none_token: str = none_header_b64 + "." + encode_base64url(payload) + "."
+none_rejected: bool = False
+try:
+    none_algs: list[str] = ["HS256", "none"]
+    none_profile: VerificationProfile = VerificationProfile(none_algs, "")
+    verify_hs256(none_token, secret, none_profile)
+except DisallowedAlgorithmError:
+    none_rejected = True
+nox.test.assert_true(none_rejected, "alg=none must be unconditionally rejected")
+
+# 6. Negative: Verifier-controlled algorithm allowlist
+disallowed_algs: list[str] = ["RS256"]
+disallowed_profile: VerificationProfile = VerificationProfile(disallowed_algs, "")
+alg_disallowed: bool = False
+try:
+    verify_hs256(token, secret, disallowed_profile)
+except DisallowedAlgorithmError:
+    alg_disallowed = True
+nox.test.assert_true(alg_disallowed, "Algorithm not in allowlist rejected with DisallowedAlgorithmError")
+
+# 7. Negative: kid mismatch
+kid_mismatch_profile: VerificationProfile = VerificationProfile(algs, "expected-different-kid")
+kid_mismatch: bool = False
+try:
+    verify_hs256(token, secret, kid_mismatch_profile)
+except UnknownKeyError:
+    kid_mismatch = True
+nox.test.assert_true(kid_mismatch, "Key ID mismatch rejected with UnknownKeyError")
+
+# 8. Negative: Secret key shorter than 32 bytes rejected
+short_key_rejected: bool = False
+try:
+    sign_hs256(payload, "short-secret-under-32-bytes")
+except InvalidKeyError:
+    short_key_rejected = True
+nox.test.assert_true(short_key_rejected, "HMAC secret under 32 bytes rejected with InvalidKeyError")
+
+# 9. Negative: Duplicate header keys rejected (RFC 8725 §3.10)
+dup_header: str = "{\"alg\":\"HS256\",\"alg\":\"HS256\"}"
+dup_token: str = encode_base64url(dup_header) + "." + encode_base64url(payload) + ".fakesig"
+dup_header_rejected: bool = False
+try:
+    verify_hs256(dup_token, secret, profile)
+except JsonFormatError:
+    dup_header_rejected = True
+nox.test.assert_true(dup_header_rejected, "Duplicate header key rejected with JsonFormatError")

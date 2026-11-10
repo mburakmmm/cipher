@@ -1,0 +1,98 @@
+# Cipher — Strict JSON Parser and Accessors
+# Enforces RFC 8725 Section 3.10 (Duplicate member rejection) and bounded size/nesting limits.
+
+from nox.json import JsonError
+import nox.json
+import nox.strings
+from errors import JsonFormatError, ResourceLimitExceededError
+
+MAX_JSON_BYTES: int = 65536  # 64 KB limit for security-sensitive headers and payload structures
+
+def parse_strict_json(raw_json: str) -> JsonValue:
+    byte_count: int = nox.strings.byte_len(raw_json)
+    if byte_count == 0:
+        raise JsonFormatError("JSON input cannot be empty")
+    if byte_count > MAX_JSON_BYTES:
+        raise ResourceLimitExceededError("JSON input exceeds maximum allowed size of 64KB")
+    
+    try:
+        val: JsonValue = nox.json.parse(raw_json)
+        return val
+    except JsonError:
+        raise JsonFormatError("Invalid or duplicate-key JSON input")
+
+def is_object(v: JsonValue) -> bool:
+    # In core.nox, kind == 5 represents Object
+    return v.kind == 5
+
+def has_field(v: JsonValue, key: str) -> bool:
+    if not is_object(v):
+        return False
+    i: int = 0
+    n: int = len(v.keys)
+    while i < n:
+        if v.keys[i] == key:
+            return True
+        i = i + 1
+    return False
+
+def get_field_value(v: JsonValue, key: str) -> JsonValue:
+    if not is_object(v):
+        raise JsonFormatError("JSON value is not an object")
+    i: int = 0
+    n: int = len(v.keys)
+    while i < n:
+        if v.keys[i] == key:
+            return v.vals[i]
+        i = i + 1
+    raise JsonFormatError("Missing required JSON field: " + key)
+
+def get_string_field(v: JsonValue, key: str, default_val: str = "", required: bool = True) -> str:
+    if not has_field(v, key):
+        if required:
+            raise JsonFormatError("Missing required string field: " + key)
+        return default_val
+    val: JsonValue = get_field_value(v, key)
+    if val.kind != 3:
+        raise JsonFormatError("Field '" + key + "' must be a string")
+    return val.s
+
+def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool = True) -> int:
+    if not has_field(v, key):
+        if required:
+            raise JsonFormatError("Missing required integer field: " + key)
+        return default_val
+    val: JsonValue = get_field_value(v, key)
+    if val.kind != 2:
+        raise JsonFormatError("Field '" + key + "' must be a numeric integer")
+    return int(val.n)
+
+def get_bool_field(v: JsonValue, key: str, default_val: bool = False, required: bool = True) -> bool:
+    if not has_field(v, key):
+        if required:
+            raise JsonFormatError("Missing required boolean field: " + key)
+        return default_val
+    val: JsonValue = get_field_value(v, key)
+    if val.kind != 1:
+        raise JsonFormatError("Field '" + key + "' must be a boolean")
+    return val.b
+
+def get_string_list_field(v: JsonValue, key: str, required: bool = True) -> list[str]:
+    empty: list[str] = []
+    if not has_field(v, key):
+        if required:
+            raise JsonFormatError("Missing required string array field: " + key)
+        return empty
+    val: JsonValue = get_field_value(v, key)
+    if val.kind != 4:
+        raise JsonFormatError("Field '" + key + "' must be an array")
+    out: list[str] = []
+    i: int = 0
+    n: int = len(val.arr)
+    while i < n:
+        item: JsonValue = val.arr[i]
+        if item.kind != 3:
+            raise JsonFormatError("Array elements in '" + key + "' must be strings")
+        out.append(item.s)
+        i = i + 1
+    return out

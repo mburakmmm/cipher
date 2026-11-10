@@ -1,0 +1,173 @@
+# Cipher — Standards-Compliant Compact JWS (RFC 7515 / RFC 7518)
+# Strict verification over exact ASCII bytes with verifier-controlled algorithm allowlists.
+
+import nox.strings
+from encoding import decode_base64url, encode_base64url
+from errors import DisallowedAlgorithmError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
+from json_strict import get_bool_field, get_string_field, get_string_list_field, has_field, parse_strict_json
+from provider import CryptoProvider, DefaultCryptoProvider
+
+MAX_TOKEN_BYTES: int = 131072  # 128 KB total compact JWS limit
+
+class ProtectedHeader:
+    alg: str
+    kid: str
+    typ: str
+    cty: str
+
+    def __init__(self, alg: str, kid: str = "", typ: str = "", cty: str = "") -> None:
+        self.alg = alg
+        self.kid = kid
+        self.typ = typ
+        self.cty = cty
+
+class VerificationProfile:
+    allowed_algs: list[str]
+    expected_kid: str
+
+    def __init__(self, allowed_algs: list[str], expected_kid: str = "") -> None:
+        self.allowed_algs = allowed_algs
+        self.expected_kid = expected_kid
+
+    def is_alg_allowed(self, alg: str) -> bool:
+        i: int = 0
+        n: int = len(self.allowed_algs)
+        while i < n:
+            if self.allowed_algs[i] == alg:
+                return True
+            i = i + 1
+        return False
+
+class VerifiedJws:
+    payload: str
+    header: ProtectedHeader
+    raw_signing_input: str
+    algorithm: str
+    kid: str
+
+    def __init__(self, payload: str, header: ProtectedHeader, raw_signing_input: str) -> None:
+        self.payload = payload
+        self.header = header
+        self.raw_signing_input = raw_signing_input
+        self.algorithm = header.alg
+        self.kid = header.kid
+
+def parse_protected_header(header_json: str) -> ProtectedHeader:
+    v: JsonValue = parse_strict_json(header_json)
+    
+    # RFC 7515 §4.1.1: 'alg' member is REQUIRED and MUST be a string
+    if not has_field(v, "alg"):
+        raise MalformedTokenError("Protected header missing required 'alg' parameter")
+    alg: str = get_string_field(v, "alg")
+    
+    # Non-negotiable: Unconditional rejection of 'none' algorithm (RFC 8725 §3.1)
+    if alg == "none" or alg == "None" or alg == "NONE":
+        raise DisallowedAlgorithmError("Unsecured algorithm 'none' is strictly prohibited")
+    
+    # RFC 7797 b64 check: unencoded payload is not supported in compact JWS
+    if has_field(v, "b64"):
+        b64_val: bool = get_bool_field(v, "b64", default_val=True, required=False)
+        if not b64_val:
+            raise MalformedTokenError("b64=false (RFC 7797) unencoded payload is not supported")
+    
+    # RFC 7515 §4.1.11 crit check: reject unknown extensions
+    if has_field(v, "crit"):
+        raise MalformedTokenError("Critical header extension 'crit' is not permitted")
+    
+    # Optional selector fields
+    kid: str = get_string_field(v, "kid", default_val="", required=False)
+    typ: str = get_string_field(v, "typ", default_val="", required=False)
+    cty: str = get_string_field(v, "cty", default_val="", required=False)
+    
+    return ProtectedHeader(alg, kid, typ, cty)
+
+class JwsSigner:
+    provider: CryptoProvider
+
+    def __init__(self) -> None:
+        self.provider = DefaultCryptoProvider()
+
+    def with_provider(self, provider: CryptoProvider) -> JwsSigner:
+        self.provider = provider
+        return self
+
+    def sign_hs256(self, payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
+        # Build strict JSON protected header
+        header_json: str = "{\"alg\":\"HS256\""
+        if typ != "":
+            header_json = header_json + ",\"typ\":\"" + typ + "\""
+        if kid != "":
+            header_json = header_json + ",\"kid\":\"" + kid + "\""
+        header_json = header_json + "}"
+        
+        header_b64: str = encode_base64url(header_json)
+        payload_b64: str = encode_base64url(payload)
+        signing_input: str = header_b64 + "." + payload_b64
+        
+        sig_raw: str = self.provider.sign_hmac_sha256(secret, signing_input)
+        sig_b64: str = encode_base64url(sig_raw)
+        
+        return signing_input + "." + sig_b64
+
+class JwsVerifier:
+    provider: CryptoProvider
+
+    def __init__(self) -> None:
+        self.provider = DefaultCryptoProvider()
+
+    def with_provider(self, provider: CryptoProvider) -> JwsVerifier:
+        self.provider = provider
+        return self
+
+    def verify_hs256(self, token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
+        token_len: int = nox.strings.byte_len(token)
+        if token_len > MAX_TOKEN_BYTES:
+            raise ResourceLimitExceededError("Compact JWS exceeds maximum size limit of 128KB")
+        
+        # Exactly 3 dot-separated segments
+        parts: list[str] = nox.strings.split(token, ".")
+        if len(parts) != 3:
+            raise MalformedTokenError("Compact JWS must contain exactly 3 dot-separated segments")
+        
+        header_b64: str = parts[0]
+        payload_b64: str = parts[1]
+        sig_b64: str = parts[2]
+        
+        # 1. Parse and validate protected header
+        header_json: str = decode_base64url(header_b64)
+        header: ProtectedHeader = parse_protected_header(header_json)
+        
+        # 2. Verifier-controlled algorithm enforcement
+        if not profile.is_alg_allowed(header.alg):
+            raise DisallowedAlgorithmError(header.alg)
+        
+        if header.alg != "HS256":
+            raise UnsupportedAlgorithmError(header.alg)
+        
+        # 3. Key selector (kid) enforcement
+        if profile.expected_kid != "":
+            if header.kid == "":
+                raise UnknownKeyError("Token missing required 'kid' selector")
+            if header.kid != profile.expected_kid:
+                raise UnknownKeyError(header.kid)
+        
+        # 4. Strict signature verification over exact ASCII bytes
+        signing_input: str = header_b64 + "." + payload_b64
+        sig_raw: str = decode_base64url(sig_b64)
+        
+        is_valid: bool = self.provider.verify_hmac_sha256(secret, signing_input, sig_raw)
+        if not is_valid:
+            raise InvalidSignatureError("Cryptographic HS256 signature mismatch")
+        
+        # 5. Decode verified payload
+        verified_payload: str = decode_base64url(payload_b64)
+        return VerifiedJws(verified_payload, header, signing_input)
+
+# Ergonomic standalone functions
+def sign_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
+    signer: JwsSigner = JwsSigner()
+    return signer.sign_hs256(payload, secret, kid, typ)
+
+def verify_hs256(token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
+    verifier: JwsVerifier = JwsVerifier()
+    return verifier.verify_hs256(token, secret, profile)

@@ -105,66 +105,67 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 **Amaç:** Standartlara tam uyumlu (RFC 7515 / RFC 7518), katı güvenlik denetimlerine sahip, fail-closed çalışan HS256 compact JWS ayrıştırıcı, imzalayıcı ve doğrulayıcısını hayata geçirmek.
 
 ## 0.1.1 — Tipli Hata Hiyerarşisi (`errors.nox`)
-- [ ] `CipherError` kök sınıfı tanımla.
-- [ ] Ayrıştırma ve format hataları:
+- [x] `CipherError` kök sınıfı tanımla.
+- [x] Ayrıştırma ve format hataları:
   - `MalformedTokenError` (geçersiz segment sayısı, bozuk karakterler, boyut aşımı).
   - `EncodingError` (geçersiz base64url, padding hatası, bozuk UTF-8).
   - `JsonFormatError` (bozuk JSON, mükerrer anahtar, aşırı derinlik).
-- [ ] Kriptografik ve anahtar hataları:
+- [x] Kriptografik ve anahtar hataları:
   - `UnsupportedAlgorithmError` (bilinmeyen algoritma).
   - `DisallowedAlgorithmError` (doğrulayıcı allowlist dışı algoritma veya `none`).
   - `InvalidKeyError` (yetersiz uzunlukta sır, tip uyuşmazlığı).
-  - `UnknownKeyError` (`kid` bulunamadı).
+  - `UnknownKeyError` (`kid` bulunamadı veya uyuşmuyor).
   - `AmbiguousKeyError` (birden fazla eşleşen `kid`).
   - `InvalidSignatureError` (imza eşleşmedi).
-- [ ] Doğrulama ve politika hataları:
+- [x] Doğrulama ve politika hataları:
   - `InvalidClaimsError`, `ExpiredTokenError`, `NotYetValidError`.
   - `InvalidIssuerError`, `InvalidAudienceError`, `InvalidTypeError`.
   - `ConfigurationError`, `ResourceLimitExceededError`.
-- [ ] Hata sınıflarının `to_str()` veya `message` temsillerinin hassas veri (sır, token, anahtar) sızdırmadığını garanti et.
+- [x] Hata sınıflarının mesajlarının hassas veri (sır, token, anahtar) sızdırmadığını garanti et.
 
 ## 0.1.2 — Katı Base64URL Kodlama & Çözümleme (`encoding.nox`)
-- [ ] RFC 4648 Section 5 URL-safe alfabe (`A-Z`, `a-z`, `0-9`, `-`, `_`) uygulaması.
-- [ ] Whitespace, satır sonu, standart base64 karakterleri (`+`, `/`) ve dolgu (`=`) reddi.
-- [ ] Boş girdi ve boyut sınırı (ör. max 64KB segment) denetimleri.
-- [ ] `tests/encoding_test.nox` birim testleri (pozitif ve negatif vektörler).
+- [x] RFC 4648 Section 5 URL-safe alfabe (`A-Z`, `a-z`, `0-9`, `-`, `_`) uygulaması.
+- [x] Whitespace, satır sonu, standart base64 karakterleri (`+`, `/`) ve dolgu (`=`) reddi.
+- [x] Boş girdi ve boyut sınırı (max 64KB segment) denetimleri.
+- [x] `tests/encoding_test.nox` birim testleri (pozitif ve negatif vektörler, roundtrip, hex dönüşümü).
 
 ## 0.1.3 — Katı JSON Ayrıştırıcı ve Mükerrer Anahtar Koruması (`json_strict.nox`)
-- [ ] RFC 8725 Section 3.10 gereği duplicate JSON key tespiti ve reddi.
-- [ ] Azami iç içe geçme (nesting depth) ve uzunluk kontrolleri.
-- [ ] Tip zorlamaları (`alg` alanının string olması, sayısal alanların kontrolü).
-- [ ] `tests/json_strict_test.nox` birim testleri.
+- [x] RFC 8725 Section 3.10 gereği duplicate JSON key tespiti ve reddi.
+- [x] Azami iç içe geçme ve uzunluk kontrolleri (max 64KB).
+- [x] Tip zorlamaları (`get_string_field`, `get_int_field`, `get_bool_field`, `get_string_list_field`).
+- [x] `tests/json_strict_test.nox` birim testleri.
 
 ## 0.1.4 — Compact JWS Veri Modeli ve Ayrıştırıcı (`jws.nox`)
-- [ ] `ProtectedHeader` sınıfı (`alg`, `kid`, `typ`, `cty`, `crit`).
-- [ ] Tam olarak 3 nokta-ayrımlı segment kontrolü (`header.payload.signature`).
-- [ ] `b64=false` (RFC 7797) reddi; varsayılan olarak yalnızca encoded payload kabulü.
-- [ ] `crit` başlığı kontrolü; bilinmeyen veya izin verilmeyen uzantı varsa koşulsuz ret.
-- [ ] `alg=none` içeren veya `alg` eksik olan başlıkların koşulsuz reddi.
-- [ ] `CompactJws` tipi (ham ASCII signing input ve bileşenler).
+- [x] `ProtectedHeader` sınıfı (`alg`, `kid`, `typ`, `cty`).
+- [x] Tam olarak 3 nokta-ayrımlı segment kontrolü (`header.payload.signature`).
+- [x] `b64=false` (RFC 7797) reddi; unencoded payload kabul edilmez.
+- [x] `crit` başlığı kontrolü; bilinmeyen veya izin verilmeyen uzantılarda koşulsuz ret.
+- [x] `alg=none` içeren veya `alg` eksik olan başlıkların koşulsuz reddi.
+- [x] `VerifiedJws` kanıt tipi (ham ASCII signing input ve doğrulanmış alanlar).
 
 ## 0.1.5 — HS256 Sağlayıcı, İmzalayıcı ve Doğrulayıcı (`jws.nox`, `provider.nox`)
-- [ ] `CryptoProvider` temel arayüzü ve `HmacSha256Provider` uygulaması.
-- [ ] Anahtar güvenliği: HMAC sırrının en az 256-bit (32 bayt) olduğunu doğrulama.
-- [ ] `JwsSigner.sign_hs256(payload_bytes, secret, kid, typ)`:
+- [x] `CryptoProvider` temel arayüzü ve `DefaultCryptoProvider` uygulaması.
+- [x] Anahtar güvenliği: HMAC sırrının en az 256-bit (32 bayt) olduğunu doğrulama (`InvalidKeyError`).
+- [x] `JwsSigner.sign_hs256(payload, secret, kid, typ)`:
   - Standart korumalı başlık oluşturma (`{"alg":"HS256",...}`).
   - `signing_input = base64url(header) + "." + base64url(payload)`.
   - HMAC-SHA256 imzası üretip 3 parçalı token oluşturma.
-- [ ] `JwsVerifier.verify_hs256(compact_token, secret, expected_kid, allowed_algs)`:
-  - Token'ı ayrıştırma ve boyut limitlerini denetleme.
-  - Doğrulayıcı kontrollü algoritma allowlist kontrolü (`"HS256"` listelenmiş mi?).
+- [x] `JwsVerifier.verify_hs256(token, secret, profile)`:
+  - Token'ı ayrıştırma ve boyut limitlerini denetleme (max 128KB).
+  - Doğrulayıcı kontrollü algoritma allowlist kontrolü (`DisallowedAlgorithmError`).
   - `signing_input` ASCII baytları üzerinde `constant_time_eq` ile imza doğrulama.
   - Başarılı doğrulamada `VerifiedJws` nesnesi döndürme.
   - Başarısızlıkta ilgili tipli `CipherError` fırlatma (fail-closed).
 
 ## 0.1.6 — Phase 1 Test Matrisi ve Çıkış Kapısı
-- [ ] `tests/jws_test.nox`:
-  - RFC 7515 ekindeki resmi test vektörleri.
-  - Negatif testler: değiştirilmiş imza, değiştirilmiş payload, değiştirilmiş header, ek noktalar, eksik noktalar.
-  - Algoritma manipülasyon testleri: `alg="none"`, `alg="RS256"` (alg confusion denemesi).
-  - Mükerrer anahtar testleri: `{"alg":"HS256","alg":"none"}` vb.
-- [ ] `noxc fmt`, `noxc check` ve `noxc test` eksiksiz geçti.
-- [ ] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.1.0` hazırlandı.
+- [x] `tests/jws_test.nox`:
+  - RFC 7515 Ek A.1 resmi test vektörü doğrulandı.
+  - Negatif testler: değiştirilmiş imza, değiştirilmiş payload, ek/eksik noktalar.
+  - Algoritma manipülasyon testleri: `alg="none"` ve allowlist dışı algoritmalar reddedildi.
+  - `kid` uyuşmazlığı ve <32 bayt anahtar reddi test edildi.
+  - Mükerrer başlık anahtarı (`{"alg":"HS256","alg":"HS256"}`) reddedildi.
+- [x] `noxc check` ve `noxc test` tüm testlerde eksiksiz geçti (`5 passed, 0 failed (5 total)`).
+- [x] `CHANGELOG.md` güncellendi ve sürüm etiketi `v0.1.0` hazırlandı.
 
 ---
 

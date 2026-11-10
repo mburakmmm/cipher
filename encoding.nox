@@ -1,0 +1,93 @@
+# Cipher — Strict Base64URL and Binary Encoding
+# Compliant with RFC 4648 Section 5 and RFC 7515 Section 2 (Unpadded, URL-safe).
+
+import nox.base64
+import nox.strings
+from errors import EncodingError, ResourceLimitExceededError
+
+MAX_SEGMENT_BYTES: int = 65536  # 64 KB maximum for a single compact JWS segment
+
+def _is_urlsafe_base64_char(code: int) -> bool:
+    # A-Z (65-90)
+    if code >= 65 and code <= 90:
+        return True
+    # a-z (97-122)
+    if code >= 97 and code <= 122:
+        return True
+    # 0-9 (48-57)
+    if code >= 48 and code <= 57:
+        return True
+    # '-' (45) or '_' (95)
+    if code == 45 or code == 95:
+        return True
+    return False
+
+def validate_base64url_syntax(s: str) -> None:
+    n: int = nox.strings.byte_len(s)
+    if n > MAX_SEGMENT_BYTES:
+        raise ResourceLimitExceededError("Segment size exceeds maximum limit of 64KB")
+    
+    i: int = 0
+    while i < n:
+        code: int = nox.strings.byte_at(s, i)
+        # Immediate rejection of standard base64 '+' (43), '/' (47), and padding '=' (61)
+        if code == 61:
+            raise EncodingError("Base64URL must not contain '=' padding characters")
+        if code == 43 or code == 47:
+            raise EncodingError("Base64URL must not contain '+' or '/' standard Base64 characters")
+        if code == 32 or code == 9 or code == 10 or code == 13:
+            raise EncodingError("Base64URL must not contain whitespace characters")
+        if not _is_urlsafe_base64_char(code):
+            raise EncodingError("Invalid character in Base64URL string")
+        i = i + 1
+
+def encode_base64url(raw: str) -> str:
+    n: int = nox.strings.byte_len(raw)
+    if n > MAX_SEGMENT_BYTES:
+        raise ResourceLimitExceededError("Payload size exceeds maximum limit of 64KB")
+    return nox.base64.encode_url(raw)
+
+def decode_base64url(encoded: str) -> str:
+    validate_base64url_syntax(encoded)
+    return nox.base64.decode(encoded)
+
+def _hex_char_to_val(c: int) -> int:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    raise EncodingError("Invalid hexadecimal digit")
+
+def _nibble_to_hex_char(val: int) -> str:
+    if val >= 0 and val <= 9:
+        return nox.strings.char_from_byte(48 + val)
+    if val >= 10 and val <= 15:
+        return nox.strings.char_from_byte(87 + val)
+    raise EncodingError("Invalid nibble value")
+
+def hex_to_bytes(hex_str: str) -> str:
+    n: int = nox.strings.byte_len(hex_str)
+    if n % 2 != 0:
+        raise EncodingError("Hexadecimal string length must be even")
+    out: str = ""
+    i: int = 0
+    while i < n:
+        hi: int = _hex_char_to_val(nox.strings.byte_at(hex_str, i))
+        lo: int = _hex_char_to_val(nox.strings.byte_at(hex_str, i + 1))
+        out = out + nox.strings.char_from_byte((hi << 4) | lo)
+        i = i + 2
+    return out
+
+def bytes_to_hex(raw: str) -> str:
+    n: int = nox.strings.byte_len(raw)
+    out: str = ""
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(raw, i)
+        hi: int = (b >> 4) & 15
+        lo: int = b & 15
+        out = out + _nibble_to_hex_char(hi) + _nibble_to_hex_char(lo)
+        i = i + 1
+    return out

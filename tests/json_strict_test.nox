@@ -1,0 +1,51 @@
+import nox.test
+from errors import JsonFormatError
+from json_strict import get_bool_field, get_int_field, get_string_field, get_string_list_field, has_field, parse_strict_json
+
+# 1. Parse valid JSON and verify accessors
+valid_json: str = "{\"alg\":\"HS256\",\"typ\":\"JWT\",\"exp\":1700000000,\"active\":true,\"roles\":[\"admin\",\"user\"]}"
+v: JsonValue = parse_strict_json(valid_json)
+
+nox.test.assert_true(has_field(v, "alg"), "has alg field")
+nox.test.assert_eq_str(get_string_field(v, "alg"), "HS256", "alg matches")
+nox.test.assert_eq_str(get_string_field(v, "typ"), "JWT", "typ matches")
+nox.test.assert_eq_int(get_int_field(v, "exp"), 1700000000, "exp matches")
+nox.test.assert_true(get_bool_field(v, "active"), "active matches")
+
+roles: list[str] = get_string_list_field(v, "roles")
+nox.test.assert_eq_int(len(roles), 2, "roles length matches")
+nox.test.assert_eq_str(roles[0], "admin", "first role")
+nox.test.assert_eq_str(roles[1], "user", "second role")
+
+# 2. Duplicate key rejection (RFC 8725 §3.10)
+dup_json: str = "{\"alg\":\"HS256\",\"alg\":\"none\"}"
+dup_caught: bool = False
+try:
+    parse_strict_json(dup_json)
+except JsonFormatError:
+    dup_caught = True
+nox.test.assert_true(dup_caught, "Duplicate JSON keys must be rejected with JsonFormatError")
+
+# 3. Missing required field rejection
+missing_caught: bool = False
+try:
+    get_string_field(v, "nonexistent", required=True)
+except JsonFormatError:
+    missing_caught = True
+nox.test.assert_true(missing_caught, "Missing required field raises JsonFormatError")
+
+# 4. Type mismatch rejection
+type_mismatch_caught: bool = False
+try:
+    get_string_field(v, "exp", required=True)
+except JsonFormatError:
+    type_mismatch_caught = True
+nox.test.assert_true(type_mismatch_caught, "Type mismatch raises JsonFormatError")
+
+# 5. Empty JSON input rejection
+empty_caught: bool = False
+try:
+    parse_strict_json("")
+except JsonFormatError:
+    empty_caught = True
+nox.test.assert_true(empty_caught, "Empty input raises JsonFormatError")
