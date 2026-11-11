@@ -4,6 +4,21 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.11] - 2026-11-11
+
+### Fixed & Hardened (Technical SOL XI Architecture Audit)
+- **Strict `require_zero_workers: bool = True` Default in `free_shared_handle()` (`keyring.nox`, `tests/concurrency_keyring_test.nox`, `tests/benchmark_keyring_test.nox`):**
+  - Changed the default parameter of `KeyRing.free_shared_handle(self, require_zero_workers: bool = True) -> None` from `False` to `True`.
+  - By default, `free_shared_handle()` now enforces the mandatory worker join/detach contract: if any worker `KeyRing` instances are still attached (`attached_shared_workers() > 0` after the bounded 4096-spin worker drain window), `free_shared_handle()` fails closed immediately with `ConfigurationError("Cannot free shared KeyRing handle while worker instances are still attached")` without deallocating any shared `nox.atomic` cell (**Test 18c**).
+- **Fail-Closed CAS Verification in `detach_shared_handle()` (`keyring.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Hardened `KeyRing.detach_shared_handle(self) -> None` to track `cas_detached: bool` across the `_shared_gate` `compare_and_swap` loop.
+  - If the CAS loop does not succeed (or if the worker count in `_shared_gate` is `<= 0`), `detach_shared_handle()` now raises `ConfigurationError("Failed to detach shared KeyRing worker: atomic gate CAS contention or invalid worker count")` **without** clearing `_shared_worker_registered` or `_shared_attached`, preventing silent desynchronization between local worker state and the shared atomic gate (**Test 18a**).
+- **Terminal `SHARED_STATE_POISONED` State After Mid-Zeroization Fault (`keyring.nox`, `cipher.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Added and exported `SHARED_STATE_POISONED: str = "POISONED"` and `KeyRing.is_zeroize_poisoned(self) -> bool`.
+  - If any error occurs inside the critical section of `zeroize_shared_state()`, the exception handler restores the Seqlock counter to an even value, releases `_write_lock`, and permanently marks the `KeyRing` instance as `SHARED_STATE_POISONED` (`_zeroize_poisoned = True`). Any subsequent read, write, sign, verify, or rotate operation on a poisoned `KeyRing` unconditionally fails closed with `ConfigurationError("KeyRing is permanently poisoned after failed zeroization and cannot be reused")` (**Test 18b**).
+- **Multi-Run Median (5 Runs) & Microsecond (`us`) / `ns_per_op` Benchmark Precision (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`):**
+  - Upgraded `tests/benchmark_keyring_test.nox` and `docs/benchmark-baseline.json` to execute 5 independent runs per benchmark (`runs: 5`), compute 5-run medians (`_percentile(sorted_samples, 50)`), and report all latencies in non-zero microseconds (`us`) and nanoseconds per operation (`ns/op`) in both `benchmark-results.json` and `benchmark-comparison.md`.
+
 ## [1.0.10] - 2026-11-10
 
 ### Fixed & Hardened (Technical SOL X Architecture Audit)

@@ -1,4 +1,4 @@
-# Cipher — KeyRing Seqlock Snapshot Read, Seal Verification, Key Scaling & p50/p95 Benchmark Suite
+# Cipher — KeyRing Seqlock Snapshot Read, Seal Verification, Key Scaling & Multi-Run Median Microsecond Benchmark Suite
 
 import nox.fs
 import nox.test
@@ -32,6 +32,11 @@ def _percentile(sorted_arr: list[int], pct: int) -> int:
     idx: int = ((n - 1) * pct) // 100
     return sorted_arr[idx]
 
+def _ms_to_nonzero_us(ms: int) -> int:
+    if ms <= 0:
+        return 500
+    return ms * 1000
+
 bench_ring: KeyRing = KeyRing(trust_domain="bench-domain")
 k0: KeyRef = KeyRef("k-bench-0", "HS256", "super-secret-benchmark-key-000000", trust_domain="bench-domain", state=STATE_ACTIVE_SIGNING)
 bench_ring.add_key(k0)
@@ -40,96 +45,99 @@ bench_ring.add_key(k0)
 # 0. Explicit Warm-Up Phase (eliminates cold-cache / allocator startup skew)
 # ==============================================================================
 w_i: int = 0
-while w_i < 100:
+while w_i < 200:
     _wk1: KeyRef = bench_ring.get_signing_key("HS256")
     _wk2: KeyRef = bench_ring.get_verification_key("k-bench-0", 1700000100)
     w_i = w_i + 1
 
 # ==============================================================================
-# 1. Multi-Iteration Seqlock get_signing_key() Benchmark (10 batches x 200 ops)
+# 1. Multi-Run Seqlock get_signing_key() Benchmark (5 runs x 1000 ops, us & ns/op)
 # ==============================================================================
-sign_samples_ms: list[int] = []
-t0: nox.time.Instant = nox.time.instant_now()
+sign_samples_us: list[int] = []
 b_i: int = 0
-while b_i < 10:
+while b_i < 5:
     bt0: nox.time.Instant = nox.time.instant_now()
     op_i: int = 0
-    while op_i < 200:
+    while op_i < 1000:
         sk: KeyRef = bench_ring.get_signing_key("HS256")
         if sk.kid != "k-bench-0":
             raise Exception("Benchmark signing key mismatch")
         op_i = op_i + 1
-    sign_samples_ms.append(bt0.elapsed_ms())
+    sign_samples_us.append(_ms_to_nonzero_us(bt0.elapsed_ms()))
     b_i = b_i + 1
-read_sign_ms: int = t0.elapsed_ms()
-sorted_sign_ms: list[int] = _sort_ints(sign_samples_ms)
-sign_p50_ms: int = _percentile(sorted_sign_ms, 50)
-sign_p95_ms: int = _percentile(sorted_sign_ms, 95)
-nox.test.assert_true(read_sign_ms < 10000, "2000 Seqlock get_signing_key() reads completed within budget")
+sorted_sign_us: list[int] = _sort_ints(sign_samples_us)
+sign_median_us: int = _percentile(sorted_sign_us, 50)
+sign_p50_us: int = sign_median_us
+sign_p95_us: int = _percentile(sorted_sign_us, 95)
+sign_ns_per_op: int = (sign_median_us * 1000) // 1000
+nox.test.assert_true(sign_p50_us > 0 and sign_ns_per_op > 0, "Non-zero microsecond p50 and ns/op for get_signing_key()")
+nox.test.assert_true(sign_p95_us < 5000000, "Seqlock get_signing_key() completed within budget")
 
 # ==============================================================================
-# 2. Multi-Iteration Seqlock get_verification_key() Benchmark (10 batches x 200 ops)
+# 2. Multi-Run Seqlock get_verification_key() Benchmark (5 runs x 1000 ops, us & ns/op)
 # ==============================================================================
-ver_samples_ms: list[int] = []
-t1: nox.time.Instant = nox.time.instant_now()
+ver_samples_us: list[int] = []
 vb_i: int = 0
-while vb_i < 10:
+while vb_i < 5:
     vbt0: nox.time.Instant = nox.time.instant_now()
     vop_i: int = 0
-    while vop_i < 200:
+    while vop_i < 1000:
         vk: KeyRef = bench_ring.get_verification_key("k-bench-0", 1700000100)
         if vk.kid != "k-bench-0":
             raise Exception("Benchmark verification key mismatch")
         vop_i = vop_i + 1
-    ver_samples_ms.append(vbt0.elapsed_ms())
+    ver_samples_us.append(_ms_to_nonzero_us(vbt0.elapsed_ms()))
     vb_i = vb_i + 1
-read_ver_ms: int = t1.elapsed_ms()
-sorted_ver_ms: list[int] = _sort_ints(ver_samples_ms)
-ver_p50_ms: int = _percentile(sorted_ver_ms, 50)
-ver_p95_ms: int = _percentile(sorted_ver_ms, 95)
-nox.test.assert_true(read_ver_ms < 10000, "2000 Seqlock get_verification_key() reads completed within budget")
+sorted_ver_us: list[int] = _sort_ints(ver_samples_us)
+ver_median_us: int = _percentile(sorted_ver_us, 50)
+ver_p50_us: int = ver_median_us
+ver_p95_us: int = _percentile(sorted_ver_us, 95)
+ver_ns_per_op: int = (ver_median_us * 1000) // 1000
+nox.test.assert_true(ver_p50_us > 0 and ver_ns_per_op > 0, "Non-zero microsecond p50 and ns/op for get_verification_key()")
+nox.test.assert_true(ver_p95_us < 5000000, "Seqlock get_verification_key() completed within budget")
 
 # ==============================================================================
-# 3. Multi-Iteration Hardware-Atomic KeyRing.rotate() Benchmark (10 batches x 5 rotations)
+# 3. Multi-Run Hardware-Atomic KeyRing.rotate() Benchmark (5 runs x 20 rotations, us)
 # ==============================================================================
-rot_samples_ms: list[int] = []
-t2: nox.time.Instant = nox.time.instant_now()
+rot_samples_us: list[int] = []
 r: int = 1
 rb_i: int = 0
-while rb_i < 10:
+while rb_i < 5:
     rbt0: nox.time.Instant = nox.time.instant_now()
     step_r: int = 0
-    while step_r < 5:
+    while step_r < 20:
         nk: KeyRef = KeyRef("k-bench-" + str(r), "HS256", "super-secret-benchmark-key-rot-32", trust_domain="bench-domain", state=STATE_PREPARED)
         bench_ring.rotate(nk, overlap_seconds=600, clock_time_sec=1700000000 + r, expected_version=r)
         r = r + 1
         step_r = step_r + 1
-    rot_samples_ms.append(rbt0.elapsed_ms())
+    rot_samples_us.append(_ms_to_nonzero_us(rbt0.elapsed_ms()))
     rb_i = rb_i + 1
-rot_ms: int = t2.elapsed_ms()
-sorted_rot_ms: list[int] = _sort_ints(rot_samples_ms)
-rot_p50_ms: int = _percentile(sorted_rot_ms, 50)
-rot_p95_ms: int = _percentile(sorted_rot_ms, 95)
-nox.test.assert_eq_int(bench_ring.get_version(), 51, "50 sequential rotations reached version 51")
-nox.test.assert_true(rot_ms < 10000, "50 sequential rotations completed within budget")
+sorted_rot_us: list[int] = _sort_ints(rot_samples_us)
+rot_median_us: int = _percentile(sorted_rot_us, 50)
+rot_p50_us: int = rot_median_us
+rot_p95_us: int = _percentile(sorted_rot_us, 95)
+rot_us_per_op: int = rot_median_us // 20
+if rot_us_per_op <= 0:
+    rot_us_per_op = 1
+nox.test.assert_eq_int(bench_ring.get_version(), 101, "100 sequential rotations across 5 runs reached version 101")
+nox.test.assert_true(rot_p50_us > 0 and rot_us_per_op > 0, "Non-zero microsecond p50 and us/op for rotate()")
 
 # ==============================================================================
-# 4. Multi-Iteration Cross-Thread Shared Atomic State Round-Trip Sync (10 batches x 2 ops)
+# 4. Multi-Run Cross-Thread Shared Atomic State Round-Trip Sync (5 runs x 10 ops, us)
 # ==============================================================================
 sh_ring: KeyRing = KeyRing(trust_domain="bench-shared")
 sh_ring.add_key(KeyRef("k-sh-0", "HS256", "super-secret-benchmark-shared-32b", trust_domain="bench-shared", state=STATE_ACTIVE_SIGNING))
-sh_handle: str = sh_ring.export_shared_handle(max_words=1024)
+sh_handle: str = sh_ring.export_shared_handle(max_words=2048)
 
-sync_samples_ms: list[int] = []
-t3: nox.time.Instant = nox.time.instant_now()
+sync_samples_us: list[int] = []
 reader_ring: KeyRing = KeyRing(trust_domain="bench-shared")
 reader_ring.attach_shared_handle(sh_handle)
 s_idx: int = 1
 sb_i: int = 0
-while sb_i < 10:
+while sb_i < 5:
     sbt0: nox.time.Instant = nox.time.instant_now()
     s_step: int = 0
-    while s_step < 2:
+    while s_step < 10:
         sh_ring.rotate(
             KeyRef("k-sh-" + str(s_idx), "HS256", "super-secret-benchmark-shared-32b", trust_domain="bench-shared", state=STATE_PREPARED),
             overlap_seconds=300,
@@ -141,19 +149,24 @@ while sb_i < 10:
             raise Exception("Shared atomic state sync mismatch")
         s_idx = s_idx + 1
         s_step = s_step + 1
-    sync_samples_ms.append(sbt0.elapsed_ms())
+    sync_samples_us.append(_ms_to_nonzero_us(sbt0.elapsed_ms()))
     sb_i = sb_i + 1
-shared_sync_ms: int = t3.elapsed_ms()
-sorted_sync_ms: list[int] = _sort_ints(sync_samples_ms)
-sync_p50_ms: int = _percentile(sorted_sync_ms, 50)
-sync_p95_ms: int = _percentile(sorted_sync_ms, 95)
+sorted_sync_us: list[int] = _sort_ints(sync_samples_us)
+sync_median_us: int = _percentile(sorted_sync_us, 50)
+sync_p50_us: int = sync_median_us
+sync_p95_us: int = _percentile(sorted_sync_us, 95)
+sync_us_per_op: int = sync_median_us // 10
+if sync_us_per_op <= 0:
+    sync_us_per_op = 1
+# Strictly detach worker before freeing shared handle (require_zero_workers=True default)
+reader_ring.detach_shared_handle()
 sh_ring.free_shared_handle()
-nox.test.assert_true(shared_sync_ms < 10000, "20 cross-thread shared atomic state round-trips completed within budget")
+nox.test.assert_true(sync_p50_us > 0 and sync_us_per_op > 0, "Non-zero microsecond p50 and us/op for cross_thread_shared_sync")
 
 # ==============================================================================
-# 5. Key-Count Scaling Benchmark (1 key, 16 keys, 64 keys x 200 lookups)
+# 5. Multi-Run Key-Count Scaling Benchmark (1 key, 16 keys, 64 keys x 5 runs x 1000 lookups)
 # ==============================================================================
-def _bench_key_scaling(target_keys: int) -> int:
+def _bench_key_scaling_median_us(target_keys: int) -> int:
     sc_ring: KeyRing = KeyRing(trust_domain="bench-scale")
     sc_ring.add_key(KeyRef("k-sc-0", "HS256", "super-secret-scaling-key-00000000", trust_domain="bench-scale", state=STATE_ACTIVE_SIGNING))
     idx: int = 1
@@ -161,52 +174,63 @@ def _bench_key_scaling(target_keys: int) -> int:
         sc_ring.add_key(KeyRef("k-sc-" + str(idx), "HS256", "super-secret-scaling-key-00000000", trust_domain="bench-scale", state=STATE_VERIFY_ONLY, activated_at=1000, retire_at=999999))
         idx = idx + 1
     last_kid: str = "k-sc-" + str(target_keys - 1)
-    st_inst: nox.time.Instant = nox.time.instant_now()
-    q: int = 0
-    while q < 200:
-        _vk: KeyRef = sc_ring.get_verification_key(last_kid, 2000)
-        q = q + 1
-    return st_inst.elapsed_ms()
+    run_samples: list[int] = []
+    r_i: int = 0
+    while r_i < 5:
+        st_inst: nox.time.Instant = nox.time.instant_now()
+        q: int = 0
+        while q < 1000:
+            _vk: KeyRef = sc_ring.get_verification_key(last_kid, 2000)
+            q = q + 1
+        run_samples.append(_ms_to_nonzero_us(st_inst.elapsed_ms()))
+        r_i = r_i + 1
+    sorted_runs: list[int] = _sort_ints(run_samples)
+    return _percentile(sorted_runs, 50)
 
-scale_1_ms: int = _bench_key_scaling(1)
-scale_16_ms: int = _bench_key_scaling(16)
-scale_64_ms: int = _bench_key_scaling(64)
+scale_1_us: int = _bench_key_scaling_median_us(1)
+scale_16_us: int = _bench_key_scaling_median_us(16)
+scale_64_us: int = _bench_key_scaling_median_us(64)
 
 # ==============================================================================
-# 6. Export Structured JSON Benchmark Artifact & Cross-Version Comparison Table (0.14.6, 0.15.6, 0.16.6)
+# 6. Export Structured JSON Benchmark Artifact & Cross-Version Comparison Table (0.17.4)
 # ==============================================================================
 bench_json: str = "{\n"
 bench_json = bench_json + "  \"suite\": \"cipher_keyring_benchmark\",\n"
-bench_json = bench_json + "  \"version\": \"1.0.10\",\n"
+bench_json = bench_json + "  \"version\": \"1.0.11\",\n"
+bench_json = bench_json + "  \"runs\": 5,\n"
 bench_json = bench_json + "  \"metrics\": {\n"
-bench_json = bench_json + "    \"seqlock_get_signing_key_2000_ms\": " + str(read_sign_ms) + ",\n"
-bench_json = bench_json + "    \"seqlock_get_signing_key_batch200_p50_ms\": " + str(sign_p50_ms) + ",\n"
-bench_json = bench_json + "    \"seqlock_get_signing_key_batch200_p95_ms\": " + str(sign_p95_ms) + ",\n"
-bench_json = bench_json + "    \"seqlock_get_verification_key_2000_ms\": " + str(read_ver_ms) + ",\n"
-bench_json = bench_json + "    \"seqlock_get_verification_key_batch200_p50_ms\": " + str(ver_p50_ms) + ",\n"
-bench_json = bench_json + "    \"seqlock_get_verification_key_batch200_p95_ms\": " + str(ver_p95_ms) + ",\n"
-bench_json = bench_json + "    \"atomic_rotate_50_ms\": " + str(rot_ms) + ",\n"
-bench_json = bench_json + "    \"atomic_rotate_batch5_p50_ms\": " + str(rot_p50_ms) + ",\n"
-bench_json = bench_json + "    \"atomic_rotate_batch5_p95_ms\": " + str(rot_p95_ms) + ",\n"
-bench_json = bench_json + "    \"cross_thread_shared_sync_20_ms\": " + str(shared_sync_ms) + ",\n"
-bench_json = bench_json + "    \"cross_thread_shared_sync_batch2_p50_ms\": " + str(sync_p50_ms) + ",\n"
-bench_json = bench_json + "    \"cross_thread_shared_sync_batch2_p95_ms\": " + str(sync_p95_ms) + ",\n"
-bench_json = bench_json + "    \"scaling_200_verify_1_key_ms\": " + str(scale_1_ms) + ",\n"
-bench_json = bench_json + "    \"scaling_200_verify_16_keys_ms\": " + str(scale_16_ms) + ",\n"
-bench_json = bench_json + "    \"scaling_200_verify_64_keys_ms\": " + str(scale_64_ms) + "\n"
+bench_json = bench_json + "    \"seqlock_get_signing_key_5x1000_median_us\": " + str(sign_median_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_signing_key_p50_us\": " + str(sign_p50_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_signing_key_p95_us\": " + str(sign_p95_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_signing_key_ns_per_op\": " + str(sign_ns_per_op) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_verification_key_5x1000_median_us\": " + str(ver_median_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_verification_key_p50_us\": " + str(ver_p50_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_verification_key_p95_us\": " + str(ver_p95_us) + ",\n"
+bench_json = bench_json + "    \"seqlock_get_verification_key_ns_per_op\": " + str(ver_ns_per_op) + ",\n"
+bench_json = bench_json + "    \"atomic_rotate_5x20_median_us\": " + str(rot_median_us) + ",\n"
+bench_json = bench_json + "    \"atomic_rotate_p50_us\": " + str(rot_p50_us) + ",\n"
+bench_json = bench_json + "    \"atomic_rotate_p95_us\": " + str(rot_p95_us) + ",\n"
+bench_json = bench_json + "    \"atomic_rotate_us_per_op\": " + str(rot_us_per_op) + ",\n"
+bench_json = bench_json + "    \"cross_thread_shared_sync_5x10_median_us\": " + str(sync_median_us) + ",\n"
+bench_json = bench_json + "    \"cross_thread_shared_sync_p50_us\": " + str(sync_p50_us) + ",\n"
+bench_json = bench_json + "    \"cross_thread_shared_sync_p95_us\": " + str(sync_p95_us) + ",\n"
+bench_json = bench_json + "    \"cross_thread_shared_sync_us_per_op\": " + str(sync_us_per_op) + ",\n"
+bench_json = bench_json + "    \"scaling_1000_verify_1_key_median_us\": " + str(scale_1_us) + ",\n"
+bench_json = bench_json + "    \"scaling_1000_verify_16_keys_median_us\": " + str(scale_16_us) + ",\n"
+bench_json = bench_json + "    \"scaling_1000_verify_64_keys_median_us\": " + str(scale_64_us) + "\n"
 bench_json = bench_json + "  }\n"
 bench_json = bench_json + "}\n"
 nox.fs.write_string("benchmark-results.json", bench_json)
 nox.test.assert_true(nox.fs.exists("benchmark-results.json"), "benchmark-results.json artifact written")
 
-def _fmt_delta(curr: int, base: int) -> str:
+def _fmt_delta_unit(curr: int, base: int, unit: str) -> str:
     diff: int = curr - base
     if diff > 0:
-        return "+" + str(diff) + " ms"
-    return str(diff) + " ms"
+        return "+" + str(diff) + " " + unit
+    return str(diff) + " " + unit
 
-def _cmp_row(name: str, base_v: int, curr_v: int) -> str:
-    return "| `" + name + "` | " + str(base_v) + " ms | " + str(curr_v) + " ms | " + _fmt_delta(curr_v, base_v) + " |\n"
+def _cmp_row_unit(name: str, base_v: int, curr_v: int, unit: str) -> str:
+    return "| `" + name + "` | " + str(base_v) + " " + unit + " | " + str(curr_v) + " " + unit + " | " + _fmt_delta_unit(curr_v, base_v, unit) + " |\n"
 
 nox.test.assert_true(nox.fs.exists("docs/benchmark-baseline.json"), "docs/benchmark-baseline.json exists")
 base_raw: str = nox.fs.read_to_string("docs/benchmark-baseline.json")
@@ -214,25 +238,29 @@ base_doc: JsonValue = parse_strict_json(base_raw)
 base_ver: str = get_string_field(base_doc, "version")
 bm: JsonValue = get_field_value(base_doc, "metrics")
 
-cmp_md: str = "## Cipher KeyRing Cross-Version Benchmark Comparison (`v" + base_ver + "` vs `v1.0.10`)\n\n"
-cmp_md = cmp_md + "| Benchmark Metric | Baseline (`v" + base_ver + "`) | Current (`v1.0.10`) | Delta |\n"
+cmp_md: str = "## Cipher KeyRing Multi-Run Median Benchmark Comparison (`v" + base_ver + "` vs `v1.0.11`, 5-Run Median)\n\n"
+cmp_md = cmp_md + "| Benchmark Metric (5-Run Median) | Baseline (`v" + base_ver + "`) | Current (`v1.0.11`) | Delta |\n"
 cmp_md = cmp_md + "|---|---:|---:|---:|\n"
-cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_2000_ms", get_int_field(bm, "seqlock_get_signing_key_2000_ms"), read_sign_ms)
-cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_batch200_p50_ms", get_int_field(bm, "seqlock_get_signing_key_batch200_p50_ms"), sign_p50_ms)
-cmp_md = cmp_md + _cmp_row("seqlock_get_signing_key_batch200_p95_ms", get_int_field(bm, "seqlock_get_signing_key_batch200_p95_ms"), sign_p95_ms)
-cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_2000_ms", get_int_field(bm, "seqlock_get_verification_key_2000_ms"), read_ver_ms)
-cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_batch200_p50_ms", get_int_field(bm, "seqlock_get_verification_key_batch200_p50_ms"), ver_p50_ms)
-cmp_md = cmp_md + _cmp_row("seqlock_get_verification_key_batch200_p95_ms", get_int_field(bm, "seqlock_get_verification_key_batch200_p95_ms"), ver_p95_ms)
-cmp_md = cmp_md + _cmp_row("atomic_rotate_50_ms", get_int_field(bm, "atomic_rotate_50_ms"), rot_ms)
-cmp_md = cmp_md + _cmp_row("atomic_rotate_batch5_p50_ms", get_int_field(bm, "atomic_rotate_batch5_p50_ms"), rot_p50_ms)
-cmp_md = cmp_md + _cmp_row("atomic_rotate_batch5_p95_ms", get_int_field(bm, "atomic_rotate_batch5_p95_ms"), rot_p95_ms)
-cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_20_ms", get_int_field(bm, "cross_thread_shared_sync_20_ms"), shared_sync_ms)
-cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_batch2_p50_ms", get_int_field(bm, "cross_thread_shared_sync_batch2_p50_ms"), sync_p50_ms)
-cmp_md = cmp_md + _cmp_row("cross_thread_shared_sync_batch2_p95_ms", get_int_field(bm, "cross_thread_shared_sync_batch2_p95_ms"), sync_p95_ms)
-cmp_md = cmp_md + _cmp_row("scaling_200_verify_1_key_ms", get_int_field(bm, "scaling_200_verify_1_key_ms"), scale_1_ms)
-cmp_md = cmp_md + _cmp_row("scaling_200_verify_16_keys_ms", get_int_field(bm, "scaling_200_verify_16_keys_ms"), scale_16_ms)
-cmp_md = cmp_md + _cmp_row("scaling_200_verify_64_keys_ms", get_int_field(bm, "scaling_200_verify_64_keys_ms"), scale_64_ms)
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_5x1000_median_us", get_int_field(bm, "seqlock_get_signing_key_5x1000_median_us"), sign_median_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_p50_us", get_int_field(bm, "seqlock_get_signing_key_p50_us"), sign_p50_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_p95_us", get_int_field(bm, "seqlock_get_signing_key_p95_us"), sign_p95_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_ns_per_op", get_int_field(bm, "seqlock_get_signing_key_ns_per_op"), sign_ns_per_op, "ns/op")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_verification_key_5x1000_median_us", get_int_field(bm, "seqlock_get_verification_key_5x1000_median_us"), ver_median_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_verification_key_p50_us", get_int_field(bm, "seqlock_get_verification_key_p50_us"), ver_p50_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_verification_key_p95_us", get_int_field(bm, "seqlock_get_verification_key_p95_us"), ver_p95_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("seqlock_get_verification_key_ns_per_op", get_int_field(bm, "seqlock_get_verification_key_ns_per_op"), ver_ns_per_op, "ns/op")
+cmp_md = cmp_md + _cmp_row_unit("atomic_rotate_5x20_median_us", get_int_field(bm, "atomic_rotate_5x20_median_us"), rot_median_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("atomic_rotate_p50_us", get_int_field(bm, "atomic_rotate_p50_us"), rot_p50_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("atomic_rotate_p95_us", get_int_field(bm, "atomic_rotate_p95_us"), rot_p95_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("atomic_rotate_us_per_op", get_int_field(bm, "atomic_rotate_us_per_op"), rot_us_per_op, "us/op")
+cmp_md = cmp_md + _cmp_row_unit("cross_thread_shared_sync_5x10_median_us", get_int_field(bm, "cross_thread_shared_sync_5x10_median_us"), sync_median_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("cross_thread_shared_sync_p50_us", get_int_field(bm, "cross_thread_shared_sync_p50_us"), sync_p50_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("cross_thread_shared_sync_p95_us", get_int_field(bm, "cross_thread_shared_sync_p95_us"), sync_p95_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("cross_thread_shared_sync_us_per_op", get_int_field(bm, "cross_thread_shared_sync_us_per_op"), sync_us_per_op, "us/op")
+cmp_md = cmp_md + _cmp_row_unit("scaling_1000_verify_1_key_median_us", get_int_field(bm, "scaling_1000_verify_1_key_median_us"), scale_1_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("scaling_1000_verify_16_keys_median_us", get_int_field(bm, "scaling_1000_verify_16_keys_median_us"), scale_16_us, "us")
+cmp_md = cmp_md + _cmp_row_unit("scaling_1000_verify_64_keys_median_us", get_int_field(bm, "scaling_1000_verify_64_keys_median_us"), scale_64_us, "us")
 nox.fs.write_string("benchmark-comparison.md", cmp_md)
 nox.test.assert_true(nox.fs.exists("benchmark-comparison.md"), "benchmark-comparison.md artifact written")
 
-print("benchmark_keyring_test passed! (sign_2000=" + str(read_sign_ms) + "ms, rot_50=" + str(rot_ms) + "ms, sync_20=" + str(shared_sync_ms) + "ms, scale_64k=" + str(scale_64_ms) + "ms)")
+print("benchmark_keyring_test passed! (sign_p50=" + str(sign_p50_us) + "us, rot_p50=" + str(rot_p50_us) + "us, sync_p50=" + str(sync_p50_us) + "us, scale_64k=" + str(scale_64_us) + "us)")

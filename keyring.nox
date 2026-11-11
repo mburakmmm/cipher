@@ -30,6 +30,7 @@ SHARED_STATE_ALIVE: str = "ALIVE"
 SHARED_STATE_CLOSING: str = "CLOSING"
 SHARED_STATE_DRAINING: str = "DRAINING"
 SHARED_STATE_DESTROYED: str = "DESTROYED"
+SHARED_STATE_POISONED: str = "POISONED"
 
 def redact_shared_handle(handle_str: str) -> str:
     if nox.strings.byte_len(handle_str) == 0:
@@ -240,6 +241,8 @@ class KeyRing:
     _shared_attached: bool
     _is_shared_owner: bool
     _shared_worker_registered: bool
+    _zeroize_poisoned: bool
+    _zeroize_fault_inject: bool
     _shared_lifecycle_local: str
     _shared_synced_seq: int
     _shared_alive: nox.atomic.AtomicBool
@@ -263,6 +266,8 @@ class KeyRing:
         self._shared_attached = False
         self._is_shared_owner = False
         self._shared_worker_registered = False
+        self._zeroize_poisoned = False
+        self._zeroize_fault_inject = False
         self._shared_lifecycle_local = SHARED_STATE_UNSHARED
         self._shared_synced_seq = 0
         self._shared_alive = nox.atomic.from_bool_handle(0)
@@ -331,7 +336,9 @@ class KeyRing:
         return words
 
     def get_shared_lifecycle_state(self) -> str:
-        # Explicit 5-state lifecycle machine: UNSHARED -> ALIVE -> CLOSING -> DRAINING -> DESTROYED
+        # Explicit lifecycle machine: UNSHARED -> ALIVE -> CLOSING -> DRAINING -> DESTROYED (or POISONED on zeroize fault)
+        if self._zeroize_poisoned:
+            return SHARED_STATE_POISONED
         if not self._shared_attached:
             return self._shared_lifecycle_local
         g_val: int = self._shared_gate.add(0)
@@ -342,6 +349,9 @@ class KeyRing:
         if not self._shared_alive.load():
             return SHARED_STATE_DRAINING
         return SHARED_STATE_ALIVE
+
+    def is_zeroize_poisoned(self) -> bool:
+        return self._zeroize_poisoned
 
     def is_shared_owner(self) -> bool:
         return self._shared_attached and self._is_shared_owner
@@ -602,14 +612,18 @@ class KeyRing:
             raise ConfigurationError("Owning KeyRing instance cannot call detach_shared_handle(); use free_shared_handle() instead")
         if self._shared_worker_registered:
             spins: int = 0
+            cas_detached: bool = False
             while spins < MAX_SEQLOCK_ATTEMPTS:
                 cur: int = self._shared_gate.add(0)
                 workers: int = (cur >> 32) & SHARED_READER_MASK
                 if workers <= 0:
                     break
                 if self._shared_gate.compare_and_swap(cur, cur - SHARED_WORKER_UNIT):
+                    cas_detached = True
                     break
                 spins = spins + 1
+            if not cas_detached:
+                raise ConfigurationError("Failed to detach shared KeyRing worker: atomic gate CAS contention or invalid worker count")
             self._shared_worker_registered = False
         cur_ver: int = self._state.version
         self._write_lock = nox.atomic.new_bool(False)
@@ -660,8 +674,9 @@ class KeyRing:
         # modifying any shared cell. If another writer holds the lock and it cannot
         # be acquired within the bounded spin window, fails closed with ConfigurationError
         # without touching a single shared cell!
-        # Critical section is wrapped in try/except (0.16.4) so _write_lock is ALWAYS
-        # released and Seqlock is restored to an even value on any error.
+        # Critical section is wrapped in try/except (0.16.4 & 0.17.3) so _write_lock is ALWAYS
+        # released, Seqlock is restored to an even value, and on any mid-zeroization error
+        # the KeyRing is permanently marked SHARED_STATE_POISONED and can never be reused.
         if not self._shared_attached:
             return
         if not self._is_shared_owner:
@@ -706,6 +721,8 @@ class KeyRing:
             i: int = 0
             while i < len(self._shared_cells):
                 self._shared_cells[i].store(0)
+                if i == 0 and self._zeroize_fault_inject:
+                    raise ConfigurationError("Simulated mid-zeroization fault after partial cell scrub")
                 i = i + 1
             k_i: int = 0
             while k_i < len(self._shared_key_cells):
@@ -722,6 +739,14 @@ class KeyRing:
                 seq_odd_entered = False
             self._shared_lifecycle_local = SHARED_STATE_DRAINING
         except Exception as err:
+            # Permanently poison this KeyRing instance so a partially zeroed state can NEVER be reused (0.17.3)
+            self._zeroize_poisoned = True
+            self._shared_lifecycle_local = SHARED_STATE_POISONED
+            self._shared_alive.store(False)
+            empty_p_keys: list[KeyRef] = []
+            self._state = KeyRingState(0, empty_p_keys, 0)
+            self._seal_key = ""
+            self._state_mac = ""
             if seq_odd_entered:
                 self._seq.add(1)
             self._write_lock.store(False)
@@ -734,14 +759,20 @@ class KeyRing:
             return 0
         return self._shared_gate.add(0) & SHARED_READER_MASK
 
-    def free_shared_handle(self, require_zero_workers: bool = False) -> None:
+    def free_shared_handle(self, require_zero_workers: bool = True) -> None:
         if self._shared_attached:
             if not self._is_shared_owner:
                 raise ConfigurationError("Only the owning KeyRing instance may call free_shared_handle(); worker instances must call detach_shared_handle()")
+            if require_zero_workers:
+                w_spins: int = 0
+                while self.attached_shared_workers() > 0 and w_spins < 4096:
+                    w_spins = w_spins + 1
+                if self.attached_shared_workers() > 0:
+                    raise ConfigurationError("Cannot free shared KeyRing handle while worker instances are still attached")
+            if not self._zeroize_poisoned and (self._shared_alive.load() or (self._shared_gate.add(0) & SHARED_CLOSING_BIT) == 0):
+                self.zeroize_shared_state()
             if require_zero_workers and self.attached_shared_workers() > 0:
                 raise ConfigurationError("Cannot free shared KeyRing handle while worker instances are still attached")
-            if self._shared_alive.load() or (self._shared_gate.add(0) & SHARED_CLOSING_BIT) == 0:
-                self.zeroize_shared_state()
             # Drain all active concurrent readers via single-word _shared_gate before deallocating cells.
             # Because SHARED_CLOSING_BIT is set in _shared_gate, no new reader can ever increment
             # the low 30 bits; once (gate & SHARED_READER_MASK) reaches 0, it remains 0 permanently.
@@ -764,9 +795,12 @@ class KeyRing:
             self._shared_attached = False
             self._is_shared_owner = False
             self._shared_worker_registered = False
-            self._shared_lifecycle_local = SHARED_STATE_DESTROYED
+            if not self._zeroize_poisoned:
+                self._shared_lifecycle_local = SHARED_STATE_DESTROYED
 
     def _read_consistent_state_inner(self) -> KeyRingState:
+        if self._zeroize_poisoned:
+            raise ConfigurationError("KeyRing is permanently poisoned after failed zeroization and cannot be reused")
         # Seqlock + Hardware Acquire-Release RMW Reader Protocol
         # Uses self._seq.add(0) which compiles to 'ldaddal' on ARM64 and 'lock xadd' on x86_64:
         # - Acquire semantics on s1 prevent subsequent loads of _state / _shared_cells from floating above s1.
@@ -813,6 +847,8 @@ class KeyRing:
         raise ConfigurationError("KeyRing read contention timeout: writer active in critical section")
 
     def _read_consistent_state(self) -> KeyRingState:
+        if self._zeroize_poisoned:
+            raise ConfigurationError("KeyRing is permanently poisoned after failed zeroization and cannot be reused")
         if not self._shared_attached:
             return self._read_consistent_state_inner()
         # Acquire single-word CAS reader gate (_shared_gate):
@@ -847,6 +883,8 @@ class KeyRing:
         self._write_lock.store(False)
 
     def _commit_state(self, base_ver: int, new_state: KeyRingState) -> None:
+        if self._zeroize_poisoned:
+            raise ConfigurationError("KeyRing is permanently poisoned after failed zeroization and cannot be reused")
         if self._shared_attached and ((self._shared_gate.add(0) & SHARED_CLOSING_BIT) != 0 or not self._shared_alive.load()):
             raise ConfigurationError("Shared KeyRing handle has been zeroized or destroyed")
         # 1. Hardware Atomic Writer Mutex Acquisition (nox_atomic_cas on AtomicBool: casal / lock cmpxchg)

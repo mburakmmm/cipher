@@ -4,7 +4,7 @@ import nox.test
 import nox.thread
 from errors import AmbiguousKeyError, ConfigurationError, KeyUnavailableError, UnknownKeyError
 from keys import KeyRef, STATE_ACTIVE_SIGNING, STATE_PREPARED, STATE_REVOKED, STATE_VERIFY_ONLY
-from keyring import KeyRing, KeyRingState, SHARED_CLOSING_BIT, SHARED_READER_MASK, SHARED_STATE_ALIVE, SHARED_STATE_CLOSING, SHARED_STATE_DESTROYED, SHARED_STATE_DRAINING, SHARED_STATE_UNSHARED, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical, redact_shared_handle
+from keyring import KeyRing, KeyRingState, SHARED_CLOSING_BIT, SHARED_READER_MASK, SHARED_STATE_ALIVE, SHARED_STATE_CLOSING, SHARED_STATE_DESTROYED, SHARED_STATE_DRAINING, SHARED_STATE_POISONED, SHARED_STATE_UNSHARED, SHARED_WORKER_UNIT, _compute_state_seal, _deserialize_state_canonical, _serialize_state_canonical, redact_shared_handle
 from rotation import RotationReceipt
 
 # ==============================================================================
@@ -415,6 +415,7 @@ async def parallel_keyring_worker(arg_payload: str) -> int:
             # Expected when another OS thread wins the hardware lock, Seqlock, or CAS race
             pass
         step_i = step_i + 1
+    worker_ring.detach_shared_handle()
     return rot_wins
 
 async def run_parallel_keyring_rotation_test() -> None:
@@ -463,8 +464,10 @@ async def single_race_writer_worker(arg_payload: str) -> int:
     cand_key: KeyRef = KeyRef(cand_kid, "HS256", cand_secret, trust_domain="tenant-shared-proof", state=STATE_PREPARED)
     try:
         w_ring.rotate(cand_key, overlap_seconds=600, clock_time_sec=7000 + wid, expected_version=1)
+        w_ring.detach_shared_handle()
         return wid
     except ConfigurationError:
+        w_ring.detach_shared_handle()
         return 0
 
 async def independent_reader_os_worker(shared_h: str) -> str:
@@ -473,6 +476,7 @@ async def independent_reader_os_worker(shared_h: str) -> str:
     st: KeyRingState = r_ring.get_state()
     active_k: KeyRef = r_ring.get_signing_key("HS256")
     old_k: KeyRef = r_ring.get_verification_key("k-proof-init", 7100)
+    r_ring.detach_shared_handle()
     return str(st.version) + "|" + active_k.kid + "|" + old_k.state + "|" + st.get_seal_hash()
 
 async def run_cross_thread_state_identity_proof() -> None:
@@ -580,7 +584,9 @@ async def utf8_shared_rotator_worker(shared_h: str) -> str:
         state=STATE_PREPARED
     )
     u_ring.rotate(next_utf8_k, overlap_seconds=600, clock_time_sec=9000, expected_version=1)
-    return init_signer.kid + "|" + u_ring.get_signing_key("HS256").kid
+    res_kids: str = init_signer.kid + "|" + u_ring.get_signing_key("HS256").kid
+    u_ring.detach_shared_handle()
+    return res_kids
 
 async def run_utf8_multibyte_shared_test() -> None:
     utf8_ring: KeyRing = KeyRing(trust_domain="kiracı-güvenlik-αβγ")
@@ -674,6 +680,7 @@ except ConfigurationError:
     uaf_attach_rejected = True
 nox.test.assert_true(uaf_attach_rejected, "Attaching a zeroized shared handle fails closed immediately")
 
+attached_life_ring.detach_shared_handle()
 cap_ring.free_shared_handle()
 
 # ==============================================================================
@@ -708,6 +715,7 @@ nox.test.assert_eq_str(zlock_reader.get_signing_key("HS256").kid, "k-zl-0", "Att
 # Now zeroize cleanly with lock available:
 lock_guard_ring.zeroize_shared_state()
 nox.test.assert_true(lock_guard_ring.is_shared_zeroized(), "Shared state zeroized cleanly once writer lock is available")
+zlock_reader.detach_shared_handle()
 lock_guard_ring.free_shared_handle()
 
 # 15b. P1 Active Reader Drain vs. free_shared_handle() Concurrent OS Thread Race:
@@ -723,12 +731,14 @@ async def concurrent_reader_race_worker(shared_h: str) -> int:
         try:
             sk: KeyRef = r_ring.get_signing_key("HS256")
             if sk.kid != "k-fr-0" and sk.kid != "k-fr-1":
+                r_ring.detach_shared_handle()
                 return -1
             valid_reads = valid_reads + 1
         except ConfigurationError:
             # Expected once owner calls zeroize_shared_state() / free_shared_handle()
             break
         iter_i = iter_i + 1
+    r_ring.detach_shared_handle()
     return valid_reads
 
 async def run_reader_vs_free_race_test() -> None:
@@ -993,5 +1003,95 @@ async def run_attach_vs_zeroize_race_test() -> None:
 
 t_attach_race: Task[None] = spawn run_attach_vs_zeroize_race_test()
 await t_attach_race
+
+# ==============================================================================
+# Test 18: P1 Default require_zero_workers=True on free_shared_handle(),
+# Fail-Closed CAS Verification in detach_shared_handle(), and Terminal POISONED
+# State on Mid-Zeroization Fault (0.17.1, 0.17.2, 0.17.3)
+# ==============================================================================
+
+# 18a & 18c: Strict default free_shared_handle() (require_zero_workers=True) and
+# fail-closed detach_shared_handle() when _shared_gate worker count CAS fails:
+strict_owner: KeyRing = KeyRing(trust_domain="tenant-strict-v1011")
+strict_owner.add_key(KeyRef("k-st-0", "HS256", "super-secret-strict-key-00-32byt", trust_domain="tenant-strict-v1011", state=STATE_ACTIVE_SIGNING))
+strict_h: str = strict_owner.export_shared_handle(max_words=128)
+
+strict_worker: KeyRing = KeyRing(trust_domain="tenant-strict-v1011")
+strict_worker.attach_shared_handle(strict_h)
+nox.test.assert_eq_int(strict_owner.attached_shared_workers(), 1, "1 worker attached to strict_owner")
+
+# 18c: Calling strict_owner.free_shared_handle() with DEFAULT arguments MUST fail closed while strict_worker is attached!
+default_free_with_worker_rejected: bool = False
+try:
+    strict_owner.free_shared_handle()
+except ConfigurationError:
+    default_free_with_worker_rejected = True
+nox.test.assert_true(default_free_with_worker_rejected, "Default free_shared_handle() (require_zero_workers=True) rejects teardown while worker is attached")
+nox.test.assert_eq_str(strict_owner.get_shared_lifecycle_state(), SHARED_STATE_ALIVE, "strict_owner remains ALIVE after rejected default free_shared_handle()")
+
+# 18a: Simulate _shared_gate worker count underflow/CAS failure during detach_shared_handle():
+# Temporarily clear worker count in _shared_gate so detach_shared_handle() sees workers == 0 (CAS cannot succeed).
+strict_owner._shared_gate.add(-SHARED_WORKER_UNIT)
+nox.test.assert_eq_int(strict_owner.attached_shared_workers(), 0, "Temporarily zeroed worker count to test detach CAS failure")
+
+detach_cas_fail_rejected: bool = False
+try:
+    strict_worker.detach_shared_handle()
+except ConfigurationError:
+    detach_cas_fail_rejected = True
+nox.test.assert_true(detach_cas_fail_rejected, "detach_shared_handle() raises ConfigurationError when CAS does not succeed")
+nox.test.assert_true(strict_worker._shared_worker_registered, "strict_worker preserves _shared_worker_registered == True on detach failure")
+nox.test.assert_true(strict_worker._shared_attached, "strict_worker preserves _shared_attached == True on detach failure")
+
+# Restore worker count in _shared_gate and verify clean detach + default free_shared_handle():
+strict_owner._shared_gate.add(SHARED_WORKER_UNIT)
+strict_worker.detach_shared_handle()
+nox.test.assert_true(not strict_worker._shared_worker_registered, "strict_worker clears _shared_worker_registered after successful CAS detach")
+nox.test.assert_true(not strict_worker._shared_attached, "strict_worker clears _shared_attached after successful CAS detach")
+nox.test.assert_eq_int(strict_owner.attached_shared_workers(), 0, "strict_owner attached_shared_workers() is 0 after clean detach")
+
+strict_owner.free_shared_handle()
+nox.test.assert_eq_str(strict_owner.get_shared_lifecycle_state(), SHARED_STATE_DESTROYED, "Default free_shared_handle() succeeds once all workers detach")
+
+# 18b: Mid-Zeroization Fault -> Terminal SHARED_STATE_POISONED State (Never Reusable):
+poison_owner: KeyRing = KeyRing(trust_domain="tenant-poison")
+poison_owner.add_key(KeyRef("k-ps-0", "HS256", "super-secret-poison-key-00-32byt", trust_domain="tenant-poison", state=STATE_ACTIVE_SIGNING))
+_poison_h: str = poison_owner.export_shared_handle(max_words=128)
+nox.test.assert_true(not poison_owner.is_zeroize_poisoned(), "poison_owner starts unpoisoned")
+
+# Inject deterministic mid-zeroization fault after cell[0] is scrubbed:
+poison_owner._zeroize_fault_inject = True
+zeroize_fault_raised: bool = False
+try:
+    poison_owner.zeroize_shared_state()
+except ConfigurationError:
+    zeroize_fault_raised = True
+nox.test.assert_true(zeroize_fault_raised, "Mid-zeroization fault raises ConfigurationError")
+nox.test.assert_true(poison_owner.is_zeroize_poisoned(), "poison_owner is permanently marked is_zeroize_poisoned() == True")
+nox.test.assert_eq_str(poison_owner.get_shared_lifecycle_state(), SHARED_STATE_POISONED, "Lifecycle state is permanently POISONED after mid-zeroization error")
+
+# Verify writer lock was released and Seqlock was restored to even despite the fault:
+nox.test.assert_true(poison_owner.acquire_write_lock(), "Writer lock was properly released by exception handler in zeroize_shared_state()")
+poison_owner.release_write_lock()
+nox.test.assert_eq_int(poison_owner._seq.add(0) & 1, 0, "Seqlock counter was restored to even value on mid-zeroization fault")
+
+# Verify that a POISONED KeyRing can NEVER be reused for reads, signing, verification, or rotation:
+poison_read_rejected: bool = False
+try:
+    poison_owner.get_signing_key("HS256")
+except ConfigurationError:
+    poison_read_rejected = True
+nox.test.assert_true(poison_read_rejected, "POISONED KeyRing rejects get_signing_key()")
+
+poison_write_rejected: bool = False
+try:
+    poison_owner.add_key(KeyRef("k-ps-1", "HS256", "super-secret-poison-key-01-32byt", trust_domain="tenant-poison", state=STATE_PREPARED))
+except ConfigurationError:
+    poison_write_rejected = True
+nox.test.assert_true(poison_write_rejected, "POISONED KeyRing rejects add_key()")
+
+# Clean up C atomic handles on poisoned owner while preserving POISONED terminal state:
+poison_owner.free_shared_handle()
+nox.test.assert_eq_str(poison_owner.get_shared_lifecycle_state(), SHARED_STATE_POISONED, "POISONED terminal state is preserved even after freeing C handles")
 
 print("concurrency_keyring_test passed!")

@@ -887,3 +887,36 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.10` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.10` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 17 — `v1.0.11` Strict `require_zero_workers=True` Default in `free_shared_handle()`, Fail-Closed CAS Verification in `detach_shared_handle()`, Terminal Poisoned State on Partial Zeroization Error & Sub-Millisecond Multi-Run Median Benchmarks (SOL XI Analizi)
+
+**Amaç:** On birinci bağımsız teknik incelemede (GPT 6 SOL XI analizi) tespit edilen `free_shared_handle()` varsayılanının bağlı worker'lara izin vermesi, `detach_shared_handle()` içinde CAS başarısının doğrulanmaması, zeroization hatası sonrasında kısmen sıfırlanmış `KeyRing` nesnesinin yeniden kullanılabilir kalması riski ve benchmark metriklerinde sıfır çıkan `p50` milisaniye çözünürlüğü konularını eksiksiz tamamlamak:
+1. **P1 — `free_shared_handle()` Varsayılanını `require_zero_workers: bool = True` Yapma ve Zorunlu Worker Detach Sözleşmesi (`keyring.nox`, `tests/concurrency_keyring_test.nox`, `tests/benchmark_keyring_test.nox`):** `free_shared_handle(self, require_zero_workers: bool = True) -> None` varsayılanını `True` yaparak, aktif bağlı worker nesneleri (`attached_shared_workers() > 0`) varken paylaşımlı atomik hücrelerin serbest bırakılmasını varsayılan olarak engellemek; tüm çoklu iş parçacığı ve yaşam döngüsü testlerinde worker'ların `detach_shared_handle()` çağrısını zorunlu sözleşme olarak uygulamak.
+2. **P1 — `detach_shared_handle()` İçinde CAS Başarısını Zorunlu Doğrulama (`keyring.nox`, `tests/concurrency_keyring_test.nox`):** `detach_shared_handle()` içindeki `_shared_gate` CAS döngüsü worker sayısını düşürmeden tamamlanırsa veya sayaç bozuksa (`workers <= 0`), yerel `_shared_worker_registered` ve `_shared_attached` durumlarını **değiştirmeden** derhal `ConfigurationError` fırlatmak ve bunu negatif testle doğrulamak (**Test 18a**).
+3. **P1 — Kısmi Zeroization Hatası Sonrasında Terminal `POISONED` Durumu (`keyring.nox`, `cipher.nox`, `tests/concurrency_keyring_test.nox`):** `zeroize_shared_state()` kritik bölgesinde herhangi bir hata oluştuğunda kilit bırakılsa bile belleğin kısmen sıfırlanmış olabileceği gerçeğine karşı `KeyRing` nesnesini kalıcı olarak `SHARED_STATE_POISONED` (`"POISONED"`, `_zeroize_poisoned = True`) durumuna geçirmek ve bu nesne üzerinde sonraki tüm okuma/yazma/imzalama işlemlerini `ConfigurationError` ile reddetmek (**Test 18b**).
+4. **P2 — Mikro Saniye (`us`) / İşlem Başına Nano Saniye (`ns/op`) Hassasiyeti ve Çoklu Koşu Medyanı (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`):** `p50` değerlerinin `0 ms` çıkmasını önlemek için 5 bağımsız benchmark koşusunun medyanını (`multi-run median`) alan ve metrikleri mikro saniye (`us`) ile işlem başına nano saniye (`ns_per_op`) hassasiyetinde raporlayan benchmark mimarisine geçmek.
+
+## 0.17.1 — P1: `free_shared_handle(require_zero_workers: bool = True)` Varsayılanı ve Worker Join/Detach Sözleşmesi (`keyring.nox`, `tests/concurrency_keyring_test.nox`, `tests/benchmark_keyring_test.nox`)
+- [x] `KeyRing.free_shared_handle(self, require_zero_workers: bool = True) -> None` varsayılan parametresini `True` yap; `require_zero_workers == True` iken kısa bir worker drain beklemesinden (`drain_w_spins < 4096`) sonra hâlâ `attached_shared_workers() > 0` ise hiçbir atomik hücreyi serbest bırakmadan `ConfigurationError` fırlat.
+- [x] `tests/concurrency_keyring_test.nox` ve `tests/benchmark_keyring_test.nox` içindeki tüm worker `KeyRing` örneklerinde `detach_shared_handle()` çağrısını uygula ve varsayılan `free_shared_handle()` çağrısının bağlı worker varken reddedildiğini doğrula (**Test 18c**).
+
+## 0.17.2 — P1: `detach_shared_handle()` İçinde CAS Başarısının Doğrulanması (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `detach_shared_handle()` içinde `cas_detached: bool = False` bayrağını izle; `workers <= 0` ise veya CAS döngüsü `cas_detached == False` ile biterse yerel `_shared_worker_registered` ve `_shared_attached` bayraklarını değiştirmeden `ConfigurationError("Failed to detach shared KeyRing worker: atomic gate CAS contention or invalid worker count")` fırlat.
+- [x] `tests/concurrency_keyring_test.nox` içine CAS başarısızlığı / bozuk worker sayacı durumunda `detach_shared_handle()` çağrısının hata ürettiğini ve yerel kayıt durumunu koruduğunu kanıtlayan **Test 18a** ekle.
+
+## 0.17.3 — P1: Zeroization Hatası Sonrasında Terminal `POISONED` Durumu (`keyring.nox`, `cipher.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `SHARED_STATE_POISONED: str = "POISONED"` sabitini ve `KeyRing.is_zeroize_poisoned(self) -> bool` metodunu ekle ve `cipher.nox` üzerinden dışa aktar.
+- [x] `zeroize_shared_state()` içindeki `except` bloğunda `_zeroize_poisoned = True` ve `_shared_lifecycle_local = SHARED_STATE_POISONED` ata; poisoned durumdaki bir `KeyRing` üzerinde tüm okuma ve yazma çağrılarını `ConfigurationError` ile reddet (**Test 18b**).
+
+## 0.17.4 — P2: Mikro Saniye (`us`) / `ns_per_op` Hassasiyetli ve Çoklu Koşu Medyanlı Benchmark Karşılaştırması (`docs/benchmark-baseline.json`, `tests/benchmark_keyring_test.nox`)
+- [x] `tests/benchmark_keyring_test.nox` dosyasını 5 bağımsız koşunun medyanını (`multi_run_median`) ve sıfır olmayan mikro saniye (`us`) / `ns_per_op` metriklerini hesaplayacak şekilde güncelle; `docs/benchmark-baseline.json` ve `benchmark-comparison.md` çıktılarını yeni hassas metriklerle senkronize et.
+
+## 0.17.5 — Phase 17 Çıkış Kapısı ve `v1.0.11` Yayını
+- [x] `noxc test` ile tüm test matrisini çalıştır (18 test %100 geçmeli).
+- [x] `./scripts/test-isolated-consumer.sh` çalıştır ve her iki aşamayı (Stage 1 Local Git + Stage 2 Remote Registry) doğrula.
+- [x] `nox.json` versiyonunu `1.0.11` yap.
+- [x] `CHANGELOG.md` dosyasına `v1.0.11` sürüm notlarını ekle.
+- [x] Git commit, `v1.0.11` git tag push ve `noxc publish` çalıştır.
+- [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
