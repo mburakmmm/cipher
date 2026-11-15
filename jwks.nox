@@ -3,6 +3,7 @@
 
 import nox.strings
 import nox.time
+import nox.tls
 from nox.url import URL, UrlError
 import nox.url
 from cipher.errors import ConfigurationError, EncodingError, KeyUnavailableError, ResourceLimitExceededError, UnknownKeyError
@@ -469,9 +470,9 @@ def parse_jwks(jwks_json: str) -> list[JwkKey]:
     
     out: list[JwkKey] = []
     i: int = 0
-    n: int = len(keys_val.arr)
+    n: int = nox.json.array_len(keys_val)
     while i < n:
-        raw_key: JsonValue = keys_val.arr[i]
+        raw_key: JsonValue = nox.json.array_get(keys_val, i)
         # dump individual JWK back to string for strict parse_jwk validation
         raw_key_json: str = nox.json.dump(raw_key)
         k: JwkKey = parse_jwk(raw_key_json)
@@ -578,3 +579,80 @@ class JwksKeySource:
         # Record into negative cache to prevent fetch storm
         self.record_unknown_kid(kid)
         raise UnknownKeyError("Key identifier not found in JWKS: " + kid)
+
+class TlsJwksTarget:
+    url: str
+    host: str
+    port: int
+    path: str
+    resolved_ip: str
+
+    def __init__(self, url: str, host: str, port: int, path: str, resolved_ip: str = "") -> None:
+        self.url = url
+        self.host = host
+        self.port = port
+        self.path = path
+        self.resolved_ip = resolved_ip
+
+def validate_tls_jwks_target(configured_url: str, resolved_ip: str = "", allowed_host: str = "") -> TlsJwksTarget:
+    if not is_safe_jwks_url(configured_url, allowed_host):
+        raise ConfigurationError("Insecure or disallowed JWKS TLS URL: " + configured_url)
+    if resolved_ip != "":
+        if not verify_resolved_ip(resolved_ip):
+            raise ConfigurationError("JWKS resolved IP violates SSRF boundary: " + resolved_ip)
+    try:
+        parsed: URL = nox.url.parse(configured_url)
+    except UrlError as err:
+        raise ConfigurationError("Invalid JWKS URL: " + str(err))
+    port: int = 443
+    if parsed.port > 0:
+        port = parsed.port
+    req_path: str = parsed.path
+    if req_path == "":
+        req_path = "/.well-known/jwks.json"
+    if len(parsed.query) > 0:
+        q_pos: int = nox.strings.index_of(configured_url, "?")
+        if q_pos >= 0:
+            frag_pos: int = nox.strings.index_of(configured_url, "#")
+            q_end: int = len(configured_url)
+            if frag_pos > q_pos:
+                q_end = frag_pos
+            req_path = req_path + configured_url[q_pos:q_end]
+    return TlsJwksTarget(configured_url, parsed.host, port, req_path, resolved_ip)
+
+def fetch_jwks_tls(target: TlsJwksTarget, max_bytes: int = 1048576) -> str:
+    # Enforce SSRF + DNS-pinning policy BEFORE opening any TLS socket
+    verified: TlsJwksTarget = validate_tls_jwks_target(target.url, target.resolved_ip, target.host)
+    if max_bytes <= 0 or max_bytes > MAX_JWKS_RESPONSE_BYTES:
+        raise ConfigurationError("Invalid JWKS max_bytes limit")
+
+    stream: nox.tls.TlsStream = nox.tls.connect(verified.host, verified.port)
+    raw_resp: str = ""
+    try:
+        req: str = "GET " + verified.path + " HTTP/1.1\r\nHost: " + verified.host + "\r\nConnection: close\r\nAccept: application/jwk-set+json, application/json\r\n\r\n"
+        stream.write(req)
+        while True:
+            chunk: str = stream.read(8192)
+            if chunk == "":
+                break
+            if nox.strings.byte_len(raw_resp) + nox.strings.byte_len(chunk) > max_bytes + 8192:
+                raise ResourceLimitExceededError("JWKS TLS response exceeded configured byte limit")
+            raw_resp = raw_resp + chunk
+    except Exception as err:
+        stream.close()
+        raise ConfigurationError("JWKS TLS fetch failed: " + str(err))
+    stream.close()
+
+    sep_idx: int = nox.strings.index_of(raw_resp, "\r\n\r\n")
+    if sep_idx < 0:
+        raise ConfigurationError("Malformed HTTP response from JWKS TLS endpoint")
+    crlf_idx: int = nox.strings.index_of(raw_resp, "\r\n")
+    if crlf_idx <= 0:
+        raise ConfigurationError("Malformed HTTP status line from JWKS TLS endpoint")
+    status_line: str = raw_resp[0:crlf_idx]
+    if not (nox.strings.starts_with(status_line, "HTTP/1.1 200") or nox.strings.starts_with(status_line, "HTTP/1.0 200")):
+        raise ConfigurationError("JWKS TLS endpoint did not return HTTP 200 (redirects disabled fail-closed)")
+    body: str = raw_resp[sep_idx + 4:len(raw_resp)]
+    if nox.strings.byte_len(body) > max_bytes:
+        raise ResourceLimitExceededError("JWKS body exceeded MAX_JWKS_RESPONSE_BYTES")
+    return body

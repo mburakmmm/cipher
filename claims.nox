@@ -4,7 +4,7 @@
 import nox.strings
 import nox.time
 from cipher.errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
-from cipher.json_strict import get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
+from cipher.json_strict import get_array_item, get_array_len, get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
 
 class ClaimsProfile:
     expected_issuer: str
@@ -87,9 +87,9 @@ def _parse_audience_field(v: JsonValue) -> list[str]:
     # If aud is an array of strings
     if aud_val.kind == 4:
         i: int = 0
-        n: int = len(aud_val.arr)
+        n: int = get_array_len(aud_val)
         while i < n:
-            item: JsonValue = aud_val.arr[i]
+            item: JsonValue = get_array_item(aud_val, i)
             if item.kind != 3:
                 raise InvalidClaimsError("All audience array elements must be strings")
             out.append(item.s)

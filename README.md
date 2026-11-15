@@ -5,7 +5,7 @@
 [![CI](https://github.com/mburakmmm/cipher/actions/workflows/ci.yml/badge.svg)](https://github.com/mburakmmm/cipher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mburakmmm/cipher?color=blue)](https://github.com/mburakmmm/cipher/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![NOX](https://img.shields.io/badge/NOX-2.1.0-orange)](https://noxlang.com)
+[![NOX](https://img.shields.io/badge/NOX-2.1.186-orange)](https://noxlang.com)
 [![Security Policy](https://img.shields.io/badge/Security-RFC%208725%20BCP-red)](SECURITY.md)
 
 **Cryptographic Token & Key Management Mechanism Layer for the NOX Ecosystem**
@@ -87,9 +87,9 @@ Incoming Token
 
 | Specification | Scope & Profile in Cipher | Status |
 |---|---|---|
-| **RFC 7515 (JWS)** | Compact JWS signing and verification, strict ASCII input validation | **Production (HS256)** |
-| **RFC 7517 (JWK)** | JSON Web Key parsing, safe public key export (zero private leakage) | **Production (RSA >= 2048-bit, oct)** |
-| **RFC 7518 (JWA)** | HS256 HMAC-SHA256 active; RS256/asymmetric parsing supported | **HS256 Active** *(RS256 verify gated by ADR-0001 FFI)* |
+| **RFC 7515 (JWS)** | Compact JWS signing and verification, strict ASCII input validation | **Production (`HS256`, Pure-NOX `EdDSA`; `RS256`/`PS256`/`ES256`/`HS384`/`HS512` via Opt-In OpenSSL Shim)** |
+| **RFC 7517 / RFC 8037 (JWK / OKP)** | JSON Web Key parsing (`oct`, `RSA >= 2048-bit`, `EC P-256`, `OKP Ed25519`), safe public key export (zero private leakage) | **Production** |
+| **RFC 7518 (JWA)** | `HS256` & `EdDSA` (`Ed25519` verify) pure NOX; `RS256`, `PS256`, `ES256`, `HS384`, `HS512`, `EdDSA` sign via `cipher.openssl_provider` | **Production** *(Zero C object required unless importing `cipher.openssl_provider`)* |
 | **RFC 7519 (JWT)** | Registered claims (`exp`, `nbf`, `iat`, `iss`, `aud`, `sub`, `jti`) verification | **Production** |
 | **RFC 7638 (Thumbprint)** | Deterministic SHA-256 JWK thumbprint generation | **Production** |
 | **RFC 8725 (JWT BCP)** | Best Current Practices: duplicate key rejection, explicit typ enforcement | **Production** |
@@ -139,7 +139,18 @@ Track implementation progress and verification evidence in [todo.md](todo.md):
 - [x] **Phase 4:** KeyRing & Safe Key Rotation Lifecycle (`v0.4.x`)
 - [x] **Phase 5:** Remote JWKS, Outage Resilience & SSRF Defenses (`v0.5.x`)
 - [x] **Phase 6:** Sentinel Boundary Adapter & `v1.0.0` Release Gate
-- [x] **Phase 7:** Production Hardening, Atomic Rollback & `v1.0.1` Gate (SOL Analysis)
+- [x] **Phases 7–17:** Hardening, 64-bit CAS Gate, `POISONED` Fault Guard & Multi-Run Benchmarks (`v1.0.1`–`v1.0.11`)
+- [x] **Phase 18 (`v1.1.0`):** `noxc 2.1.186` Tape JSON, Pure-NOX `EdDSA`, Opt-In OpenSSL C Shim (`RS256`/`PS256`/`ES256`/`HS384`/`HS512`), `AtomicRef` KeyRing, `monotonic_ns()`, `nox.property` & `nox.mem.stats()`
+
+### Optional OpenSSL C Shim (Opt-In)
+
+Core `cipher` (`from cipher import ...`) has **zero C dependencies**. To enable `RS256`, `PS256`, `ES256`, `EdDSA` signing, `HS384`, and `HS512` via OpenSSL `libcrypto`:
+
+```bash
+./scripts/build-openssl-shim.sh
+```
+
+Then import `OpenSslCryptoProvider` from `cipher.openssl_provider`. No OpenSSL development headers or `-lcrypto` link flags are required; the shim resolves `libcrypto` dynamically via `dlopen` / `LoadLibraryA`.
 
 ---
 

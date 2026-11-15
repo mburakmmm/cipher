@@ -408,7 +408,7 @@ async def parallel_keyring_worker(arg_payload: str) -> int:
         try:
             cur_v: int = worker_ring.get_version()
             cand_kid: str = "k-mt-w" + worker_id + "-" + str(step_i) + "-" + str(cur_v)
-            cand_key: KeyRef = KeyRef(cand_kid, "HS256", "super-secret-mt-worker-key-32bytes!", trust_domain="tenant-mt", state=STATE_PREPARED)
+            cand_key: KeyRef = KeyRef(cand_kid, "HS256", "super-secret-mt-worker-key-32bytes!", trust_domain="tenant-mt", state="PREPARED")
             worker_ring.rotate(cand_key, overlap_seconds=300, clock_time_sec=5000 + step_i, expected_version=cur_v)
             rot_wins = rot_wins + 1
         except ConfigurationError:
@@ -461,7 +461,7 @@ async def single_race_writer_worker(arg_payload: str) -> int:
 
     cand_kid: str = "k-win-w" + str(wid)
     cand_secret: str = "super-secret-winning-worker-key-w" + str(wid) + "!"
-    cand_key: KeyRef = KeyRef(cand_kid, "HS256", cand_secret, trust_domain="tenant-shared-proof", state=STATE_PREPARED)
+    cand_key: KeyRef = KeyRef(cand_kid, "HS256", cand_secret, trust_domain="tenant-shared-proof", state="PREPARED")
     try:
         w_ring.rotate(cand_key, overlap_seconds=600, clock_time_sec=7000 + wid, expected_version=1)
         w_ring.detach_shared_handle()
@@ -1093,5 +1093,74 @@ nox.test.assert_true(poison_write_rejected, "POISONED KeyRing rejects add_key()"
 # Clean up C atomic handles on poisoned owner while preserving POISONED terminal state:
 poison_owner.free_shared_handle()
 nox.test.assert_eq_str(poison_owner.get_shared_lifecycle_state(), SHARED_STATE_POISONED, "POISONED terminal state is preserved even after freeing C handles")
+
+# ==============================================================================
+# Test 19: v1.1.0 High-Capacity AtomicRef Cross-Thread State Sharing (>64 KiB,
+# breaking the old 3 KB / 48 KiB 6-byte word-packing limit) (18.3)
+# ==============================================================================
+async def worker_read_unbounded(h_str: str, sec: str) -> int:
+    w: KeyRing = KeyRing(trust_domain="tenant-atomic-ref")
+    w.attach_shared_handle(h_str)
+    c1: int = w.get_state().key_count()
+    w.add_key(KeyRef("k-ref-worker-added", "HS256", sec + "-w", trust_domain="tenant-atomic-ref", state="PREPARED"))
+    c2: int = w.get_state().key_count()
+    w.detach_shared_handle()
+    if c1 == 180 and c2 == 181:
+        return 1
+    return 0
+
+async def run_atomic_ref_high_capacity_test() -> None:
+    ref_owner: KeyRing = KeyRing(trust_domain="tenant-atomic-ref")
+    # Build > 55 KiB of shared key state (~180 keys x ~320 bytes each = >57,600 bytes > 48 KiB!)
+    big_secret: str = "S"
+    s_pad: int = 0
+    while s_pad < 240:
+        big_secret = big_secret + "x"
+        s_pad = s_pad + 1
+
+    idx: int = 0
+    while idx < 180:
+        st_kind: str = STATE_VERIFY_ONLY
+        if idx == 0:
+            st_kind = STATE_ACTIVE_SIGNING
+        ref_owner.add_key(KeyRef("k-ref-" + str(idx), "HS256", big_secret + "-" + str(idx), trust_domain="tenant-atomic-ref", state=st_kind))
+        idx = idx + 1
+
+    # Export with UNBOUNDED AtomicRef mode (max_words=0) — zero 6-byte packed cells, >48 KiB state
+    unbounded_h: str = ref_owner.export_shared_handle(max_words=0)
+    nox.test.assert_true(ref_owner.has_shared_atomic_ref(), "Owner KeyRing has AtomicRef active")
+    nox.test.assert_true(ref_owner.shared_used_bytes() > 52000, "Canonical shared state exceeds old 48 KiB limit (" + str(ref_owner.shared_used_bytes()) + " bytes)")
+    nox.test.assert_eq_int(ref_owner.shared_capacity_bytes(), 0, "max_words=0 indicates pure unbounded AtomicRef capacity")
+    nox.test.assert_true(not nox.strings.contains(unbounded_h, big_secret), "Handle contains zero key secret material")
+    v0_ref: int = ref_owner.shared_atomic_ref_version()
+
+    w_task: Task[int] = spawn worker_read_unbounded(unbounded_h, big_secret)
+    ok_res: int = await w_task
+    nox.test.assert_eq_int(ok_res, 1, "Spawned worker thread read 180 keys and committed 181st key via AtomicRef")
+    nox.test.assert_eq_int(ref_owner.get_state().key_count(), 181, "Owner observes 181st key committed by worker via AtomicRef")
+    nox.test.assert_true(ref_owner.shared_atomic_ref_version() > v0_ref, "AtomicRef version incremented on worker commit")
+    ref_owner.zeroize_shared_state()
+    nox.test.assert_true(ref_owner.is_shared_zeroized(), "AtomicRef state cleared and verified zeroized")
+    ref_owner.free_shared_handle()
+
+t_atomic_ref: Task[None] = spawn run_atomic_ref_high_capacity_test()
+await t_atomic_ref
+
+# Also test that default export_shared_handle(max_words=512) gracefully spills past 3 KB via AtomicRef:
+spill_owner: KeyRing = KeyRing(trust_domain="tenant-spill")
+sp_i: int = 0
+while sp_i < 60:
+    sp_st: str = STATE_VERIFY_ONLY
+    if sp_i == 0:
+        sp_st = STATE_ACTIVE_SIGNING
+    spill_owner.add_key(KeyRef("k-sp-" + str(sp_i), "HS256", "super-secret-spill-key-padding-material-64bytes-" + str(sp_i), trust_domain="tenant-spill", state=sp_st))
+    sp_i = sp_i + 1
+spill_h: str = spill_owner.export_shared_handle()
+nox.test.assert_true(spill_owner.shared_used_bytes() > 3072, "Default export_shared_handle() now exceeds old 3072-byte ceiling via AtomicRef")
+spill_worker: KeyRing = KeyRing(trust_domain="tenant-spill")
+spill_worker.attach_shared_handle(spill_h)
+nox.test.assert_eq_int(spill_worker.get_state().key_count(), 60, "Worker sees all 60 keys >3 KB via AtomicRef")
+spill_worker.detach_shared_handle()
+spill_owner.free_shared_handle()
 
 print("concurrency_keyring_test passed!")

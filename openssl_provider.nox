@@ -1,0 +1,220 @@
+# Cipher — Optional OpenSSL Cryptography Provider (Opt-In FFI Bridge)
+# Zero core dependency: programs that do not import this module never link native/cipher_openssl_shim.o.
+# Provides vetted OpenSSL libcrypto EVP support for RS256, PS256, ES256, EdDSA (sign/verify), HS384, and HS512.
+
+import nox.crypto
+import nox.ed25519
+import nox.ffi
+import nox.strings
+from cipher.encoding import bytes_to_hex, decode_base64url_hex, hex_to_bytes, is_valid_hex
+from cipher.errors import InvalidKeyError, ProviderFailureError, UnsupportedAlgorithmError
+from cipher.jwk import JwkKey, parse_jwk
+from cipher.provider import CryptoProvider, MIN_HMAC_SECRET_BYTES
+
+CIPHER_OSSL_OK: int = 0
+CIPHER_OSSL_VERIFY_VALID: int = 1
+CIPHER_OSSL_VERIFY_INVALID: int = 0
+CIPHER_OSSL_ERR_UNAVAILABLE: int = -1
+CIPHER_OSSL_ERR_UNSUPPORTED: int = -2
+CIPHER_OSSL_ERR_BAD_INPUT: int = -3
+CIPHER_OSSL_ERR_BAD_KEY: int = -4
+CIPHER_OSSL_ERR_BUF_SMALL: int = -5
+CIPHER_OSSL_ERR_CRYPTO: int = -6
+
+extern def cipher_ossl_is_available() -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_hmac_hex(alg: str, key_hex: str, msg: str, out_hex: ptr, out_cap: i64) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_const_time_hex_eq(a_hex: str, b_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_ed25519_sign_hex(priv_seed_hex: str, msg: str, out_hex: ptr, out_cap: i64) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_ed25519_verify_hex(pub_hex: str, msg: str, sig_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_rsa_verify_jwk_hex(alg: str, n_hex: str, e_hex: str, msg: str, sig_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_rsa_verify_pem_hex(alg: str, pem: str, msg: str, sig_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_rsa_sign_pem_hex(alg: str, priv_pem: str, msg: str, out_hex: ptr, out_cap: i64) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_es256_verify_jwk_hex(x_hex: str, y_hex: str, msg: str, sig_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_es256_verify_pem_hex(pem: str, msg: str, sig_hex: str) -> i64 from "native/cipher_openssl_shim.o"
+extern def cipher_ossl_es256_sign_pem_hex(priv_pem: str, msg: str, out_hex: ptr, out_cap: i64) -> i64 from "native/cipher_openssl_shim.o"
+
+def is_openssl_available() -> bool:
+    return int(cipher_ossl_is_available()) == 1
+
+def _is_json_jwk_str(s: str) -> bool:
+    trimmed: str = nox.strings.trim(s)
+    return nox.strings.byte_len(trimmed) > 0 and nox.strings.byte_at(trimmed, 0) == 123
+
+def _raise_for_rc(rc: int, context: str) -> None:
+    if rc == CIPHER_OSSL_ERR_UNAVAILABLE:
+        raise ProviderFailureError(context + ": OpenSSL libcrypto unavailable")
+    if rc == CIPHER_OSSL_ERR_UNSUPPORTED:
+        raise UnsupportedAlgorithmError(context)
+    if rc == CIPHER_OSSL_ERR_BAD_KEY:
+        raise InvalidKeyError(context + ": invalid or weak key material")
+    if rc == CIPHER_OSSL_ERR_BAD_INPUT or rc == CIPHER_OSSL_ERR_BUF_SMALL:
+        raise ProviderFailureError(context + ": invalid input or output buffer capacity")
+    raise ProviderFailureError(context + ": OpenSSL operation failed (rc=" + str(rc) + ")")
+
+class OpenSslCryptoProvider(CryptoProvider):
+    def __init__(self) -> None:
+        if not is_openssl_available():
+            raise ProviderFailureError("OpenSSL libcrypto runtime library could not be loaded")
+
+    def provider_name(self) -> str:
+        return "openssl-libcrypto-ffi"
+
+    def supports_algorithm(self, alg: str) -> bool:
+        if not is_openssl_available():
+            return False
+        return (alg == "HS256" or alg == "HS384" or alg == "HS512" or
+                alg == "EdDSA" or alg == "RS256" or alg == "PS256" or alg == "ES256")
+
+    def _hmac_hex(self, alg: str, key: str, data: str) -> str:
+        key_bytes_len: int = nox.strings.byte_len(key)
+        if alg == "HS256" and key_bytes_len < MIN_HMAC_SECRET_BYTES:
+            raise InvalidKeyError("HS256 secret length must be at least 32 bytes (256 bits)")
+        if alg == "HS384" and key_bytes_len < 48:
+            raise InvalidKeyError("HS384 secret length must be at least 48 bytes (384 bits)")
+        if alg == "HS512" and key_bytes_len < 64:
+            raise InvalidKeyError("HS512 secret length must be at least 64 bytes (512 bits)")
+
+        key_hex: str = bytes_to_hex(key)
+        out_cap: int = 256
+        out_buf: ptr = nox.ffi.alloc(out_cap)
+        rc: int = CIPHER_OSSL_ERR_CRYPTO
+        out_hex: str = ""
+        try:
+            rc = int(cipher_ossl_hmac_hex(alg, key_hex, data, out_buf, i64(out_cap)))
+            if rc == CIPHER_OSSL_OK:
+                out_hex = nox.ffi.cstr(out_buf)
+        except Exception as err:
+            nox.ffi.release(out_buf)
+            raise err
+        nox.ffi.release(out_buf)
+        if rc != CIPHER_OSSL_OK:
+            _raise_for_rc(rc, "HMAC " + alg)
+        return out_hex
+
+    def sign_hmac_sha256(self, key: str, data: str) -> str:
+        return self.sign_hmac("HS256", key, data)
+
+    def verify_hmac_sha256(self, key: str, data: str, expected_sig: str) -> bool:
+        return self.verify_hmac("HS256", key, data, expected_sig)
+
+    def sign_hmac(self, alg: str, key: str, data: str) -> str:
+        if alg != "HS256" and alg != "HS384" and alg != "HS512":
+            raise UnsupportedAlgorithmError(alg)
+        sig_hex: str = self._hmac_hex(alg, key, data)
+        return hex_to_bytes(sig_hex)
+
+    def verify_hmac(self, alg: str, key: str, data: str, expected_sig: str) -> bool:
+        expected_len: int = 0
+        if alg == "HS256":
+            expected_len = 32
+        elif alg == "HS384":
+            expected_len = 48
+        elif alg == "HS512":
+            expected_len = 64
+        else:
+            raise UnsupportedAlgorithmError(alg)
+
+        computed_hex: str = self._hmac_hex(alg, key, data)
+        if nox.strings.byte_len(expected_sig) != expected_len:
+            return False
+        expected_hex: str = bytes_to_hex(expected_sig)
+        return int(cipher_ossl_const_time_hex_eq(computed_hex, expected_hex)) == 1
+
+    def sign_asymmetric(self, alg: str, private_key_material: str, data: str) -> str:
+        if alg != "EdDSA" and alg != "RS256" and alg != "PS256" and alg != "ES256":
+            raise UnsupportedAlgorithmError(alg)
+
+        out_cap: int = 4096
+        out_buf: ptr = nox.ffi.alloc(out_cap)
+        rc: int = CIPHER_OSSL_ERR_CRYPTO
+        sig_hex: str = ""
+        try:
+            if alg == "EdDSA":
+                seed_hex: str = ""
+                if _is_json_jwk_str(private_key_material):
+                    parsed_okp: JwkKey = parse_jwk(private_key_material)
+                    seed_hex = parsed_okp.to_ed25519_private_hex()
+                else:
+                    trimmed_seed: str = nox.strings.lower(nox.strings.trim(private_key_material))
+                    if nox.strings.byte_len(trimmed_seed) != 64 or not is_valid_hex(trimmed_seed):
+                        raise InvalidKeyError("Ed25519 signing requires 32-byte seed hex (64 chars) or OKP private JWK")
+                    seed_hex = trimmed_seed
+                rc = int(cipher_ossl_ed25519_sign_hex(seed_hex, data, out_buf, i64(out_cap)))
+            elif alg == "RS256" or alg == "PS256":
+                rc = int(cipher_ossl_rsa_sign_pem_hex(alg, private_key_material, data, out_buf, i64(out_cap)))
+            elif alg == "ES256":
+                rc = int(cipher_ossl_es256_sign_pem_hex(private_key_material, data, out_buf, i64(out_cap)))
+
+            if rc == CIPHER_OSSL_OK:
+                sig_hex = nox.ffi.cstr(out_buf)
+        except Exception as err:
+            nox.ffi.release(out_buf)
+            raise err
+        nox.ffi.release(out_buf)
+
+        if rc != CIPHER_OSSL_OK:
+            _raise_for_rc(rc, "Asymmetric sign " + alg)
+        return hex_to_bytes(sig_hex)
+
+    def verify_asymmetric(self, alg: str, public_key_material: str, data: str, sig_raw: str) -> bool:
+        sig_hex: str = bytes_to_hex(sig_raw)
+
+        if alg == "EdDSA":
+            pub_hex: str = ""
+            if _is_json_jwk_str(public_key_material):
+                parsed_okp: JwkKey = parse_jwk(public_key_material)
+                pub_hex = parsed_okp.to_ed25519_public_hex()
+            else:
+                cleaned: str = nox.strings.lower(nox.strings.trim(public_key_material))
+                if nox.strings.byte_len(cleaned) != 64 or not is_valid_hex(cleaned):
+                    raise InvalidKeyError("Ed25519 public key must be 32 bytes (64 hex chars) or OKP JWK")
+                pub_hex = cleaned
+            if nox.strings.byte_len(sig_hex) != 128:
+                return False
+            rc_ed: int = int(cipher_ossl_ed25519_verify_hex(pub_hex, data, sig_hex))
+            if rc_ed < 0:
+                _raise_for_rc(rc_ed, "EdDSA verify")
+            return rc_ed == CIPHER_OSSL_VERIFY_VALID
+
+        if alg == "RS256" or alg == "PS256":
+            rc_rsa: int = CIPHER_OSSL_ERR_CRYPTO
+            if _is_json_jwk_str(public_key_material):
+                parsed_rsa: JwkKey = parse_jwk(public_key_material)
+                if parsed_rsa.kty != "RSA":
+                    raise InvalidKeyError("Algorithm confusion: " + alg + " requires RSA JWK")
+                n_hex: str = decode_base64url_hex(parsed_rsa.n)
+                e_hex: str = decode_base64url_hex(parsed_rsa.e)
+                rc_rsa = int(cipher_ossl_rsa_verify_jwk_hex(alg, n_hex, e_hex, data, sig_hex))
+            elif nox.strings.contains(public_key_material, "-----BEGIN PUBLIC KEY-----"):
+                rc_rsa = int(cipher_ossl_rsa_verify_pem_hex(alg, public_key_material, data, sig_hex))
+            else:
+                raise InvalidKeyError(alg + " verification requires RSA JWK JSON or PEM SubjectPublicKeyInfo")
+            if rc_rsa < 0:
+                _raise_for_rc(rc_rsa, alg + " verify")
+            return rc_rsa == CIPHER_OSSL_VERIFY_VALID
+
+        if alg == "ES256":
+            if nox.strings.byte_len(sig_hex) != 128:
+                return False
+            rc_ec: int = CIPHER_OSSL_ERR_CRYPTO
+            if _is_json_jwk_str(public_key_material):
+                parsed_ec: JwkKey = parse_jwk(public_key_material)
+                if parsed_ec.kty != "EC" or parsed_ec.crv != "P-256":
+                    raise InvalidKeyError("Algorithm confusion: ES256 requires EC P-256 JWK")
+                x_hex: str = decode_base64url_hex(parsed_ec.x)
+                y_hex: str = decode_base64url_hex(parsed_ec.y)
+                rc_ec = int(cipher_ossl_es256_verify_jwk_hex(x_hex, y_hex, data, sig_hex))
+            elif nox.strings.contains(public_key_material, "-----BEGIN PUBLIC KEY-----"):
+                rc_ec = int(cipher_ossl_es256_verify_pem_hex(public_key_material, data, sig_hex))
+            else:
+                raise InvalidKeyError("ES256 verification requires EC P-256 JWK JSON or PEM SubjectPublicKeyInfo")
+            if rc_ec < 0:
+                _raise_for_rc(rc_ec, "ES256 verify")
+            return rc_ec == CIPHER_OSSL_VERIFY_VALID
+
+        raise UnsupportedAlgorithmError(alg)
+
+    def secure_random_hex(self, n_bytes: int) -> str:
+        if n_bytes <= 0:
+            raise InvalidKeyError("Random byte length must be positive")
+        return nox.crypto.secure_random_hex(n_bytes)

@@ -1,7 +1,9 @@
 import nox.test
 from encoding import decode_base64url, encode_base64url
-from errors import DisallowedAlgorithmError, InvalidKeyError, UnsupportedAlgorithmError
-from jws import VerificationProfile, verify_hs256
+from errors import DisallowedAlgorithmError, InvalidKeyError, InvalidSignatureError, UnsupportedAlgorithmError
+from jws import JwsVerifier, VerificationProfile, VerifiedJws, verify_hs256, verify_jws
+from keys import KeyRef, STATE_ACTIVE_SIGNING
+from keyring import KeyRing
 from provider import DefaultCryptoProvider
 
 # 1. Algorithm Confusion Attack Simulation (RFC 8725 §3.2)
@@ -37,3 +39,42 @@ try:
 except UnsupportedAlgorithmError:
     unsupported_prevented = True
 nox.test.assert_true(unsupported_prevented, "Unsupported algorithm correctly rejected with UnsupportedAlgorithmError")
+
+# 3. Official RFC 8037 Appendix A.4 EdDSA (Ed25519) JWS Verification using pure NOX stdlib
+rfc8037_jwk: str = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+rfc8037_token: str = "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg"
+
+eddsa_prof: VerificationProfile = VerificationProfile(["EdDSA"], "")
+verified_ed: VerifiedJws = verify_jws(rfc8037_token, rfc8037_jwk, eddsa_prof)
+nox.test.assert_eq_str(verified_ed.algorithm, "EdDSA", "RFC 8037 EdDSA algorithm matches")
+nox.test.assert_eq_str(verified_ed.payload, "Example of Ed25519 signing", "RFC 8037 Ed25519 payload verified natively")
+
+# 4. KeyRing + EdDSA integration
+ed_token_kid_hdr: str = encode_base64url("{\"alg\":\"EdDSA\",\"kid\":\"k-ed-8037\"}")
+# Build test token check using verifier.verify_with_keyring with tampered signature (fail closed)
+ed_ring: KeyRing = KeyRing(trust_domain="ed-domain")
+ed_ring.add_key(KeyRef("k-ed-8037", "EdDSA", rfc8037_jwk, trust_domain="ed-domain", state=STATE_ACTIVE_SIGNING))
+tampered_ed_sig: str = "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+ed_tamper_rejected: bool = False
+try:
+    verify_jws(tampered_ed_sig, rfc8037_jwk, eddsa_prof)
+except InvalidSignatureError:
+    ed_tamper_rejected = True
+nox.test.assert_true(ed_tamper_rejected, "Tampered EdDSA signature rejected with InvalidSignatureError")
+
+# Wrong key family confusion check: RSA JWK passed for EdDSA verification
+rsa_jwk: str = "{\"kty\":\"RSA\",\"n\":\"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw\",\"e\":\"AQAB\"}"
+ed_confusion_rejected: bool = False
+try:
+    verify_jws(rfc8037_token, rsa_jwk, eddsa_prof)
+except InvalidKeyError:
+    ed_confusion_rejected = True
+nox.test.assert_true(ed_confusion_rejected, "RSA JWK passed to EdDSA verification must fail closed with InvalidKeyError")
+
+# Verifying with KeyRing when kid is missing must fail closed
+missing_kid_kr_rejected: bool = False
+try:
+    JwsVerifier().verify_with_keyring(rfc8037_token, ed_ring, eddsa_prof)
+except Exception:
+    missing_kid_kr_rejected = True
+nox.test.assert_true(missing_kid_kr_rejected, "verify_with_keyring rejects token without kid")

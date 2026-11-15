@@ -34,9 +34,10 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
 ## 2. Component Structure
 
 - **`errors.nox`**: Comprehensive strongly-typed exception hierarchy rooted in `CipherError`. No sensitive parameters or secrets in exception strings.
-- **`encoding.nox`**: RFC 4648 §5 URL-safe base64 encoding/decoding rejecting padding (`=`), whitespace, and non-alphabet characters. Hex conversion utilities.
-- **`json_strict.nox`**: RFC 8725 §3.10 duplicate key rejection, bounded sizes, and strongly-typed value accessors.
-- **`provider.nox`**: Pluggable provider abstraction with `DefaultCryptoProvider` backed by OS CSPRNG.
+- **`encoding.nox`**: RFC 4648 §5 URL-safe base64 encoding/decoding rejecting padding (`=`), whitespace, and non-alphabet characters. NUL-byte-safe hex utilities accelerated via `nox.bytes.str_from_list`.
+- **`json_strict.nox`**: RFC 8725 §3.10 duplicate key rejection, bounded sizes, and lazy `nox.json` tape accessors (`nox.yyjson` strictly forbidden on security boundaries).
+- **`provider.nox`**: Pluggable `CryptoProvider` abstraction with pure-NOX `DefaultCryptoProvider` (`HS256` + `nox.ed25519.verify`).
+- **`openssl_provider.nox` (Opt-In)**: Optional OpenSSL `libcrypto` C FFI bridge (`native/cipher_openssl.h`, `native/cipher_openssl_shim.c`) providing `RS256`, `PS256`, `ES256`, `EdDSA` sign+verify, `HS384`, and `HS512` via dynamic `dlopen` / `LoadLibraryA` without mandatory C linkage for pure-NOX consumers.
 - **`jws.nox`**: Compact JWS parsing, signing, and verification over original ASCII bytes with verifier-controlled algorithm allowlists.
 - **`claims.nox`**: Numerical date verification (`exp`, `nbf`, `iat`), clock leeway, issuer exact match, audience string/array match.
 - **`jwt.nox`**: Two-stage validation returning `VerifiedJwt` evidence. Separate `UnverifiedJwt` for diagnostic inspection.
@@ -64,8 +65,8 @@ Cipher is a framework-independent, pure NOX cryptographic token and contract lib
    - **Phase A (Pre-Linearization Validation & Staging — Rollback Permitted):** Under the hardware writer mutex (`_write_lock.compare_and_swap(False, True)`), `_commit_state` verifies `prev_state` and `new_state` seals, pre-serializes canonical state bytes, checks shared-memory capacity, advances `_atomic_version.compare_and_swap(base_ver, base_ver + 1)`, enters the odd Seqlock state via `_seq.compare_and_swap(base_ver * 2, base_ver * 2 + 1)` (`casal` Acquire-Release barrier), and stages `_state`, `_state_mac`, and `_shared_cells`. While `_seq` is odd, no Seqlock reader can complete a read; if any error occurs in Phase A (`committed == False`), state and sequence are rolled back cleanly before releasing `_write_lock`.
    - **Phase B (The Linearization Point — Irreversible):** The single atomic instruction `self._seq.compare_and_swap(odd_seq, even_next_seq)` (`casal` / `lock cmpxchg`) is the **exact Linearization Point** of the commit. Once `committed = True`, rollback is strictly forbidden (`if not committed:`), guaranteeing that no committed state observed by a reader can ever be rolled back.
 4. **Cross-OS-Thread Shared Atomic State (`export_shared_handle` / `attach_shared_handle`):**
-   - Because NOX's default QBE `nox.thread.start` uses shared-nothing per-worker heaps, `KeyRing` provides `export_shared_handle() -> str` and `attach_shared_handle(handle_str: str)` backed by 512 process-wide `nox.atomic.AtomicInt` cells (`SHARED_ATOMIC_WORDS = 512`, 3,072 bytes capacity).
-   - Writers pack the length-prefixed canonical `KeyRingState` into the shared atomic cells during Phase A (before the Linearization Point), and readers across any OS thread automatically deserialize and verify the latest `KeyRingState` whenever `st.version != (s1 >> 1)`.
+   - Because NOX's QBE/LLVM `nox.thread.start` uses shared-nothing per-worker heaps, `KeyRing` pairs `nox.atomic.AtomicRef` (`_shared_state_ref`) with the single-word 64-bit `_shared_gate` CAS + hardware Seqlock protocol.
+   - `AtomicRef` shares arbitrary-size immutable canonical UTF-8 `KeyRingState` snapshots (`> 48 KiB`, 180+ keys verified across OS threads, breaking the prior 6-byte word-packing limit) while optionally preserving bounded `AtomicInt` telemetry (`max_words=64..8192`, or `max_words=0` for pure unbounded `AtomicRef` mode). Internal worker execution paths inline critical constants rather than relying on module-global reads across fresh OS threads.
 
 ### Decoupled IP Syntax Parsing, SSRF Policy & Negative Cache Boundaries
 `jwks.nox` strictly separates syntactic IP parsing from SSRF security policy evaluation:

@@ -53,6 +53,25 @@ jobs:
       - name: Verify Toolchain
         run: noxc version
 
+      - name: Build Optional OpenSSL C Shim (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: bash ./scripts/build-openssl-shim.sh
+
+      - name: Build Optional OpenSSL C Shim (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (Test-Path "C:\Program Files\OpenSSL-Win64\bin") {
+            "C:\Program Files\OpenSSL-Win64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Get-Command clang -ErrorAction SilentlyContinue) {
+            clang -c -O2 -Wall -Wextra -o native/cipher_openssl_shim.o native/cipher_openssl_shim.c
+          } elseif (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc -c -O2 -Wall -Wextra -o native/cipher_openssl_shim.o native/cipher_openssl_shim.c
+          } else {
+            throw "No C compiler (clang or gcc) found on Windows runner"
+          }
+
       - name: Run Full Test Suite
         run: noxc test
 

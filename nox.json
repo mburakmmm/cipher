@@ -1,6 +1,7 @@
 {
   "name": "cipher",
-  "version": "1.0.11",
+  "version": "1.1.0",
   "entry": "cipher.nox",
+  "source": "mixed",
   "requires": []
 }

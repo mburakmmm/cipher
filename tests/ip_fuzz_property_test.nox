@@ -1,8 +1,11 @@
 # Cipher — Property-Based & Adversarial Fuzz Test Suite for IPv4/IPv6 Parsers & SSRF Policy
 
+import nox.mem
+import nox.property
+from nox.property import Rng
 import nox.test
 import nox.url
-from cipher import EncodingError, IPv4Address, IPv6Address, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, verify_resolved_ip
+from cipher import CipherError, EncodingError, IPv4Address, IPv6Address, JwkKey, VerificationProfile, VerifiedJws, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwk, sign_jws, verify_jws, verify_resolved_ip
 
 def _nibble_to_hex(n: int, upper: bool) -> str:
     if n == 0:
@@ -506,5 +509,99 @@ _verify_rfc4291_vector("::FFFF:129.144.52.38", 0, 0, 0, 0, 0, 65535, 33168, 1335
 # RFC 6890 / RFC 6052 Well-Known Prefix (64:ff9b::/96) & Discard Prefix (100::/64)
 _verify_rfc4291_vector("64:ff9b::192.0.2.33", 100, 65435, 0, 0, 0, 0, 49152, 545, True, False)
 _verify_rfc4291_vector("100::1", 256, 0, 0, 0, 0, 0, 0, 1, True, False)
+
+# ==============================================================================
+# Property 7: nox.property Seeded Shrinking Fuzzing + nox.mem.stats() Leak Gate (18.4)
+# ==============================================================================
+def _prop_ipv4_cidr_oracle(r: Rng) -> bool:
+    o0: int = r.int_range(0, 255)
+    o1: int = r.int_range(0, 255)
+    o2: int = r.int_range(0, 255)
+    o3: int = r.int_range(0, 255)
+    oracle_r: bool = _oracle_ipv4_restricted_u32(o0, o1, o2, o3)
+    ip_s: str = str(o0) + "." + str(o1) + "." + str(o2) + "." + str(o3)
+    p4: IPv4Address = parse_ipv4(ip_s)
+    if is_restricted_ipv4_addr(p4) != oracle_r:
+        return False
+    if verify_resolved_ip(ip_s) == oracle_r:
+        return False
+    if verify_resolved_ip("::ffff:" + ip_s) == oracle_r:
+        return False
+    return True
+
+def _prop_ipv6_cidr_oracle(r: Rng) -> bool:
+    edges: list[int] = [0, 100, 8193, 8194, 16368, 64512, 65152, 65216, 65280, 9728, 10240]
+    h0: int = r.int_range(0, 65535)
+    if r.boolean():
+        h0 = edges[r.int_range(0, len(edges) - 1)]
+    h1: int = r.int_range(0, 65535)
+    h2: int = r.int_range(0, 65535)
+    h3: int = r.int_range(0, 65535)
+    h4: int = r.int_range(0, 65535)
+    h5: int = r.int_range(0, 65535)
+    h6: int = r.int_range(0, 65535)
+    h7: int = r.int_range(0, 65535)
+    if h0 == 0 and r.boolean():
+        h1 = 0
+        h2 = 0
+        h3 = 0
+        h4 = 0
+        h5 = 65535
+    oracle_r: bool = _oracle_ipv6_restricted(h0, h1, h2, h3, h4, h5, h6, h7)
+    v6_s: str = _u16_to_hex4(h0, r.boolean()) + ":" + _u16_to_hex4(h1, r.boolean()) + ":" + _u16_to_hex4(h2, r.boolean()) + ":" + _u16_to_hex4(h3, r.boolean()) + ":" + _u16_to_hex4(h4, r.boolean()) + ":" + _u16_to_hex4(h5, r.boolean()) + ":" + _u16_to_hex4(h6, r.boolean()) + ":" + _u16_to_hex4(h7, r.boolean())
+    p6: IPv6Address = parse_ipv6(v6_s)
+    if is_restricted_ipv6_addr(p6) != oracle_r:
+        return False
+    if verify_resolved_ip(v6_s) == oracle_r:
+        return False
+    return True
+
+def _prop_malformed_token_jwk_fail_closed(r: Rng) -> bool:
+    s1: str = r.ascii_str(24)
+    s2: str = r.ascii_str(24)
+    s3: str = r.ascii_str(24)
+    bad_tok: str = s1 + "." + s2 + "." + s3
+    rejected_tok: bool = False
+    try:
+        _v: VerifiedJws = verify_jws(bad_tok, "super-secret-fuzz-key-at-least-32-bytes!", VerificationProfile(["HS256"]))
+    except CipherError:
+        rejected_tok = True
+    if not rejected_tok:
+        return False
+
+    bad_jwk: str = "{\"kty\":\"" + s1 + "\",\"kid\":\"" + s2 + "\"}"
+    rejected_jwk: bool = False
+    try:
+        _k: JwkKey = parse_jwk(bad_jwk)
+    except CipherError:
+        rejected_jwk = True
+    return rejected_jwk
+
+nox.property.check("ipv4_cidr_oracle_shrinking", _prop_ipv4_cidr_oracle, runs=250, seed=20261115, max_size=65535)
+nox.property.check("ipv6_cidr_oracle_shrinking", _prop_ipv6_cidr_oracle, runs=250, seed=20261116, max_size=65535)
+nox.property.check("malformed_token_and_jwk_fail_closed", _prop_malformed_token_jwk_fail_closed, runs=150, seed=20261117, max_size=64)
+
+def _run_jws_mem_churn() -> int:
+    sec: str = "super-secret-mem-regression-key-32b"
+    prof: VerificationProfile = VerificationProfile(["HS256"], expected_kid="mem-1")
+    ok_cnt: int = 0
+    round_i: int = 0
+    while round_i < 40:
+        tok: str = sign_jws("{\"n\":" + str(round_i) + "}", "HS256", sec, kid="mem-1")
+        ver: VerifiedJws = verify_jws(tok, sec, prof)
+        if ver.kid == "mem-1":
+            ok_cnt = ok_cnt + 1
+        round_i = round_i + 1
+    return ok_cnt
+
+# Warm up before nox.mem.stats() baseline window
+_warm_cnt: int = _run_jws_mem_churn()
+nox.test.assert_eq_int(_warm_cnt, 40, "Warmup JWS churn succeeded")
+
+nox.mem.stats()
+_chk_cnt: int = _run_jws_mem_churn()
+jws_mem: nox.mem.MemStats = nox.mem.stats()
+nox.test.assert_eq_int(_chk_cnt, 40, "JWS churn succeeded under mem tracking")
+nox.test.assert_true(jws_mem.live <= 4, "Bounded ARC live allocations after JWS sign/verify churn (live=" + str(jws_mem.live) + ")")
 
 print("ip_fuzz_property_test passed!")

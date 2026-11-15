@@ -3,13 +3,17 @@
 
 import nox.crypto
 import nox.strings
-from cipher.encoding import decode_base64url, encode_base64url, hex_to_bytes, validate_base64url_syntax
+from cipher.encoding import decode_base64url, decode_base64url_hex, encode_base64url, encode_base64url_from_hex, hex_to_bytes, validate_base64url_syntax
 from cipher.errors import EncodingError, InvalidKeyError, JsonFormatError
 from cipher.json_strict import get_string_field, has_field, is_object, parse_strict_json
 
 MIN_RSA_MODULUS_CHARS: int = 342  # RFC 7518 §3.3: 2048-bit modulus (256 bytes) requires at least 342 unpadded Base64URL characters (2040 bits is only 340 chars)
 MAX_RSA_EXPONENT_CHARS: int = 11  # Upper bound for safe integer RSA public exponent (IEEE 754 53-bit safe integer limit; e.g. 65537 'AQAB' is 4 chars)
 MAX_SAFE_INT_BEFORE_SHIFT: int = 140737488355327  # (2^53 - 1) >> 6: IEEE 754 53-bit safe integer overflow prevention boundary
+ED25519_COORD_BYTES: int = 32
+ED25519_COORD_HEX_LEN: int = 64
+P256_COORD_BYTES: int = 32
+P256_COORD_HEX_LEN: int = 64
 
 
 
@@ -61,9 +65,14 @@ class JwkKey:
     d: str
     # Symmetric fields
     k: str
+    # EC / OKP fields
+    crv: str
+    x: str
+    y: str
 
     def __init__(self, kty: str, kid: str = "", alg: str = "", use: str = "sig",
-                 n: str = "", e: str = "", d: str = "", k: str = "") -> None:
+                 n: str = "", e: str = "", d: str = "", k: str = "",
+                 crv: str = "", x: str = "", y: str = "") -> None:
         self.kty = kty
         self.kid = kid
         self.alg = alg
@@ -72,8 +81,16 @@ class JwkKey:
         self.e = e
         self.d = d
         self.k = k
+        self.crv = crv
+        self.x = x
+        self.y = y
+
+        if self.use != "" and self.use != "sig":
+            raise InvalidKeyError("JWK 'use' must be 'sig' when provided")
 
         if self.kty == "RSA":
+            if self.alg != "" and self.alg != "RS256" and self.alg != "RS384" and self.alg != "RS512" and self.alg != "PS256" and self.alg != "PS384" and self.alg != "PS512":
+                raise InvalidKeyError("Incompatible 'alg' for RSA JWK: " + self.alg)
             if self.n == "" or self.e == "":
                 raise InvalidKeyError("RSA JWK must contain both 'n' and 'e' parameters")
             
@@ -117,17 +134,87 @@ class JwkKey:
                 raise InvalidKeyError("RSA public exponent 'e' must be greater than 1")
             if e_val % 2 == 0:
                 raise InvalidKeyError("RSA public exponent 'e' must be an odd positive integer")
-        
+            return
+
+        if self.kty == "OKP":
+            if self.crv != "Ed25519":
+                raise InvalidKeyError("Unsupported OKP curve (only 'Ed25519' is permitted): " + self.crv)
+            if self.alg != "" and self.alg != "EdDSA":
+                raise InvalidKeyError("Incompatible 'alg' for OKP Ed25519 JWK: " + self.alg)
+            if self.x == "":
+                raise InvalidKeyError("OKP JWK must contain public coordinate 'x'")
+            x_hex: str = ""
+            try:
+                x_hex = decode_base64url_hex(self.x)
+            except EncodingError:
+                raise InvalidKeyError("OKP 'x' coordinate has invalid Base64URL syntax")
+            if nox.strings.byte_len(x_hex) != ED25519_COORD_HEX_LEN:
+                raise InvalidKeyError("OKP Ed25519 'x' coordinate must decode to exactly 32 bytes")
+            if encode_base64url_from_hex(x_hex) != self.x:
+                raise InvalidKeyError("OKP Ed25519 'x' coordinate is non-canonical Base64URL")
+            if self.d != "":
+                d_hex: str = ""
+                try:
+                    d_hex = decode_base64url_hex(self.d)
+                except EncodingError:
+                    raise InvalidKeyError("OKP 'd' private key has invalid Base64URL syntax")
+                if nox.strings.byte_len(d_hex) != ED25519_COORD_HEX_LEN:
+                    raise InvalidKeyError("OKP Ed25519 'd' private key must decode to exactly 32 bytes")
+            return
+
+        if self.kty == "EC":
+            if self.crv != "P-256":
+                raise InvalidKeyError("Unsupported EC curve (only 'P-256' is permitted): " + self.crv)
+            if self.alg != "" and self.alg != "ES256":
+                raise InvalidKeyError("Incompatible 'alg' for EC P-256 JWK: " + self.alg)
+            if self.x == "" or self.y == "":
+                raise InvalidKeyError("EC P-256 JWK must contain both 'x' and 'y' coordinates")
+            ec_x_hex: str = ""
+            ec_y_hex: str = ""
+            try:
+                ec_x_hex = decode_base64url_hex(self.x)
+                ec_y_hex = decode_base64url_hex(self.y)
+            except EncodingError:
+                raise InvalidKeyError("EC 'x'/'y' coordinate has invalid Base64URL syntax")
+            if nox.strings.byte_len(ec_x_hex) != P256_COORD_HEX_LEN or nox.strings.byte_len(ec_y_hex) != P256_COORD_HEX_LEN:
+                raise InvalidKeyError("EC P-256 'x' and 'y' coordinates must each decode to exactly 32 bytes")
+            if encode_base64url_from_hex(ec_x_hex) != self.x or encode_base64url_from_hex(ec_y_hex) != self.y:
+                raise InvalidKeyError("EC P-256 coordinates must use canonical Base64URL encoding")
+            if self.d != "":
+                ec_d_hex: str = ""
+                try:
+                    ec_d_hex = decode_base64url_hex(self.d)
+                except EncodingError:
+                    raise InvalidKeyError("EC 'd' private scalar has invalid Base64URL syntax")
+                if nox.strings.byte_len(ec_d_hex) != P256_COORD_HEX_LEN:
+                    raise InvalidKeyError("EC P-256 'd' private scalar must decode to exactly 32 bytes")
+            return
+
         if self.kty == "oct":
+            if self.alg != "" and self.alg != "HS256" and self.alg != "HS384" and self.alg != "HS512":
+                raise InvalidKeyError("Incompatible 'alg' for symmetric 'oct' JWK: " + self.alg)
             if self.k == "":
                 raise InvalidKeyError("Symmetric 'oct' JWK must contain 'k' parameter")
+            return
+
+        raise InvalidKeyError("Unsupported JWK key type 'kty': " + self.kty)
 
     def is_private(self) -> bool:
-        if self.kty == "RSA":
+        if self.kty == "RSA" or self.kty == "OKP" or self.kty == "EC":
             return self.d != ""
         if self.kty == "oct":
             return True
         return False
+
+    def to_ed25519_public_hex(self) -> str:
+        if self.kty != "OKP" or self.crv != "Ed25519":
+            raise InvalidKeyError("Key is not an OKP Ed25519 JWK")
+        return decode_base64url_hex(self.x)
+
+    def to_ed25519_private_hex(self) -> str:
+        if self.kty != "OKP" or self.crv != "Ed25519" or self.d == "":
+            raise InvalidKeyError("OKP Ed25519 JWK does not contain private key material 'd'")
+        return decode_base64url_hex(self.d)
 
     def to_public_json(self) -> str:
         # Invariant: Never export private 'd' or symmetric secret 'k'
@@ -141,6 +228,28 @@ class JwkKey:
                 out = out + ",\"use\":\"" + self.use + "\""
             out = out + "}"
             return out
+
+        if self.kty == "OKP":
+            out_okp: str = "{\"kty\":\"OKP\",\"crv\":\"" + self.crv + "\",\"x\":\"" + self.x + "\""
+            if self.kid != "":
+                out_okp = out_okp + ",\"kid\":\"" + self.kid + "\""
+            if self.alg != "":
+                out_okp = out_okp + ",\"alg\":\"" + self.alg + "\""
+            if self.use != "":
+                out_okp = out_okp + ",\"use\":\"" + self.use + "\""
+            out_okp = out_okp + "}"
+            return out_okp
+
+        if self.kty == "EC":
+            out_ec: str = "{\"kty\":\"EC\",\"crv\":\"" + self.crv + "\",\"x\":\"" + self.x + "\",\"y\":\"" + self.y + "\""
+            if self.kid != "":
+                out_ec = out_ec + ",\"kid\":\"" + self.kid + "\""
+            if self.alg != "":
+                out_ec = out_ec + ",\"alg\":\"" + self.alg + "\""
+            if self.use != "":
+                out_ec = out_ec + ",\"use\":\"" + self.use + "\""
+            out_ec = out_ec + "}"
+            return out_ec
         
         if self.kty == "oct":
             # RFC 7517: Symmetric keys MUST NOT be exported as public JWKs
@@ -156,6 +265,18 @@ class JwkKey:
             hex_hash: str = nox.crypto.sha256(canonical_json)
             raw_hash: str = hex_to_bytes(hex_hash)
             return encode_base64url(raw_hash)
+
+        if self.kty == "OKP":
+            # Lexicographical order: crv, kty, x
+            canonical_okp: str = "{\"crv\":\"" + self.crv + "\",\"kty\":\"OKP\",\"x\":\"" + self.x + "\"}"
+            hex_okp: str = nox.crypto.sha256(canonical_okp)
+            return encode_base64url_from_hex(hex_okp)
+
+        if self.kty == "EC":
+            # Lexicographical order: crv, kty, x, y
+            canonical_ec: str = "{\"crv\":\"" + self.crv + "\",\"kty\":\"EC\",\"x\":\"" + self.x + "\",\"y\":\"" + self.y + "\"}"
+            hex_ec: str = nox.crypto.sha256(canonical_ec)
+            return encode_base64url_from_hex(hex_ec)
         
         if self.kty == "oct":
             # Lexicographical order: k, kty
@@ -183,5 +304,8 @@ def parse_jwk(jwk_json: str) -> JwkKey:
     e: str = get_string_field(v, "e", default_val="", required=False)
     d: str = get_string_field(v, "d", default_val="", required=False)
     k: str = get_string_field(v, "k", default_val="", required=False)
+    crv: str = get_string_field(v, "crv", default_val="", required=False)
+    x: str = get_string_field(v, "x", default_val="", required=False)
+    y: str = get_string_field(v, "y", default_val="", required=False)
 
-    return JwkKey(kty, kid, alg, use, n, e, d, k)
+    return JwkKey(kty, kid, alg, use, n, e, d, k, crv, x, y)

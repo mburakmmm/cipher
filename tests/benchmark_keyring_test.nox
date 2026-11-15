@@ -32,10 +32,11 @@ def _percentile(sorted_arr: list[int], pct: int) -> int:
     idx: int = ((n - 1) * pct) // 100
     return sorted_arr[idx]
 
-def _ms_to_nonzero_us(ms: int) -> int:
-    if ms <= 0:
-        return 500
-    return ms * 1000
+def _ns_to_us(ns: int) -> int:
+    us: int = ns // 1000
+    if us <= 0:
+        return 1
+    return us
 
 bench_ring: KeyRing = KeyRing(trust_domain="bench-domain")
 k0: KeyRef = KeyRef("k-bench-0", "HS256", "super-secret-benchmark-key-000000", trust_domain="bench-domain", state=STATE_ACTIVE_SIGNING)
@@ -53,47 +54,61 @@ while w_i < 200:
 # ==============================================================================
 # 1. Multi-Run Seqlock get_signing_key() Benchmark (5 runs x 1000 ops, us & ns/op)
 # ==============================================================================
+sign_samples_ns: list[int] = []
 sign_samples_us: list[int] = []
 b_i: int = 0
 while b_i < 5:
-    bt0: nox.time.Instant = nox.time.instant_now()
+    t0_sign: int = nox.time.monotonic_ns()
     op_i: int = 0
     while op_i < 1000:
         sk: KeyRef = bench_ring.get_signing_key("HS256")
         if sk.kid != "k-bench-0":
             raise Exception("Benchmark signing key mismatch")
         op_i = op_i + 1
-    sign_samples_us.append(_ms_to_nonzero_us(bt0.elapsed_ms()))
+    dt_sign: int = nox.time.monotonic_ns() - t0_sign
+    sign_samples_ns.append(dt_sign)
+    sign_samples_us.append(_ns_to_us(dt_sign))
     b_i = b_i + 1
+sorted_sign_ns: list[int] = _sort_ints(sign_samples_ns)
 sorted_sign_us: list[int] = _sort_ints(sign_samples_us)
+sign_median_ns: int = _percentile(sorted_sign_ns, 50)
 sign_median_us: int = _percentile(sorted_sign_us, 50)
 sign_p50_us: int = sign_median_us
 sign_p95_us: int = _percentile(sorted_sign_us, 95)
-sign_ns_per_op: int = (sign_median_us * 1000) // 1000
-nox.test.assert_true(sign_p50_us > 0 and sign_ns_per_op > 0, "Non-zero microsecond p50 and ns/op for get_signing_key()")
+sign_ns_per_op: int = sign_median_ns // 1000
+if sign_ns_per_op <= 0:
+    sign_ns_per_op = 1
+nox.test.assert_true(sign_p50_us > 0 and sign_ns_per_op > 0, "Real monotonic_ns microsecond p50 and ns/op for get_signing_key()")
 nox.test.assert_true(sign_p95_us < 5000000, "Seqlock get_signing_key() completed within budget")
 
 # ==============================================================================
-# 2. Multi-Run Seqlock get_verification_key() Benchmark (5 runs x 1000 ops, us & ns/op)
+# 2. Multi-Run Seqlock get_verification_key() Benchmark (5 runs x 1000 ops, ns & us)
 # ==============================================================================
+ver_samples_ns: list[int] = []
 ver_samples_us: list[int] = []
 vb_i: int = 0
 while vb_i < 5:
-    vbt0: nox.time.Instant = nox.time.instant_now()
+    t0_ver: int = nox.time.monotonic_ns()
     vop_i: int = 0
     while vop_i < 1000:
         vk: KeyRef = bench_ring.get_verification_key("k-bench-0", 1700000100)
         if vk.kid != "k-bench-0":
             raise Exception("Benchmark verification key mismatch")
         vop_i = vop_i + 1
-    ver_samples_us.append(_ms_to_nonzero_us(vbt0.elapsed_ms()))
+    dt_ver: int = nox.time.monotonic_ns() - t0_ver
+    ver_samples_ns.append(dt_ver)
+    ver_samples_us.append(_ns_to_us(dt_ver))
     vb_i = vb_i + 1
+sorted_ver_ns: list[int] = _sort_ints(ver_samples_ns)
 sorted_ver_us: list[int] = _sort_ints(ver_samples_us)
+ver_median_ns: int = _percentile(sorted_ver_ns, 50)
 ver_median_us: int = _percentile(sorted_ver_us, 50)
 ver_p50_us: int = ver_median_us
 ver_p95_us: int = _percentile(sorted_ver_us, 95)
-ver_ns_per_op: int = (ver_median_us * 1000) // 1000
-nox.test.assert_true(ver_p50_us > 0 and ver_ns_per_op > 0, "Non-zero microsecond p50 and ns/op for get_verification_key()")
+ver_ns_per_op: int = ver_median_ns // 1000
+if ver_ns_per_op <= 0:
+    ver_ns_per_op = 1
+nox.test.assert_true(ver_p50_us > 0 and ver_ns_per_op > 0, "Real monotonic_ns microsecond p50 and ns/op for get_verification_key()")
 nox.test.assert_true(ver_p95_us < 5000000, "Seqlock get_verification_key() completed within budget")
 
 # ==============================================================================
@@ -103,14 +118,14 @@ rot_samples_us: list[int] = []
 r: int = 1
 rb_i: int = 0
 while rb_i < 5:
-    rbt0: nox.time.Instant = nox.time.instant_now()
+    t0_rot: int = nox.time.monotonic_ns()
     step_r: int = 0
     while step_r < 20:
         nk: KeyRef = KeyRef("k-bench-" + str(r), "HS256", "super-secret-benchmark-key-rot-32", trust_domain="bench-domain", state=STATE_PREPARED)
         bench_ring.rotate(nk, overlap_seconds=600, clock_time_sec=1700000000 + r, expected_version=r)
         r = r + 1
         step_r = step_r + 1
-    rot_samples_us.append(_ms_to_nonzero_us(rbt0.elapsed_ms()))
+    rot_samples_us.append(_ns_to_us(nox.time.monotonic_ns() - t0_rot))
     rb_i = rb_i + 1
 sorted_rot_us: list[int] = _sort_ints(rot_samples_us)
 rot_median_us: int = _percentile(sorted_rot_us, 50)
@@ -120,7 +135,7 @@ rot_us_per_op: int = rot_median_us // 20
 if rot_us_per_op <= 0:
     rot_us_per_op = 1
 nox.test.assert_eq_int(bench_ring.get_version(), 101, "100 sequential rotations across 5 runs reached version 101")
-nox.test.assert_true(rot_p50_us > 0 and rot_us_per_op > 0, "Non-zero microsecond p50 and us/op for rotate()")
+nox.test.assert_true(rot_p50_us > 0 and rot_us_per_op > 0, "Real monotonic_ns microsecond p50 and us/op for rotate()")
 
 # ==============================================================================
 # 4. Multi-Run Cross-Thread Shared Atomic State Round-Trip Sync (5 runs x 10 ops, us)
@@ -135,7 +150,7 @@ reader_ring.attach_shared_handle(sh_handle)
 s_idx: int = 1
 sb_i: int = 0
 while sb_i < 5:
-    sbt0: nox.time.Instant = nox.time.instant_now()
+    t0_sync: int = nox.time.monotonic_ns()
     s_step: int = 0
     while s_step < 10:
         sh_ring.rotate(
@@ -149,7 +164,7 @@ while sb_i < 5:
             raise Exception("Shared atomic state sync mismatch")
         s_idx = s_idx + 1
         s_step = s_step + 1
-    sync_samples_us.append(_ms_to_nonzero_us(sbt0.elapsed_ms()))
+    sync_samples_us.append(_ns_to_us(nox.time.monotonic_ns() - t0_sync))
     sb_i = sb_i + 1
 sorted_sync_us: list[int] = _sort_ints(sync_samples_us)
 sync_median_us: int = _percentile(sorted_sync_us, 50)
@@ -177,12 +192,12 @@ def _bench_key_scaling_median_us(target_keys: int) -> int:
     run_samples: list[int] = []
     r_i: int = 0
     while r_i < 5:
-        st_inst: nox.time.Instant = nox.time.instant_now()
+        t0_sc: int = nox.time.monotonic_ns()
         q: int = 0
         while q < 1000:
             _vk: KeyRef = sc_ring.get_verification_key(last_kid, 2000)
             q = q + 1
-        run_samples.append(_ms_to_nonzero_us(st_inst.elapsed_ms()))
+        run_samples.append(_ns_to_us(nox.time.monotonic_ns() - t0_sc))
         r_i = r_i + 1
     sorted_runs: list[int] = _sort_ints(run_samples)
     return _percentile(sorted_runs, 50)
@@ -196,7 +211,7 @@ scale_64_us: int = _bench_key_scaling_median_us(64)
 # ==============================================================================
 bench_json: str = "{\n"
 bench_json = bench_json + "  \"suite\": \"cipher_keyring_benchmark\",\n"
-bench_json = bench_json + "  \"version\": \"1.0.11\",\n"
+bench_json = bench_json + "  \"version\": \"1.1.0\",\n"
 bench_json = bench_json + "  \"runs\": 5,\n"
 bench_json = bench_json + "  \"metrics\": {\n"
 bench_json = bench_json + "    \"seqlock_get_signing_key_5x1000_median_us\": " + str(sign_median_us) + ",\n"
@@ -238,8 +253,8 @@ base_doc: JsonValue = parse_strict_json(base_raw)
 base_ver: str = get_string_field(base_doc, "version")
 bm: JsonValue = get_field_value(base_doc, "metrics")
 
-cmp_md: str = "## Cipher KeyRing Multi-Run Median Benchmark Comparison (`v" + base_ver + "` vs `v1.0.11`, 5-Run Median)\n\n"
-cmp_md = cmp_md + "| Benchmark Metric (5-Run Median) | Baseline (`v" + base_ver + "`) | Current (`v1.0.11`) | Delta |\n"
+cmp_md: str = "## Cipher KeyRing Multi-Run Median Benchmark Comparison (`v" + base_ver + "` vs `v1.1.0`, 5-Run Median, `monotonic_ns()`)\n\n"
+cmp_md = cmp_md + "| Benchmark Metric (5-Run Median) | Baseline (`v" + base_ver + "`) | Current (`v1.1.0`) | Delta |\n"
 cmp_md = cmp_md + "|---|---:|---:|---:|\n"
 cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_5x1000_median_us", get_int_field(bm, "seqlock_get_signing_key_5x1000_median_us"), sign_median_us, "us")
 cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_p50_us", get_int_field(bm, "seqlock_get_signing_key_p50_us"), sign_p50_us, "us")

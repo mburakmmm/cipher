@@ -6,6 +6,8 @@ from cipher.claims import Claims, ClaimsProfile, parse_claims, validate_claims
 from cipher.encoding import decode_base64url
 from cipher.errors import MalformedTokenError
 from cipher.jws import JwsSigner, JwsVerifier, ProtectedHeader, VerificationProfile, VerifiedJws, parse_protected_header
+from cipher.keyring import KeyRing
+from cipher.provider import CryptoProvider, DefaultCryptoProvider
 
 class VerifiedJwt:
     claims: Claims
@@ -48,6 +50,9 @@ class JwtIssuer:
         # Sign payload using strict JWS HS256 engine
         return self.signer.sign_hs256(claims_json, secret, kid, typ)
 
+    def encode(self, claims_json: str, alg: str, key_material: str, kid: str = "", typ: str = "JWT") -> str:
+        return self.signer.sign(claims_json, alg, key_material, kid=kid, typ=typ)
+
 class JwtVerifier:
     jws_verifier: JwsVerifier
 
@@ -61,13 +66,26 @@ class JwtVerifier:
     def verify_hs256(self, token: str, secret: str,
                      verification_profile: VerificationProfile,
                      claims_profile: ClaimsProfile) -> VerifiedJwt:
+        return self.verify(token, secret, verification_profile, claims_profile)
+
+    def verify(self, token: str, key_material: str,
+               verification_profile: VerificationProfile,
+               claims_profile: ClaimsProfile) -> VerifiedJwt:
         # Step 1: Cryptographic signature and compact header verification
-        verified_jws: VerifiedJws = self.jws_verifier.verify_hs256(token, secret, verification_profile)
+        verified_jws: VerifiedJws = self.jws_verifier.verify(token, key_material, verification_profile)
         
         # Step 2: Parse and strictly validate claims profile
         claims: Claims = parse_claims(verified_jws.payload)
         validate_claims(claims, claims_profile)
         
+        return VerifiedJwt(claims, verified_jws.header, token, verified_jws.raw_signing_input)
+
+    def verify_with_keyring(self, token: str, ring: KeyRing,
+                            verification_profile: VerificationProfile,
+                            claims_profile: ClaimsProfile) -> VerifiedJwt:
+        verified_jws: VerifiedJws = self.jws_verifier.verify_with_keyring(token, ring, verification_profile)
+        claims: Claims = parse_claims(verified_jws.payload)
+        validate_claims(claims, claims_profile)
         return VerifiedJwt(claims, verified_jws.header, token, verified_jws.raw_signing_input)
 
 # Ergonomic helper functions
@@ -80,6 +98,24 @@ def verify_jwt_hs256(token: str, secret: str,
                       claims_profile: ClaimsProfile) -> VerifiedJwt:
     verifier: JwtVerifier = JwtVerifier()
     return verifier.verify_hs256(token, secret, verification_profile, claims_profile)
+
+def encode_jwt(claims_json: str, alg: str, key_material: str, kid: str = "", typ: str = "JWT",
+               provider: CryptoProvider | None = None) -> str:
+    signer: JwsSigner = JwsSigner()
+    if provider is not None:
+        signer = signer.with_provider(provider)
+    issuer: JwtIssuer = JwtIssuer().with_signer(signer)
+    return issuer.encode(claims_json, alg, key_material, kid=kid, typ=typ)
+
+def verify_jwt(token: str, key_material: str,
+               verification_profile: VerificationProfile,
+               claims_profile: ClaimsProfile,
+               provider: CryptoProvider | None = None) -> VerifiedJwt:
+    jws_v: JwsVerifier = JwsVerifier()
+    if provider is not None:
+        jws_v = jws_v.with_provider(provider)
+    verifier: JwtVerifier = JwtVerifier().with_jws_verifier(jws_v)
+    return verifier.verify(token, key_material, verification_profile, claims_profile)
 
 # Explicitly unsafe diagnostic decode (no verification!)
 def decode_unverified_jwt(token: str) -> UnverifiedJwt:

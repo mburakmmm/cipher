@@ -1,7 +1,7 @@
 import nox.test
 from errors import ConfigurationError, EncodingError, KeyUnavailableError, UnknownKeyError
 from jwk import JwkKey
-from jwks import IPv4Address, IPv6Address, JwksKeySource, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, verify_resolved_ip
+from jwks import IPv4Address, IPv6Address, JwksKeySource, TlsJwksTarget, fetch_jwks_tls, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, validate_tls_jwks_target, verify_resolved_ip
 
 # 1. SSRF Protection Tests
 nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
@@ -191,5 +191,28 @@ nox.test.assert_true(not verify_resolved_ip("fe80::1%eth0"), "IPv6 zone identifi
 nox.test.assert_true(not verify_resolved_ip("gggg::1"), "Non-hex characters in IPv6 rejected")
 nox.test.assert_true(not verify_resolved_ip("1:2:3:4:5:6:7:8.8.8.8"), "9-hextet overflow in embedded IPv4 rejected")
 nox.test.assert_true(not verify_resolved_ip("1:2:3:4:5:6::8.8.8.8"), "8-hextet with redundant '::' in embedded IPv4 rejected")
+
+# 5. TLS Target Validation & DNS-Pinning Fail-Closed SSRF Checks (18.4)
+tgt_ok: TlsJwksTarget = validate_tls_jwks_target("https://auth.example.com/.well-known/jwks.json", resolved_ip="93.184.216.34", allowed_host="auth.example.com")
+nox.test.assert_eq_str(tgt_ok.host, "auth.example.com", "TLS target host extracted")
+nox.test.assert_eq_int(tgt_ok.port, 443, "TLS target defaults to port 443")
+nox.test.assert_eq_str(tgt_ok.path, "/.well-known/jwks.json", "TLS target path preserved")
+
+tgt_bad_ip: bool = False
+try:
+    validate_tls_jwks_target("https://auth.example.com/.well-known/jwks.json", resolved_ip="169.254.169.254", allowed_host="auth.example.com")
+except ConfigurationError:
+    tgt_bad_ip = True
+nox.test.assert_true(tgt_bad_ip, "validate_tls_jwks_target rejects cloud metadata resolved IP before TLS dial")
+
+tls_ssrf_blocked: bool = False
+try:
+    bad_tgt: TlsJwksTarget = TlsJwksTarget("https://auth.example.com/jwks.json", "auth.example.com", 443, "/jwks.json", "127.0.0.1")
+    fetch_jwks_tls(bad_tgt)
+except ConfigurationError:
+    tls_ssrf_blocked = True
+nox.test.assert_true(tls_ssrf_blocked, "fetch_jwks_tls re-validates resolved_ip and fails closed BEFORE dialing TLS")
+
+print("jwks_test passed!")
 
 

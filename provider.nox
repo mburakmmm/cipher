@@ -1,39 +1,98 @@
-# Cipher — Cryptographic Provider Abstraction and Implementation
-# Interfacing verified OS CSPRNG and audited hashing/MAC primitives.
+# Cipher — Cryptographic Provider Abstraction
+# Strict abstraction over OS/stdlib/optional-native cryptographic primitives.
+# Prohibits custom cryptographic math implementations and silent algorithm downgrades.
 
 import nox.crypto
+import nox.ed25519
 import nox.strings
-from cipher.encoding import hex_to_bytes
-from cipher.errors import InvalidKeyError, ProviderFailureError
+from cipher.encoding import bytes_to_hex, hex_to_bytes, is_valid_hex
+from cipher.errors import InvalidKeyError, ProviderFailureError, UnsupportedAlgorithmError
+from cipher.jwk import JwkKey, parse_jwk
 
-MIN_HMAC_KEY_BYTES: int = 32  # 256 bits minimum key length for HS256 (RFC 7518 §3.2)
+MIN_HMAC_SECRET_BYTES: int = 32  # 256-bit minimum per RFC 7518 §3.2
+ED25519_PUB_HEX_LEN: int = 64
+ED25519_SIG_HEX_LEN: int = 128
+
+def _is_json_object_str(s: str) -> bool:
+    trimmed: str = nox.strings.trim(s)
+    n: int = nox.strings.byte_len(trimmed)
+    return n > 0 and nox.strings.byte_at(trimmed, 0) == 123  # '{'
+
+def _normalize_ed25519_pub_hex(public_key_material: str) -> str:
+    if _is_json_object_str(public_key_material):
+        parsed_jwk: JwkKey = parse_jwk(public_key_material)
+        if parsed_jwk.kty != "OKP" or parsed_jwk.crv != "Ed25519":
+            raise InvalidKeyError("Expected OKP Ed25519 JWK for EdDSA verification")
+        return parsed_jwk.to_ed25519_public_hex()
+    cleaned: str = nox.strings.lower(nox.strings.trim(public_key_material))
+    if nox.strings.byte_len(cleaned) != ED25519_PUB_HEX_LEN or not is_valid_hex(cleaned):
+        raise InvalidKeyError("Ed25519 public key must be 32 bytes (64 hex chars) or an OKP Ed25519 JWK")
+    return cleaned
 
 class CryptoProvider:
-    def sign_hmac_sha256(self, secret: str, data: str) -> str:
-        raise ProviderFailureError("sign_hmac_sha256 not implemented in base provider")
+    def provider_name(self) -> str:
+        return "base-abstract"
 
-    def verify_hmac_sha256(self, secret: str, data: str, expected_sig_raw: str) -> bool:
-        raise ProviderFailureError("verify_hmac_sha256 not implemented in base provider")
+    def supports_algorithm(self, alg: str) -> bool:
+        return False
+
+    def sign_hmac_sha256(self, key: str, data: str) -> str:
+        raise ProviderFailureError("sign_hmac_sha256 not implemented on base provider")
+
+    def verify_hmac_sha256(self, key: str, data: str, expected_sig: str) -> bool:
+        raise ProviderFailureError("verify_hmac_sha256 not implemented on base provider")
+
+    def sign_hmac(self, alg: str, key: str, data: str) -> str:
+        if alg == "HS256":
+            return self.sign_hmac_sha256(key, data)
+        raise UnsupportedAlgorithmError(alg)
+
+    def verify_hmac(self, alg: str, key: str, data: str, expected_sig: str) -> bool:
+        if alg == "HS256":
+            return self.verify_hmac_sha256(key, data, expected_sig)
+        raise UnsupportedAlgorithmError(alg)
+
+    def sign_asymmetric(self, alg: str, private_key_material: str, data: str) -> str:
+        raise UnsupportedAlgorithmError(alg)
+
+    def verify_asymmetric(self, alg: str, public_key_material: str, data: str, sig_raw: str) -> bool:
+        raise UnsupportedAlgorithmError(alg)
 
     def secure_random_hex(self, n_bytes: int) -> str:
-        raise ProviderFailureError("secure_random_hex not implemented in base provider")
+        raise ProviderFailureError("secure_random_hex not implemented on base provider")
 
 class DefaultCryptoProvider(CryptoProvider):
-    def sign_hmac_sha256(self, secret: str, data: str) -> str:
-        key_len: int = nox.strings.byte_len(secret)
-        if key_len < MIN_HMAC_KEY_BYTES:
-            raise InvalidKeyError("HMAC secret key must be at least 32 bytes (256 bits)")
-        try:
-            hex_mac: str = nox.crypto.hmac_sha256(secret, data)
-            return hex_to_bytes(hex_mac)
-        except Exception as err:
-            raise ProviderFailureError("HMAC signing failed: " + str(err))
+    def provider_name(self) -> str:
+        return "nox-stdlib-default"
 
-    def verify_hmac_sha256(self, secret: str, data: str, expected_sig_raw: str) -> bool:
-        computed_sig_raw: str = self.sign_hmac_sha256(secret, data)
-        return nox.crypto.constant_time_eq(computed_sig_raw, expected_sig_raw)
+    def supports_algorithm(self, alg: str) -> bool:
+        return alg == "HS256" or alg == "EdDSA"
+
+    def sign_hmac_sha256(self, key: str, data: str) -> str:
+        if nox.strings.byte_len(key) < MIN_HMAC_SECRET_BYTES:
+            raise InvalidKeyError("HS256 secret length must be at least 32 bytes (256 bits)")
+        sig_hex: str = nox.crypto.hmac_sha256(key, data)
+        return hex_to_bytes(sig_hex)
+
+    def verify_hmac_sha256(self, key: str, data: str, expected_sig: str) -> bool:
+        if nox.strings.byte_len(key) < MIN_HMAC_SECRET_BYTES:
+            raise InvalidKeyError("HS256 secret length must be at least 32 bytes (256 bits)")
+        if nox.strings.byte_len(expected_sig) != 32:
+            return False
+        computed_hex: str = nox.crypto.hmac_sha256(key, data)
+        expected_hex: str = bytes_to_hex(expected_sig)
+        return nox.crypto.constant_time_eq(computed_hex, expected_hex)
+
+    def verify_asymmetric(self, alg: str, public_key_material: str, data: str, sig_raw: str) -> bool:
+        if alg != "EdDSA":
+            raise UnsupportedAlgorithmError(alg)
+        pub_hex: str = _normalize_ed25519_pub_hex(public_key_material)
+        sig_hex: str = bytes_to_hex(sig_raw)
+        if nox.strings.byte_len(sig_hex) != ED25519_SIG_HEX_LEN:
+            return False
+        return nox.ed25519.verify(pub_hex, data, sig_hex)
 
     def secure_random_hex(self, n_bytes: int) -> str:
         if n_bytes <= 0:
-            raise ProviderFailureError("n_bytes must be greater than zero")
+            raise InvalidKeyError("Random byte length must be positive")
         return nox.crypto.secure_random_hex(n_bytes)

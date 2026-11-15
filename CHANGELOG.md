@@ -4,6 +4,28 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-15
+
+### Added
+- **Pure-NOX `EdDSA` (`Ed25519`) Verification & `OKP`/`EC` JWK Support (`encoding.nox`, `jwk.nox`, `provider.nox`, `jws.nox`, `jwt.nox`, `tests/asymmetric_jws_test.nox`):**
+  - Added NUL-byte-safe hexadecimal Base64URL helpers (`decode_base64url_hex`, `encode_base64url_from_hex`, `is_valid_hex`) and `nox.bytes.str_from_list` encoding optimizations in `encoding.nox`.
+  - Extended `JwkKey` with `OKP` (`Ed25519`) and `EC` (`P-256`) parsing, canonical length validation, RFC 7638 SHA-256 thumbprints, private-key stripping (`to_public_json()`), and RFC 8037 test vectors.
+  - Enabled zero-dependency `EdDSA` verification in `DefaultCryptoProvider` backed by `nox.ed25519.verify` alongside generalized `JwsSigner.sign` / `JwsVerifier.verify` / `JwtVerifier.verify` with algorithm-family binding.
+- **Opt-In OpenSSL `libcrypto` C Shim (`native/cipher_openssl.h`, `native/cipher_openssl_shim.c`, `openssl_provider.nox`, `scripts/build-openssl-shim.sh`, `tests/openssl_provider_test.nox`):**
+  - Added optional `OpenSslCryptoProvider` dynamically resolving `libcrypto` (1.1 / 3.x / 4.x) via `dlopen` (avoiding macOS SIP `/usr/lib/libcrypto.dylib`) / `LoadLibraryA` (Windows), delivering `RS256`, `PS256` (PSS `saltlen=32`), `ES256` (strict 64-byte raw `R || S` <-> DER), `EdDSA` sign+verify, `HS384`, and `HS512`.
+  - Pure-NOX consumers importing `cipher` never require compiling or linking the C shim (`Stage 1`), while opt-in consumers compile `native/cipher_openssl_shim.o` (`Stage 3`).
+- **`nox.atomic.AtomicRef` Unbounded Shared `KeyRing` & OS-Thread Constant Hardening (`keyring.nox`, `keys.nox`, `tests/concurrency_keyring_test.nox`):**
+  - Integrated `nox.atomic.AtomicRef` (`_shared_state_ref`, plus `max_words=0` unbounded mode) alongside the 64-bit `_shared_gate` CAS + hardware Seqlock protocol, breaking the prior 3 KB / 48 KiB 6-byte word-packing bottleneck (verified with >52 KiB / 180+ keys across OS threads in **Test 19**).
+  - Eliminated module-global initialization races on spawned OS threads by inlining literal constants in worker synchronization paths (100/100 concurrency stress runs passing).
+- **Real `monotonic_ns()` Benchmarks, `nox.property`, `nox.mem.stats()`, `nox.tls` & `@dataclass` (`tests/benchmark_keyring_test.nox`, `tests/ip_fuzz_property_test.nox`, `jwks.nox`, `rotation.nox`):**
+  - Replaced `instant_now().elapsed_ms()` + dummy 500 us floor with real `nox.time.monotonic_ns()` nanosecond/microsecond timing and updated `docs/benchmark-baseline.json`.
+  - Upgraded `tests/ip_fuzz_property_test.nox` with `nox.property.check` seeded shrinking fuzzing (IPv4, IPv6, malformed tokens/JWKs) and `nox.mem.stats()` zero-leak gates in both pure-NOX and OpenSSL FFI suites.
+  - Added `nox.tls` + DNS-pinning `TlsJwksTarget` / `validate_tls_jwks_target` / `fetch_jwks_tls` in `jwks.nox`, migrated `RotationReceipt` to `@dataclass`, and validated `noxc check --strict-spawn-shared` and `--profile freestanding` boundaries.
+
+### Changed
+- **NOX `2.1.186` Lazy Tape JSON Migration (`json_strict.nox`, `claims.nox`, `jwks.nox`, `docs/compatibility.md`, `docs/threat-model.md`):**
+  - Migrated all JSON parsing helpers to `nox.json` tape accessors (`object_len`, `object_key`, `object_value`, `array_len`, `array_get`, `get`), added nested duplicate-key rejection tests, and documented explicit security prohibition of `nox.yyjson`.
+
 ## [1.0.11] - 2026-11-11
 
 ### Fixed & Hardened (Technical SOL XI Architecture Audit)

@@ -22,30 +22,43 @@ def parse_strict_json(raw_json: str) -> JsonValue:
         raise JsonFormatError("Invalid or duplicate-key JSON input")
 
 def is_object(v: JsonValue) -> bool:
-    # In core.nox, kind == 5 represents Object
-    return v.kind == 5
+    return nox.json.is_object(v)
+
+def get_object_len(v: JsonValue) -> int:
+    if not is_object(v):
+        raise JsonFormatError("JSON value is not an object")
+    return nox.json.object_len(v)
+
+def get_object_key(v: JsonValue, i: int) -> str:
+    return nox.json.object_key(v, i)
+
+def get_object_value(v: JsonValue, i: int) -> JsonValue:
+    return nox.json.object_value(v, i)
+
+def get_array_len(v: JsonValue) -> int:
+    if not nox.json.is_array(v):
+        raise JsonFormatError("JSON value is not an array")
+    return nox.json.array_len(v)
+
+def get_array_item(v: JsonValue, i: int) -> JsonValue:
+    return nox.json.array_get(v, i)
 
 def has_field(v: JsonValue, key: str) -> bool:
     if not is_object(v):
         return False
-    i: int = 0
-    n: int = len(v.keys)
-    while i < n:
-        if v.keys[i] == key:
-            return True
-        i = i + 1
-    return False
+    try:
+        nox.json.get(v, key)
+        return True
+    except JsonError:
+        return False
 
 def get_field_value(v: JsonValue, key: str) -> JsonValue:
     if not is_object(v):
         raise JsonFormatError("JSON value is not an object")
-    i: int = 0
-    n: int = len(v.keys)
-    while i < n:
-        if v.keys[i] == key:
-            return v.vals[i]
-        i = i + 1
-    raise JsonFormatError("Missing required JSON field: " + key)
+    try:
+        return nox.json.get(v, key)
+    except JsonError:
+        raise JsonFormatError("Missing required JSON field: " + key)
 
 def get_string_field(v: JsonValue, key: str, default_val: str = "", required: bool = True) -> str:
     if not has_field(v, key):
@@ -53,9 +66,9 @@ def get_string_field(v: JsonValue, key: str, default_val: str = "", required: bo
             raise JsonFormatError("Missing required string field: " + key)
         return default_val
     val: JsonValue = get_field_value(v, key)
-    if val.kind != 3:
+    if not nox.json.is_string(val):
         raise JsonFormatError("Field '" + key + "' must be a string")
-    return val.s
+    return nox.json.as_string(val)
 
 def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool = True) -> int:
     if not has_field(v, key):
@@ -63,22 +76,18 @@ def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool =
             raise JsonFormatError("Missing required integer field: " + key)
         return default_val
     val: JsonValue = get_field_value(v, key)
-    if val.kind != 2:
+    if not nox.json.is_number(val):
         raise JsonFormatError("Field '" + key + "' must be a numeric integer")
     
-    # Check raw text representation if available
+    # Reject fractional / exponent floats explicitly when raw text was preserved
     if len(val.s) > 0:
-        if nox.strings.contains(val.s, "."):
+        if nox.strings.contains(val.s, ".") or nox.strings.contains(val.s, "e") or nox.strings.contains(val.s, "E"):
             raise JsonFormatError("Field '" + key + "' must be a strict non-fractional integer")
-        try:
-            return int(val.s)
-        except ValueError:
-            raise JsonFormatError("Field '" + key + "' has invalid integer representation")
 
-    i: int = int(val.n)
-    if float(i) != val.n:
-        raise JsonFormatError("Field '" + key + "' must be a strict non-fractional integer")
-    return i
+    try:
+        return nox.json.as_int(val)
+    except JsonError:
+        raise JsonFormatError("Field '" + key + "' has invalid or out-of-range integer representation")
 
 def get_bool_field(v: JsonValue, key: str, default_val: bool = False, required: bool = True) -> bool:
     if not has_field(v, key):
@@ -86,9 +95,9 @@ def get_bool_field(v: JsonValue, key: str, default_val: bool = False, required: 
             raise JsonFormatError("Missing required boolean field: " + key)
         return default_val
     val: JsonValue = get_field_value(v, key)
-    if val.kind != 1:
+    if not nox.json.is_bool(val):
         raise JsonFormatError("Field '" + key + "' must be a boolean")
-    return val.b
+    return nox.json.as_bool(val)
 
 def get_string_list_field(v: JsonValue, key: str, required: bool = True) -> list[str]:
     empty: list[str] = []
@@ -97,15 +106,15 @@ def get_string_list_field(v: JsonValue, key: str, required: bool = True) -> list
             raise JsonFormatError("Missing required string array field: " + key)
         return empty
     val: JsonValue = get_field_value(v, key)
-    if val.kind != 4:
+    if not nox.json.is_array(val):
         raise JsonFormatError("Field '" + key + "' must be an array")
     out: list[str] = []
     i: int = 0
-    n: int = len(val.arr)
+    n: int = nox.json.array_len(val)
     while i < n:
-        item: JsonValue = val.arr[i]
-        if item.kind != 3:
+        item: JsonValue = nox.json.array_get(val, i)
+        if not nox.json.is_string(item):
             raise JsonFormatError("Array elements in '" + key + "' must be strings")
-        out.append(item.s)
+        out.append(nox.json.as_string(item))
         i = i + 1
     return out

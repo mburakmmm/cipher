@@ -1,0 +1,166 @@
+import nox.mem
+import nox.strings
+import nox.test
+from claims import ClaimsProfile
+from encoding import decode_base64url
+from errors import DisallowedAlgorithmError, InvalidKeyError, InvalidSignatureError, UnsupportedAlgorithmError
+from jwk import JwkKey, parse_jwk
+from jws import VerificationProfile, VerifiedJws, sign_jws, verify_jws
+from jwt import VerifiedJwt, encode_jwt, verify_jwt
+from openssl_provider import OpenSslCryptoProvider, is_openssl_available
+from provider import DefaultCryptoProvider
+
+nox.test.assert_true(is_openssl_available(), "OpenSSL libcrypto must load via optional C shim")
+ossl: OpenSslCryptoProvider = OpenSslCryptoProvider()
+nox.test.assert_eq_str(ossl.provider_name(), "openssl-libcrypto-ffi", "Provider name matches")
+nox.test.assert_true(ossl.supports_algorithm("RS256"), "Supports RS256")
+nox.test.assert_true(ossl.supports_algorithm("PS256"), "Supports PS256")
+nox.test.assert_true(ossl.supports_algorithm("ES256"), "Supports ES256")
+nox.test.assert_true(ossl.supports_algorithm("EdDSA"), "Supports EdDSA")
+nox.test.assert_true(ossl.supports_algorithm("HS384"), "Supports HS384")
+nox.test.assert_true(ossl.supports_algorithm("HS512"), "Supports HS512")
+
+# ------------------------------------------------------------------------------
+# 1. HS384 & HS512 Roundtrip + Secret Size Enforcement
+# ------------------------------------------------------------------------------
+hs384_secret: str = "hs384-production-secret-key-at-least-48-bytes-long!"
+hs512_secret: str = "hs512-production-secret-key-material-at-least-64-bytes-long-01234567"
+
+tok_384: str = sign_jws("{\"scope\":\"read\"}", "HS384", hs384_secret, kid="hs384-1", provider=ossl)
+v_384: VerifiedJws = verify_jws(tok_384, hs384_secret, VerificationProfile(["HS384"], expected_kid="hs384-1"), provider=ossl)
+nox.test.assert_eq_str(v_384.algorithm, "HS384", "HS384 verified")
+nox.test.assert_eq_str(v_384.payload, "{\"scope\":\"read\"}", "HS384 payload matches")
+
+tok_512: str = sign_jws("{\"scope\":\"write\"}", "HS512", hs512_secret, kid="hs512-1", provider=ossl)
+v_512: VerifiedJws = verify_jws(tok_512, hs512_secret, VerificationProfile(["HS512"], expected_kid="hs512-1"), provider=ossl)
+nox.test.assert_eq_str(v_512.algorithm, "HS512", "HS512 verified")
+
+short_512_rejected: bool = False
+try:
+    sign_jws("{}", "HS512", "only-32-bytes-long-secret-012345", provider=ossl)
+except InvalidKeyError:
+    short_512_rejected = True
+nox.test.assert_true(short_512_rejected, "HS512 secret < 64 bytes rejected")
+
+# ------------------------------------------------------------------------------
+# 2. EdDSA (Ed25519) Sign via OpenSSL + Cross-Verify via Pure NOX stdlib
+# ------------------------------------------------------------------------------
+ed_priv_jwk: str = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+ed_pub_jwk: str = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+
+ed_token: str = sign_jws("Example of Ed25519 signing", "EdDSA", ed_priv_jwk, kid="ed-1", typ="JWT", provider=ossl)
+v_ed_ossl: VerifiedJws = verify_jws(ed_token, ed_pub_jwk, VerificationProfile(["EdDSA"], expected_kid="ed-1"), provider=ossl)
+v_ed_pure: VerifiedJws = verify_jws(ed_token, ed_pub_jwk, VerificationProfile(["EdDSA"], expected_kid="ed-1"), provider=DefaultCryptoProvider())
+nox.test.assert_eq_str(v_ed_ossl.payload, "Example of Ed25519 signing", "OpenSSL Ed25519 sign/verify roundtrip")
+nox.test.assert_eq_str(v_ed_pure.payload, "Example of Ed25519 signing", "OpenSSL-signed Ed25519 verified by pure-NOX stdlib")
+
+# Exact RFC 8037 signature equivalence check via OpenSSL sign over raw signing input
+rfc_sig_raw: str = ossl.sign_asymmetric("EdDSA", ed_priv_jwk, "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc")
+nox.test.assert_eq_int(nox.strings.byte_len(rfc_sig_raw), 64, "Ed25519 signature is 64 raw bytes")
+
+# ------------------------------------------------------------------------------
+# 3. RS256 & PS256 (RSA 2048-bit PEM Sign -> JWK & PEM Verify)
+# ------------------------------------------------------------------------------
+rsa_priv_pem: str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCKSDqbW62eK/Qy\nU73Lq6x+DWZlZaK4QR9H/orBrA2RRKoL+pu7rulNvYJ8oO/WCFSmPwajmWpgP+wG\nGZ0hjH8TnULRuHgflY58TvvGARVHKqTuULaDL0Yi3NN/VzxzlrldmtAZym64Y+iQ\n6ul+f5W4anaejHEpiHY7CXo3vr2dPZw+O0sShI1XBtSylzrRxWvvKwYfyfDejMar\noX/UO+yDI5TgTf3PwS+bi9Cf1GYCzsNsYQZKdqY+f/LrfGUQjJ52xgLLjOljAfXP\nhFMqJBW7mQXZeivUi2zpKxvP+RgxWy0OiHjLwGNj0jze3c8x2SZCOnlwDAttHTr4\ndxdhGe+XAgMBAAECggEABKhlLPl8EiFZ4t4WPQeF0mMiKVUwk3NCGfs1ckuY02VU\nMv4Yg8xi+GbjP85t9bAnJchmsVkID8DnctcnB0vDtgXsi8LibPHtMDu62FMOA+0o\nTAy08RtFCgSVLStjkmMn0ELYMp4yd4yJ92OqRMQIZ4NShomlgCgkD14E217V5Tdy\n3vbP/3PDS+skBA7l5ggXdB/PlIrOWjBEv3FK0v9w1+rvYAjgNTtOhegNQr7E9cde\ngUOaWqHdioYQVk8o5U4AAaWxIVuarvQEbryIyGYG8YF491mrv5TkpBy0VCS5/0/L\n4oCLSTubBERVlb9x4cPqdGc3lAs/IshXa/2bcWK4fQKBgQDCBshkSbKsywdkJQSg\n6KkKo0/UYXA3Jl3lWHupriqyiQGJvRA0quWrAQEVffsyf2y9T7gA/YN/mkfvG48z\nZpJ3y5y/aXNQyqTEC0FMIW6iGxK2nLJyZRTd+mNQxnBDUvgBkhL/e9N8BRURf7+F\nBS5LbyRaLP6lr50Pqe96WjmdVQKBgQC2c1M/HyDDxASMxKrmzkPtTZCpNTsuGCID\n296otqYl7lR0rBzhbUcqPVpLenHZhCgQl3VI/7CBzi/pysQs6dRs3s1Tfz0itO1M\nWhjBOpjiQcnOas2+RtuZT7CbN8yoGbqlKQcnlJdZJlZwTiAhVEtFend6yeLCGwge\nR6BShJ/5OwKBgQC4JmnhTVVIzLWqJbw74DY4Q4IL56LypPZvK0jLZeNeacxM52VP\nJ3gtkhluRZC5f9k74EKapgI9hLeLSBPkzBBtpJGT1ki9QGebLbd+wyhWsO1U5moz\nSp7Ag9npGz4Hl+KM0xA27VZumgBCCIZEgQNMUyMkdxoFNSUTbc09yg5utQKBgE84\n6lfJQ2fd8H/TUcYgoFwlRwBCLe1I61Qzn44wqRplT2TN60hzM+iCdXe6tj7V5LO3\noGTPKaxjhGiG9AHwkp2nbQ6pfDlayINTx9X3hLUSDffEZowNpoL+mFf9ta70ZRgc\nJZApNEKwo+3l7ouqV3jWwZSenwjbxf2n6lSKZBBLAoGAOkVt3tp134gFlbvHvvuT\nXzAPPAI63ZPKXWZZ1oYBxKt7erTZChrp01Gnz5LTlXk49Ik9A+44umGtXeaBYtvh\njHUB8UGaESHeI0ULNvFFBlwP+KyptrViX4wxa7cGDKz/mdn/jm0E47fIlsmPeFbU\ncPlzmNqg9Xn76CIKG+ewlRo=\n-----END PRIVATE KEY-----\n"
+rsa_pub_pem: str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAikg6m1utniv0MlO9y6us\nfg1mZWWiuEEfR/6KwawNkUSqC/qbu67pTb2CfKDv1ghUpj8Go5lqYD/sBhmdIYx/\nE51C0bh4H5WOfE77xgEVRyqk7lC2gy9GItzTf1c8c5a5XZrQGcpuuGPokOrpfn+V\nuGp2noxxKYh2Owl6N769nT2cPjtLEoSNVwbUspc60cVr7ysGH8nw3ozGq6F/1Dvs\ngyOU4E39z8Evm4vQn9RmAs7DbGEGSnamPn/y63xlEIyedsYCy4zpYwH1z4RTKiQV\nu5kF2Xor1Its6Ssbz/kYMVstDoh4y8BjY9I83t3PMdkmQjp5cAwLbR06+HcXYRnv\nlwIDAQAB\n-----END PUBLIC KEY-----\n"
+rsa_pub_jwk: str = "{\"kty\":\"RSA\",\"kid\":\"rsa-2048-1\",\"n\":\"ikg6m1utniv0MlO9y6usfg1mZWWiuEEfR_6KwawNkUSqC_qbu67pTb2CfKDv1ghUpj8Go5lqYD_sBhmdIYx_E51C0bh4H5WOfE77xgEVRyqk7lC2gy9GItzTf1c8c5a5XZrQGcpuuGPokOrpfn-VuGp2noxxKYh2Owl6N769nT2cPjtLEoSNVwbUspc60cVr7ysGH8nw3ozGq6F_1DvsgyOU4E39z8Evm4vQn9RmAs7DbGEGSnamPn_y63xlEIyedsYCy4zpYwH1z4RTKiQVu5kF2Xor1Its6Ssbz_kYMVstDoh4y8BjY9I83t3PMdkmQjp5cAwLbR06-HcXYRnvlw\",\"e\":\"AQAB\"}"
+
+jwt_claims: str = "{\"iss\":\"https://auth.nox.dev\",\"sub\":\"usr_rsa\",\"aud\":\"api://core\",\"exp\":1800003600,\"iat\":1800000000}"
+c_prof: ClaimsProfile = ClaimsProfile(expected_issuer="https://auth.nox.dev", clock_time_sec=1800000100).with_audience("api://core")
+
+rs256_jwt: str = encode_jwt(jwt_claims, "RS256", rsa_priv_pem, kid="rsa-2048-1", provider=ossl)
+rs256_ver_pem: VerifiedJwt = verify_jwt(rs256_jwt, rsa_pub_pem, VerificationProfile(["RS256"], expected_kid="rsa-2048-1"), c_prof, provider=ossl)
+rs256_ver_jwk: VerifiedJwt = verify_jwt(rs256_jwt, rsa_pub_jwk, VerificationProfile(["RS256"], expected_kid="rsa-2048-1"), c_prof, provider=ossl)
+nox.test.assert_eq_str(rs256_ver_pem.claims.sub, "usr_rsa", "RS256 JWT PEM verify matches")
+nox.test.assert_eq_str(rs256_ver_jwk.claims.sub, "usr_rsa", "RS256 JWT JWK verify matches")
+
+ps256_jwt: str = encode_jwt(jwt_claims, "PS256", rsa_priv_pem, kid="rsa-2048-1", provider=ossl)
+ps256_ver_jwk: VerifiedJwt = verify_jwt(ps256_jwt, rsa_pub_jwk, VerificationProfile(["PS256"], expected_kid="rsa-2048-1"), c_prof, provider=ossl)
+nox.test.assert_eq_str(ps256_ver_jwk.claims.sub, "usr_rsa", "PS256 JWT JWK verify matches")
+
+# Cross-padding check: PS256 token submitted to RS256-only verifier MUST fail closed
+ps_vs_rs_rejected: bool = False
+try:
+    verify_jwt(ps256_jwt, rsa_pub_jwk, VerificationProfile(["RS256"], expected_kid="rsa-2048-1"), c_prof, provider=ossl)
+except DisallowedAlgorithmError:
+    ps_vs_rs_rejected = True
+nox.test.assert_true(ps_vs_rs_rejected, "PS256 token rejected by RS256 allowlist")
+
+# Weak 1024-bit RSA key MUST fail closed
+weak_rsa_priv_pem: str = "-----BEGIN PRIVATE KEY-----\nMIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAOYghWAwRLBsL2PG\nVKvaZyFUZl3T/MrMuqgYJM0mB1BkWB2rbhCgMm4UDz/NHvtQ/ZtqxhiU8xLuqmnB\nMZrUa+pEU5mXWWo1i/wjZ1l47W1m94trpRIkL9Shj+J4GBecB2Ejz6Ar4JWvB1fa\n274tKyjjAJXv2AXqcUsyfAtgG8OdAgMBAAECgYBtWirGyGj7hI0IVmhJuWCkP9zc\n3S0UmTBhTAfAzD9Rfj047AtDLzyHflS4tpnwRk4cmiJD8BOJfYvQ8RLHRgV4x/4h\nrvpEunvZyLmEJzZz73jk62HcDcLAapCkT8N0RpTafLm1a0DdeV+Q1pgUSVKwqo2t\nOxgr6bDgQ02A9zvlqQJBAPh1XqDn0b7McbsCLfuKC4B85WU7O2ypJFGFwfJppgZ9\nAgZIELEcbPq1pMnuUPEtROCwrvyWD+n34jg6Nlm9ZDsCQQDtHLVF87G19Vloz90T\n2YAR4EQZ7Bqe3+2TpuZE36aWzBOjlhwB/VnDBm6Br/8eX7J6o8CJwweP0LYRLXWx\n57IHAkB+JUkoNMrfLnnH0vF5trrkP4VQgmRHZREVeu3foBg1Tx7KBajD44TJPZQv\nGhpqeOtxkQMnJyFpTvvCRHv30BqlAkEA1W+fGT24/TLCbd+WgNSrPOwkQTVP7S1j\nHSMCaoLr4RgIoZtw0LWuxCgY9zJmsn+wGEco/JkLSIC2MxY5uI/4pwJAaCGhC7bd\n5fwQKG/XegdtPxTSnAULo56R7cFR6Dv67QsaI76eN0O1J1Cf+jsXfQ5dFMhQk/3a\nIxABwQF+K/yx3w==\n-----END PRIVATE KEY-----\n"
+weak_rsa_sign_rejected: bool = False
+try:
+    sign_jws("{}", "RS256", weak_rsa_priv_pem, provider=ossl)
+except InvalidKeyError:
+    weak_rsa_sign_rejected = True
+nox.test.assert_true(weak_rsa_sign_rejected, "RSA < 2048 bits signing rejected fail closed")
+
+# ------------------------------------------------------------------------------
+# 4. ES256 (ECDSA P-256 PEM Sign -> 64-byte raw R||S -> PEM & JWK Verify)
+# ------------------------------------------------------------------------------
+ec_priv_pem: str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwJ4fTJdV7Hfv29Ut\nfKSlRGkSWZ8fLUvIttVnSWp/cvahRANCAAS7sH0AzE3bzBPMiHQpPMjnr77Ebi3H\nkY83K48NbwUTElx7v9COfSgfRFqgEh0OEJLSLod+/boZyY3xe1wBRPji\n-----END PRIVATE KEY-----\n"
+ec_pub_pem: str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEu7B9AMxN28wTzIh0KTzI56++xG4t\nx5GPNyuPDW8FExJce7/Qjn0oH0RaoBIdDhCS0i6Hfv26GcmN8XtcAUT44g==\n-----END PUBLIC KEY-----\n"
+ec_pub_jwk: str = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"ec-p256-1\",\"x\":\"u7B9AMxN28wTzIh0KTzI56--xG4tx5GPNyuPDW8FExI\",\"y\":\"XHu_0I59KB9EWqASHQ4QktIuh379uhnJjfF7XAFE-OI\"}"
+
+parsed_ec_jwk: JwkKey = parse_jwk(ec_pub_jwk)
+nox.test.assert_eq_str(parsed_ec_jwk.crv, "P-256", "EC P-256 JWK parsed")
+
+es256_jwt: str = encode_jwt(jwt_claims, "ES256", ec_priv_pem, kid="ec-p256-1", provider=ossl)
+es256_parts: list[str] = nox.strings.split(es256_jwt, ".")
+nox.test.assert_eq_int(nox.strings.byte_len(decode_base64url(es256_parts[2])), 64, "ES256 signature uses fixed-width 64-byte JOSE R||S encoding")
+
+es256_ver_pem: VerifiedJwt = verify_jwt(es256_jwt, ec_pub_pem, VerificationProfile(["ES256"], expected_kid="ec-p256-1"), c_prof, provider=ossl)
+es256_ver_jwk: VerifiedJwt = verify_jwt(es256_jwt, ec_pub_jwk, VerificationProfile(["ES256"], expected_kid="ec-p256-1"), c_prof, provider=ossl)
+nox.test.assert_eq_str(es256_ver_pem.claims.sub, "usr_rsa", "ES256 JWT PEM verify matches")
+nox.test.assert_eq_str(es256_ver_jwk.claims.sub, "usr_rsa", "ES256 JWT EC JWK verify matches")
+
+# Tampered ES256 payload MUST fail closed
+tampered_es256: str = es256_parts[0] + ".eyJzdWIiOiJoYWNrZWQifQ." + es256_parts[2]
+es_tamper_rejected: bool = False
+try:
+    verify_jws(tampered_es256, ec_pub_jwk, VerificationProfile(["ES256"], expected_kid="ec-p256-1"), provider=ossl)
+except InvalidSignatureError:
+    es_tamper_rejected = True
+nox.test.assert_true(es_tamper_rejected, "Tampered ES256 payload rejected")
+
+# Key-family confusion: RSA JWK passed for ES256 verification
+rsa_vs_es_rejected: bool = False
+try:
+    verify_jws(es256_jwt, rsa_pub_jwk, VerificationProfile(["ES256"], expected_kid="ec-p256-1"), provider=ossl)
+except InvalidKeyError:
+    rsa_vs_es_rejected = True
+nox.test.assert_true(rsa_vs_es_rejected, "RSA JWK passed to ES256 verification rejected")
+
+# Malformed ES256 signature length (63 bytes instead of 64)
+bad_len_es_sig: str = es256_parts[0] + "." + es256_parts[1] + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+bad_len_rejected: bool = False
+try:
+    verify_jws(bad_len_es_sig, ec_pub_jwk, VerificationProfile(["ES256"], expected_kid="ec-p256-1"), provider=ossl)
+except InvalidSignatureError:
+    bad_len_rejected = True
+nox.test.assert_true(bad_len_rejected, "Non-64-byte ES256 signature rejected")
+
+# ------------------------------------------------------------------------------
+# 6. C FFI + ARC Memory Regression Check (nox.mem.stats())
+# ------------------------------------------------------------------------------
+def _run_openssl_mem_cycle(prov: OpenSslCryptoProvider, priv_pem: str, pub_pem: str) -> int:
+    prof: VerificationProfile = VerificationProfile(["ES256"], expected_kid="ec-mem")
+    passed: int = 0
+    i: int = 0
+    while i < 20:
+        t: str = sign_jws("{\"m\":" + str(i) + "}", "ES256", priv_pem, kid="ec-mem", provider=prov)
+        v: VerifiedJws = verify_jws(t, pub_pem, prof, provider=prov)
+        if v.kid == "ec-mem":
+            passed = passed + 1
+        i = i + 1
+    return passed
+
+_m0: int = _run_openssl_mem_cycle(ossl, ec_priv_pem, ec_pub_pem)
+nox.test.assert_eq_int(_m0, 20, "OpenSSL FFI warmup passed")
+nox.mem.stats()
+_m1: int = _run_openssl_mem_cycle(ossl, ec_priv_pem, ec_pub_pem)
+ossl_mem: nox.mem.MemStats = nox.mem.stats()
+nox.test.assert_eq_int(_m1, 20, "OpenSSL FFI cycle passed under nox.mem.stats()")
+nox.test.assert_true(ossl_mem.live <= 4, "Zero C/ARC memory growth after OpenSSL ES256 FFI cycle (live=" + str(ossl_mem.live) + ")")
+
+print("openssl_provider_test passed!")

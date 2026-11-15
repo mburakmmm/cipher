@@ -1,1 +1,1 @@
-from provider import CryptoProvider, DefaultCryptoProvider
+from provider import CryptoProvider, DefaultCryptoProvider, MIN_HMAC_SECRET_BYTES

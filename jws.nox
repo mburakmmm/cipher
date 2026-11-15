@@ -5,9 +5,35 @@ import nox.strings
 from cipher.encoding import decode_base64url, encode_base64url
 from cipher.errors import DisallowedAlgorithmError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
 from cipher.json_strict import get_bool_field, get_string_field, get_string_list_field, has_field, parse_strict_json
+from cipher.jwk import JwkKey, parse_jwk
+from cipher.keys import KeyRef
+from cipher.keyring import KeyRing
 from cipher.provider import CryptoProvider, DefaultCryptoProvider
 
 MAX_TOKEN_BYTES: int = 131072  # 128 KB total compact JWS limit
+
+def _is_hmac_alg(alg: str) -> bool:
+    return alg == "HS256" or alg == "HS384" or alg == "HS512"
+
+def _is_asym_alg(alg: str) -> bool:
+    return alg == "EdDSA" or alg == "RS256" or alg == "PS256" or alg == "ES256"
+
+def _validate_key_alg_binding(alg: str, key_material: str) -> None:
+    trimmed: str = nox.strings.trim(key_material)
+    if nox.strings.byte_len(trimmed) == 0:
+        raise InvalidKeyError("Key material cannot be empty")
+    if nox.strings.byte_at(trimmed, 0) == 123:  # '{' JWK JSON validation
+        parsed_jwk: JwkKey = parse_jwk(trimmed)
+        if parsed_jwk.alg != "" and parsed_jwk.alg != alg:
+            raise InvalidKeyError("JWK 'alg' (" + parsed_jwk.alg + ") does not match expected algorithm '" + alg + "'")
+        if _is_hmac_alg(alg) and parsed_jwk.kty != "oct":
+            raise DisallowedAlgorithmError("Algorithm confusion: asymmetric JWK (" + parsed_jwk.kty + ") cannot be used with HMAC '" + alg + "'")
+        if alg == "EdDSA" and parsed_jwk.kty != "OKP":
+            raise InvalidKeyError("Algorithm confusion: EdDSA requires 'OKP' JWK, got '" + parsed_jwk.kty + "'")
+        if (alg == "RS256" or alg == "PS256") and parsed_jwk.kty != "RSA":
+            raise InvalidKeyError("Algorithm confusion: " + alg + " requires 'RSA' JWK, got '" + parsed_jwk.kty + "'")
+        if alg == "ES256" and parsed_jwk.kty != "EC":
+            raise InvalidKeyError("Algorithm confusion: ES256 requires 'EC' JWK, got '" + parsed_jwk.kty + "'")
 
 class ProtectedHeader:
     alg: str
@@ -95,8 +121,20 @@ class JwsSigner:
         return self
 
     def sign_hs256(self, payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
-        # Build strict JSON protected header
-        header_json: str = "{\"alg\":\"HS256\""
+        return self.sign(payload, "HS256", secret, kid=kid, typ=typ)
+
+    def sign(self, payload: str, alg: str, key_material: str, kid: str = "", typ: str = "JWT") -> str:
+        if alg == "none" or alg == "None" or alg == "NONE" or alg == "":
+            raise DisallowedAlgorithmError("Cannot sign with 'none' or empty algorithm")
+        if not _is_hmac_alg(alg) and not _is_asym_alg(alg):
+            raise UnsupportedAlgorithmError(alg)
+        if not self.provider.supports_algorithm(alg):
+            raise UnsupportedAlgorithmError(alg)
+
+        _validate_key_alg_binding(alg, key_material)
+
+        # Build strict JSON protected header (reserved fields cannot be caller-overridden)
+        header_json: str = "{\"alg\":\"" + alg + "\""
         if typ != "":
             header_json = header_json + ",\"typ\":\"" + typ + "\""
         if kid != "":
@@ -107,7 +145,11 @@ class JwsSigner:
         payload_b64: str = encode_base64url(payload)
         signing_input: str = header_b64 + "." + payload_b64
         
-        sig_raw: str = self.provider.sign_hmac_sha256(secret, signing_input)
+        sig_raw: str = ""
+        if _is_hmac_alg(alg):
+            sig_raw = self.provider.sign_hmac(alg, key_material, signing_input)
+        else:
+            sig_raw = self.provider.sign_asymmetric(alg, key_material, signing_input)
         sig_b64: str = encode_base64url(sig_raw)
         
         return signing_input + "." + sig_b64
@@ -123,6 +165,9 @@ class JwsVerifier:
         return self
 
     def verify_hs256(self, token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
+        return self.verify(token, secret, profile)
+
+    def verify(self, token: str, key_material: str, profile: VerificationProfile) -> VerifiedJws:
         token_len: int = nox.strings.byte_len(token)
         if token_len > MAX_TOKEN_BYTES:
             raise ResourceLimitExceededError("Compact JWS exceeds maximum size limit of 128KB")
@@ -144,7 +189,9 @@ class JwsVerifier:
         if not profile.is_alg_allowed(header.alg):
             raise DisallowedAlgorithmError(header.alg)
         
-        if header.alg != "HS256":
+        if not _is_hmac_alg(header.alg) and not _is_asym_alg(header.alg):
+            raise UnsupportedAlgorithmError(header.alg)
+        if not self.provider.supports_algorithm(header.alg):
             raise UnsupportedAlgorithmError(header.alg)
         
         # 3. Key selector (kid) enforcement
@@ -161,17 +208,48 @@ class JwsVerifier:
             if header.typ != profile.expected_typ:
                 raise InvalidClaimsError("Token type mismatch: got '" + header.typ + "', expected '" + profile.expected_typ + "'")
         
-        # 4. Strict signature verification over exact ASCII bytes
+        # 5. Bind key material structurally to verified header algorithm (anti-confusion)
+        _validate_key_alg_binding(header.alg, key_material)
+
+        # 6. Strict signature verification over exact ASCII bytes
         signing_input: str = header_b64 + "." + payload_b64
         sig_raw: str = decode_base64url(sig_b64)
         
-        is_valid: bool = self.provider.verify_hmac_sha256(secret, signing_input, sig_raw)
+        is_valid: bool = False
+        if _is_hmac_alg(header.alg):
+            is_valid = self.provider.verify_hmac(header.alg, key_material, signing_input, sig_raw)
+        else:
+            is_valid = self.provider.verify_asymmetric(header.alg, key_material, signing_input, sig_raw)
+
         if not is_valid:
-            raise InvalidSignatureError("Cryptographic HS256 signature mismatch")
+            raise InvalidSignatureError("Cryptographic " + header.alg + " signature mismatch")
         
-        # 5. Decode verified payload
+        # 7. Decode verified payload
         verified_payload: str = decode_base64url(payload_b64)
         return VerifiedJws(verified_payload, header, signing_input)
+
+    def verify_with_keyring(self, token: str, ring: KeyRing, profile: VerificationProfile) -> VerifiedJws:
+        token_len: int = nox.strings.byte_len(token)
+        if token_len > MAX_TOKEN_BYTES:
+            raise ResourceLimitExceededError("Compact JWS exceeds maximum size limit of 128KB")
+        parts: list[str] = nox.strings.split(token, ".")
+        if len(parts) != 3:
+            raise MalformedTokenError("Compact JWS must contain exactly 3 dot-separated segments")
+        header: ProtectedHeader = parse_protected_header(decode_base64url(parts[0]))
+        if not profile.is_alg_allowed(header.alg):
+            raise DisallowedAlgorithmError(header.alg)
+        lookup_kid: str = header.kid
+        if profile.expected_kid != "":
+            if lookup_kid == "":
+                raise UnknownKeyError("Token missing required 'kid' selector")
+            if lookup_kid != profile.expected_kid:
+                raise UnknownKeyError(lookup_kid)
+        if lookup_kid == "":
+            raise UnknownKeyError("Token missing 'kid' selector for KeyRing lookup")
+        key_ref: KeyRef = ring.get_verification_key(lookup_kid)
+        if key_ref.algorithm != header.alg:
+            raise DisallowedAlgorithmError("Key '" + lookup_kid + "' is bound to algorithm '" + key_ref.algorithm + "', not '" + header.alg + "'")
+        return self.verify(token, key_ref.secret_material, profile)
 
 # Ergonomic standalone functions
 def sign_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
@@ -181,6 +259,20 @@ def sign_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> st
 def verify_hs256(token: str, secret: str, profile: VerificationProfile) -> VerifiedJws:
     verifier: JwsVerifier = JwsVerifier()
     return verifier.verify_hs256(token, secret, profile)
+
+def sign_jws(payload: str, alg: str, key_material: str, kid: str = "", typ: str = "JWT",
+             provider: CryptoProvider | None = None) -> str:
+    signer: JwsSigner = JwsSigner()
+    if provider is not None:
+        signer = signer.with_provider(provider)
+    return signer.sign(payload, alg, key_material, kid=kid, typ=typ)
+
+def verify_jws(token: str, key_material: str, profile: VerificationProfile,
+               provider: CryptoProvider | None = None) -> VerifiedJws:
+    verifier: JwsVerifier = JwsVerifier()
+    if provider is not None:
+        verifier = verifier.with_provider(provider)
+    return verifier.verify(token, key_material, profile)
 
 def sign_jws_hs256(payload: str, secret: str, kid: str = "", typ: str = "JWT") -> str:
     return sign_hs256(payload, secret, kid, typ)

@@ -21,12 +21,14 @@ PKG_STAGING="${TMP_ROOT}/cipher_pkg"
 CONSUMER_DIR="${TMP_ROOT}/consumer_app"
 NOX_HOME_DIR="${TMP_ROOT}/nox_home"
 
-mkdir -p "${PKG_STAGING}/cipher" "${CONSUMER_DIR}" "${NOX_HOME_DIR}"
+mkdir -p "${PKG_STAGING}/cipher" "${PKG_STAGING}/native" "${PKG_STAGING}/scripts" "${CONSUMER_DIR}" "${NOX_HOME_DIR}"
 
 # 1. Stage current working tree as a clean git repository for 'noxc fetch'
 cp "${REPO_ROOT}/nox.json" "${PKG_STAGING}/"
 cp "${REPO_ROOT}"/*.nox "${PKG_STAGING}/"
 cp "${REPO_ROOT}/cipher"/*.nox "${PKG_STAGING}/cipher/"
+cp "${REPO_ROOT}/native/cipher_openssl.h" "${REPO_ROOT}/native/cipher_openssl_shim.c" "${PKG_STAGING}/native/"
+cp "${REPO_ROOT}/scripts/build-openssl-shim.sh" "${PKG_STAGING}/scripts/"
 
 git -C "${PKG_STAGING}" init -q -b main
 git -C "${PKG_STAGING}" config user.name "Cipher Package Probe"
@@ -117,6 +119,49 @@ if ! echo "${OUTPUT}" | grep -q "Isolated Consumer verification SUCCESS!"; then
 fi
 echo "==> [Stage 1: Local Git Staging] PASSED!"
 
+# 3b. Stage 3: Opt-In OpenSSL C Shim Consumer Verification
+SHIM_CONSUMER_DIR="${TMP_ROOT}/shim_consumer_app"
+mkdir -p "${SHIM_CONSUMER_DIR}/native"
+echo "==> [Stage 3: Optional OpenSSL C Shim Consumer] Testing opt-in cipher.openssl_provider..."
+bash "${REPO_ROOT}/scripts/build-openssl-shim.sh"
+cp "${REPO_ROOT}/native/cipher_openssl_shim.o" "${SHIM_CONSUMER_DIR}/native/"
+cp "${CONSUMER_DIR}/nox.json" "${SHIM_CONSUMER_DIR}/nox.json"
+cp "${CONSUMER_DIR}/nox.lock" "${SHIM_CONSUMER_DIR}/nox.lock"
+
+cat << 'EOF' > "${SHIM_CONSUMER_DIR}/main.nox"
+from cipher.cipher import VerificationProfile, VerifiedJws, sign_jws, verify_jws
+from cipher.openssl_provider import OpenSslCryptoProvider, is_openssl_available
+
+if not is_openssl_available():
+    raise Exception("OpenSSL libcrypto failed to load in isolated shim consumer!")
+
+ossl: OpenSslCryptoProvider = OpenSslCryptoProvider()
+sec384: str = "isolated-consumer-hs384-secret-material-48-bytes-minimum"
+tok: str = sign_jws("{\"scope\":\"shim_ok\"}", "HS384", sec384, kid="iso-ossl-1", provider=ossl)
+ver: VerifiedJws = verify_jws(tok, sec384, VerificationProfile(["HS384"], expected_kid="iso-ossl-1"), provider=ossl)
+if ver.kid != "iso-ossl-1" or ver.algorithm != "HS384":
+    raise Exception("Optional OpenSSL shim verification failed in consumer!")
+
+# RFC 8037 Ed25519 sign + verify across OpenSSL provider
+seed_hex: str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+pub_hex: str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+ed_tok: str = sign_jws("{\"sub\":\"ed_consumer\"}", "EdDSA", seed_hex, kid="ed-1", provider=ossl)
+ed_ver: VerifiedJws = verify_jws(ed_tok, pub_hex, VerificationProfile(["EdDSA"], expected_kid="ed-1"), provider=ossl)
+if ed_ver.algorithm != "EdDSA":
+    raise Exception("EdDSA sign/verify mismatch in isolated shim consumer!")
+
+print("Isolated OpenSSL Shim Consumer verification SUCCESS!")
+EOF
+
+cd "${SHIM_CONSUMER_DIR}"
+SHIM_OUT="$(NOX_HOME="${NOX_HOME_DIR}" noxc run main.nox)"
+echo "${SHIM_OUT}"
+if ! echo "${SHIM_OUT}" | grep -q "Isolated OpenSSL Shim Consumer verification SUCCESS!"; then
+    echo "ERROR: Stage 3 OpenSSL shim consumer output did not contain expected success message!"
+    exit 1
+fi
+echo "==> [Stage 3: Optional OpenSSL C Shim Consumer] PASSED!"
+
 # 4. Stage 2: Real Remote Registry Installation (noxpkg.noxlang.com -> https://github.com/mburakmmm/cipher)
 REMOTE_CONSUMER_DIR="${TMP_ROOT}/remote_consumer_app"
 REMOTE_NOX_HOME="${TMP_ROOT}/remote_nox_home"
@@ -179,4 +224,4 @@ else
     echo "WARNING: Offline environment detected; skipped Stage 2 remote registry check."
 fi
 
-echo "==> Native package consumer integration test (Stage 1 + Stage 2) PASSED successfully!"
+echo "==> Native package consumer integration test (Stage 1 + Stage 2 + Stage 3) PASSED successfully!"

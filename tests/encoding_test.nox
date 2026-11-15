@@ -1,5 +1,5 @@
 import nox.test
-from encoding import bytes_to_hex, decode_base64url, encode_base64url, hex_to_bytes
+from encoding import bytes_to_hex, decode_base64url, decode_base64url_hex, encode_base64url, encode_base64url_from_hex, hex_to_bytes, is_valid_hex
 from errors import EncodingError
 
 # 1. Roundtrip test
@@ -52,3 +52,13 @@ try:
 except EncodingError:
     invalid_char_rejected = True
 nox.test.assert_true(invalid_char_rejected, "Invalid characters must be rejected")
+
+# 7. NUL-byte safe binary <-> hex <-> Base64URL roundtrip (critical for RSA/ECDSA/Ed25519 signatures)
+nul_hex: str = "004100ff000010ab"
+nul_raw: str = hex_to_bytes(nul_hex)
+nox.test.assert_eq_str(bytes_to_hex(nul_raw), nul_hex, "Embedded and leading/consecutive NUL bytes survive hex roundtrip")
+nul_b64: str = encode_base64url_from_hex(nul_hex)
+nox.test.assert_eq_str(decode_base64url_hex(nul_b64), nul_hex, "Embedded NUL bytes survive Base64URL <-> hex roundtrip")
+nox.test.assert_true(is_valid_hex("0123456789abcdefABCDEF"), "Valid hex accepted")
+nox.test.assert_true(not is_valid_hex("123"), "Odd-length hex rejected")
+nox.test.assert_true(not is_valid_hex("zzzz"), "Non-hex characters rejected")

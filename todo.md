@@ -920,3 +920,52 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `CHANGELOG.md` dosyasına `v1.0.11` sürüm notlarını ekle.
 - [x] Git commit, `v1.0.11` git tag push ve `noxc publish` çalıştır.
 - [x] GitHub Actions CI ve Release Gate süreçlerinin %100 yeşil tamamlandığını doğrula.
+
+---
+
+# Phase 18 — `v1.1.0` NOX 2.1.186 Entegrasyonu, Saf NOX EdDSA, Opsiyonel OpenSSL C Shim (`RS256`/`PS256`/`ES256`/`HS384`/`HS512`), `AtomicRef` KeyRing, Gerçek Nanosaniye Benchmarkları & `nox.property`
+
+**Amaç:** `nox-lang v2.1.186` (2.2 yolundaki yeni dil, çalışma zamanı ve standart kütüphane özellikleri) ile Cipher'ı tam uyumlu hale getirmek, standart kütüphanedeki `nox.ed25519` ile sıfır bağımlılıklı **EdDSA (Ed25519)** doğrulamasını çekirdeğe eklemek, isteğe bağlı (opt-in) OpenSSL `libcrypto` C shim modülü (`native/cipher_openssl_shim.c` + `noxc bindgen`) üzerinden tam asimetrik imza/doğrulama (`RS256`, `PS256`, `ES256`, `EdDSA sign/verify`, `HS384`, `HS512`) sunmak, `nox.atomic.AtomicRef` / `nox.time.monotonic_ns()` / `nox.property` / `nox.mem.stats()` / `--strict-spawn-shared` entegrasyonlarını tamamlayıp `v1.1.0` olarak yayımlamak.
+
+## 18.0 — P0: `nox-lang 2.1.186+` Compact Tape JSON Uyumluluğu (`json_strict.nox`, `claims.nox`, `jwks.nox`, `tests/json_strict_test.nox`, `docs/compatibility.md`)
+- [x] `json_strict.nox` içindeki doğrudan `.keys`/`.vals`/`.arr` erişimlerini `nox.json.object_len`, `nox.json.object_key`, `nox.json.object_value`, `nox.json.array_len`, `nox.json.array_get`, `nox.json.get` çağrılarına geçir; `get_array_len`, `get_array_item`, `get_object_len`, `get_object_key`, `get_object_value` yardımcılarını ekle.
+- [x] `claims.nox` (`_parse_audience_field`) ve `jwks.nox` (`parse_jwks`) modüllerini `json_strict` tape yardımcılarına geçir.
+- [x] `tests/json_strict_test.nox` içinde hem üst düzey hem iç içe duplicate JSON key reddi (RFC 8725 §3.10) testini doğrula; `nox.yyjson` modülünün duplicate key reddi sağlamadığı için güvenlik sınırında yasaklı olduğunu `docs/compatibility.md` ve `docs/threat-model.md` içinde belgele.
+- [x] `docs/compatibility.md` belgesini `noxc 2.1.186` ve yeni stdlib API'leriyle güncelle.
+- [x] Mevcut 18 testin tamamını `noxc test` ile `%100` geçer duruma getir (`18 passed, 0 failed`).
+
+## 18.1 — P0: Saf NOX `EdDSA` (`Ed25519`) Doğrulama ve `OKP` JWK Desteği (`encoding.nox`, `jwk.nox`, `keys.nox`, `provider.nox`, `jws.nox`, `jwt.nox`, `cipher.nox`, `cipher/*.nox`)
+- [x] `encoding.nox` içine NUL-byte güvenli `decode_base64url_hex(encoded: str) -> str` ve `encode_base64url_from_hex(hex_str: str) -> str` yardımcılarını ekle (32/64/256 baytlık imzalar ve anahtarlarda `0x00` baytı veri kaybı olmadan işlenmelidir).
+- [x] `jwk.nox`: `JwkKey` içine `crv: str` ve `x: str` alanlarını ekle; `kty == "OKP"` + `crv == "Ed25519"` doğrulaması (32 byte = 43 Base64URL karakter `x`, opsiyonel `d`, `to_public_json()` asla `d` döndürmez) ve RFC 7638 `OKP` JWK thumbprint (`{"crv":"Ed25519","kty":"OKP","x":"..."}`) ekle.
+- [x] `provider.nox`: `CryptoProvider` sözleşmesine `verify_ed25519`, `sign_ed25519`, `verify_asymmetric`, `sign_asymmetric` ve `sign_hmac` / `verify_hmac` (ve `provider_name`, `supports_algorithm`) metotlarını ekle; `DefaultCryptoProvider` içinde `nox.ed25519.verify` tabanlı `EdDSA` doğrulamasını etkinleştir.
+- [x] `jws.nox` & `jwt.nox`: Genel amaçlı `JwsSigner.sign(...)`, `JwsVerifier.verify(...)` ve `JwtVerifier.verify(...)` API'lerini `HS256` + `EdDSA` (ve `CryptoProvider` üzerinden `RS256`, `PS256`, `ES256`, `HS384`, `HS512`) destekleyecek şekilde genişlet; `cipher.nox` ve `cipher/*.nox` re-export dosyalarını güncelle.
+- [x] `tests/asymmetric_jws_test.nox` ve `tests/jwk_test.nox` içine gerçek `EdDSA` (Ed25519) RFC 8037 test vektörleri, `OKP` JWK testleri ve negatif imza/anahtar-karışıklığı testleri ekle.
+
+## 18.2 — P0: Opsiyonel OpenSSL C Shim (`RS256`, `PS256`, `ES256`, `EdDSA` Sign/Verify, `HS384`, `HS512`) (`native/`, `openssl_provider.nox`, `scripts/build-openssl-shim.sh`, `tests/openssl_provider_test.nox`, `.github/workflows/`)
+- [x] `native/cipher_openssl.h` ve `native/cipher_openssl_shim.c` oluştur:
+  - POSIX (`dlopen` — macOS unversioned `/usr/lib/libcrypto.dylib` SIP kapanı atlanır, Homebrew ve versiyonlu `.dylib`/`.so` aranır) ve Windows (`LoadLibraryA`) üzerinden OpenSSL `libcrypto` (`1.1` / `3.x` / `4.x` uyumlu) dinamik yükleme; fail-closed hata kodu modeli.
+  - `HS384`, `HS512` (OpenSSL `HMAC` + sabit zamanlı hex karşılaştırması).
+  - `EdDSA` (Ed25519 ham 32-bayt açık/gizli anahtar imzalama & doğrulama).
+  - `RS256` (RSA PKCS#1 v1.5 SHA-256 imzalama & doğrulama; minimum 2048-bit modulus kontrolü; JWK `(n, e)` -> DER SPKI veya PEM).
+  - `PS256` (RSA-PSS SHA-256 + MGF1-SHA256 + saltlen=32 imzalama & doğrulama; minimum 2048-bit modulus kontrolü).
+  - `ES256` (ECDSA P-256 SHA-256 imzalama & doğrulama; JOSE 64-bayt ham `R || S` <-> ASN.1 DER `ECDSA_SIG` sıkı kanonik dönüşümü; JWK `(x, y)` -> DER SPKI veya PEM).
+- [x] `noxc bindgen native/cipher_openssl.h --lib native/cipher_openssl_shim.o` uyumluluğunu doğrula; çekirdek `cipher.nox` tarafından **zorunlu olarak içe aktarılmayan** opsiyonel `openssl_provider.nox` (`OpenSslCryptoProvider`) ve `cipher/openssl_provider.nox` modüllerini oluştur.
+- [x] `scripts/build-openssl-shim.sh` derleme betiğini yaz; `.github/workflows/ci.yml` ve `.github/workflows/release.yml` içine Linux/macOS/Windows C shim derleme adımlarını ekle.
+- [x] `tests/openssl_provider_test.nox` içinde `RS256`, `PS256`, `ES256`, `EdDSA`, `HS384`, `HS512` pozitif RFC vektörleri ve negatif testler (`< 2048`-bit RSA reddi, yanlış uzunlukta `R||S` reddi, algoritma karışıklığı `HS256<->RS256`/`RS256<->ES256`, tampered signature/payload) ekle ve doğrula.
+
+## 18.3 — P1: `KeyRing` Eşzamanlılık Modernizasyonu (`nox.atomic.AtomicRef` + `--strict-spawn-shared`) (`keyring.nox`, `tests/concurrency_keyring_test.nox`)
+- [x] `keyring.nox` içinde cross-thread paylaşılan durum iletiminde `nox.atomic.AtomicRef` (`_shared_state_ref`) entegrasyonunu uygula; mevcut `_shared_gate` (64-bit CAS), `UNSHARED → ALIVE → CLOSING → DRAINING → DESTROYED → POISONED` yaşam döngüsü, `_shared_key_cells` HMAC seal sıfırlaması ve `shared_capacity_bytes` / `shared_used_bytes` / `shared_usage_permille` sözleşmelerini tam koruyarak 3 KB/48 KiB 6-byte paketleme dar boğazını gider.
+- [x] `tests/concurrency_keyring_test.nox` içine `AtomicRef` yüksek kapasiteli çoklu anahtar paylaşımı ve yaşam döngüsü testlerini ekle; `noxc check --strict-spawn-shared` denetiminden geçir.
+
+## 18.4 — P1: Nanosaniye Benchmarklar, Bellek Regresyonu, `nox.property`, `nox.tls` & Dil Ergonomisi (`tests/benchmark_keyring_test.nox`, `tests/ip_fuzz_property_test.nox`, `encoding.nox`, `jwks.nox`, `.github/workflows/`)
+- [x] `tests/benchmark_keyring_test.nox` içindeki `_ms_to_nonzero_us` (0 ms -> 500 us) geçici çözümünü kaldır ve `nox.time.monotonic_ns()` ile gerçek nanosaniye/mikrosaniye hassasiyetine geç; `docs/benchmark-baseline.json` ve `benchmark-comparison.md` verilerini güncelle.
+- [x] `encoding.nox` içindeki `hex_to_bytes` / `bytes_to_hex` döngülerini `nox.bytes.str_from_list` ile optimize ederek string birleştirme tahsislerini düşür.
+- [x] `tests/ip_fuzz_property_test.nox` (ve token/JWK fuzzing) testlerini `nox.property` (seeded shrinking) ve `nox.mem.stats()` bellek sızıntısı kontrolleriyle güçlendir.
+- [x] `jwks.nox` içinde `nox.tls` uyumluluk/SSRF sınır notlarını ve güvenli `TlsJwksFetcher` sözleşmesini ekle/doğrula; veri sınıflarında (`ProtectedHeader`, `VerificationProfile`, `RotationReceipt`) `@dataclass` / `noxc explain` iyileştirmelerini uygula ve `--profile freestanding` negatif/izolasyon derleme kapısını doğrula.
+
+## 18.5 — Phase 18 Çıkış Kapısı ve `v1.1.0` Yayını
+- [x] Tüm test paketi (`noxc test`) eksiksiz ve 0 hata ile geçmeli.
+- [x] `noxc check --strict-spawn-shared` tüm çekirdek ve testlerde hatasız geçmeli.
+- [ ] `./scripts/test-isolated-consumer.sh` (Stage 1 Local Git + Stage 2 Remote Registry + Stage 3 Optional OpenSSL C Shim Consumer) %100 yeşil geçmeli.
+- [x] `nox.json` (`version: "1.1.0"`, `packages.md` uyumlu `source` etiketi), `README.md`, `docs/algorithms.md`, `docs/architecture.md`, `docs/threat-model.md`, `docs/key-management.md` ve `CHANGELOG.md` (`v1.1.0` notları) eksiksiz güncellenmeli.
+- [ ] Git commit, `v1.1.0` tag push, GitHub Actions CI & Release Gate başarısı ve `noxc publish` doğrulaması tamamlanmalı.

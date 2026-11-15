@@ -49,16 +49,16 @@ class KeyRef:
                       retire_at=self.retire_at)
 
     def can_sign(self) -> bool:
-        return self.state == STATE_ACTIVE_SIGNING and self.use == "sig"
+        return self.state == "ACTIVE_SIGNING" and self.use == "sig"
 
     def can_verify(self, current_time_sec: int = 0) -> bool:
-        if self.state == STATE_REVOKED:
+        if self.state == "REVOKED":
             return False
-        if self.state == STATE_RETIRED:
+        if self.state == "RETIRED":
             return False
-        if self.state == STATE_ACTIVE_SIGNING:
+        if self.state == "ACTIVE_SIGNING":
             return True
-        if self.state == STATE_VERIFY_ONLY:
+        if self.state == "VERIFY_ONLY":
             if self.retire_at > 0:
                 now: int = current_time_sec
                 if now <= 0:
@@ -70,33 +70,33 @@ class KeyRef:
 
     def transition_to(self, new_state: str) -> None:
         # Terminal state: REVOKED can never transition
-        if self.state == STATE_REVOKED:
+        if self.state == "REVOKED":
             raise ConfigurationError("Revoked key cannot transition to any other state")
         
         # Valid state transitions
-        if new_state == STATE_REVOKED:
-            self.state = STATE_REVOKED
+        if new_state == "REVOKED":
+            self.state = "REVOKED"
             return
         
-        if self.state == STATE_PREPARED:
-            if new_state == STATE_ACTIVE_SIGNING:
-                self.state = STATE_ACTIVE_SIGNING
+        if self.state == "PREPARED":
+            if new_state == "ACTIVE_SIGNING":
+                self.state = "ACTIVE_SIGNING"
                 return
             raise ConfigurationError("PREPARED key can only transition to ACTIVE_SIGNING or REVOKED")
         
-        if self.state == STATE_ACTIVE_SIGNING:
-            if new_state == STATE_VERIFY_ONLY:
-                self.state = STATE_VERIFY_ONLY
+        if self.state == "ACTIVE_SIGNING":
+            if new_state == "VERIFY_ONLY":
+                self.state = "VERIFY_ONLY"
                 return
             raise ConfigurationError("ACTIVE_SIGNING key can only transition to VERIFY_ONLY or REVOKED")
         
-        if self.state == STATE_VERIFY_ONLY:
-            if new_state == STATE_RETIRED:
-                self.state = STATE_RETIRED
+        if self.state == "VERIFY_ONLY":
+            if new_state == "RETIRED":
+                self.state = "RETIRED"
                 return
             raise ConfigurationError("VERIFY_ONLY key can only transition to RETIRED or REVOKED")
         
-        if self.state == STATE_RETIRED:
+        if self.state == "RETIRED":
             raise ConfigurationError("RETIRED key cannot transition back to active use")
         
         raise ConfigurationError("Unknown state transition from " + self.state + " to " + new_state)
