@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  NOX_VERSION: v2.1.0
+  NOX_VERSION: v2.1.186
 
 jobs:
   verify-cross-platform:

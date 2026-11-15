@@ -966,6 +966,6 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 ## 18.5 — Phase 18 Çıkış Kapısı ve `v1.1.0` Yayını
 - [x] Tüm test paketi (`noxc test`) eksiksiz ve 0 hata ile geçmeli.
 - [x] `noxc check --strict-spawn-shared` tüm çekirdek ve testlerde hatasız geçmeli.
-- [ ] `./scripts/test-isolated-consumer.sh` (Stage 1 Local Git + Stage 2 Remote Registry + Stage 3 Optional OpenSSL C Shim Consumer) %100 yeşil geçmeli.
+- [x] `./scripts/test-isolated-consumer.sh` (Stage 1 Local Git + Stage 2 Remote Registry + Stage 3 Optional OpenSSL C Shim Consumer) %100 yeşil geçmeli.
 - [x] `nox.json` (`version: "1.1.0"`, `packages.md` uyumlu `source` etiketi), `README.md`, `docs/algorithms.md`, `docs/architecture.md`, `docs/threat-model.md`, `docs/key-management.md` ve `CHANGELOG.md` (`v1.1.0` notları) eksiksiz güncellenmeli.
 - [ ] Git commit, `v1.1.0` tag push, GitHub Actions CI & Release Gate başarısı ve `noxc publish` doğrulaması tamamlanmalı.
