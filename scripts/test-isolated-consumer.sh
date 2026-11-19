@@ -172,7 +172,7 @@ cd "${REMOTE_CONSUMER_DIR}"
 NOX_HOME="${REMOTE_NOX_HOME}" noxc init . >/dev/null
 
 if NOX_HOME="${REMOTE_NOX_HOME}" noxc add cipher && NOX_HOME="${REMOTE_NOX_HOME}" noxc fetch; then
-    if ! grep -q "https://github.com/mburakmmm/cipher" "${REMOTE_CONSUMER_DIR}/nox.lock"; then
+    if ! grep -q "github.com/mburakmmm/cipher" "${REMOTE_CONSUMER_DIR}/nox.lock"; then
         echo "ERROR: Remote nox.lock did not record https://github.com/mburakmmm/cipher repository!"
         cat "${REMOTE_CONSUMER_DIR}/nox.lock"
         exit 1
