@@ -1,6 +1,10 @@
 # Cipher — Secure Remote JWKS Source and Resilient Key Discovery
 # Strict SSRF controls, TTL-bounded caching, negative caching, and outage stale-window limits.
 
+import nox.dns
+import nox.http
+import nox.ip
+import nox.safehttp
 import nox.strings
 import nox.time
 import nox.tls
@@ -361,6 +365,8 @@ def _looks_like_ipv4_literal(host: str) -> bool:
 def verify_resolved_ip(ip_str: str) -> bool:
     if ip_str == "":
         return False
+    if not nox.ip.is_global_text(ip_str):
+        return False
     if nox.strings.contains(ip_str, ":"):
         try:
             v6: IPv6Address = parse_ipv6(ip_str)
@@ -620,13 +626,30 @@ def validate_tls_jwks_target(configured_url: str, resolved_ip: str = "", allowed
             req_path = req_path + configured_url[q_pos:q_end]
     return TlsJwksTarget(configured_url, parsed.host, port, req_path, resolved_ip)
 
-def fetch_jwks_tls(target: TlsJwksTarget, max_bytes: int = 1048576) -> str:
+def fetch_jwks_tls(target: TlsJwksTarget, max_bytes: int = 1048576, dns_timeout_ms: int = 5000) -> str:
     # Enforce SSRF + DNS-pinning policy BEFORE opening any TLS socket
     verified: TlsJwksTarget = validate_tls_jwks_target(target.url, target.resolved_ip, target.host)
     if max_bytes <= 0 or max_bytes > MAX_JWKS_RESPONSE_BYTES:
         raise ConfigurationError("Invalid JWKS max_bytes limit")
 
-    stream: nox.tls.TlsStream = nox.tls.connect(verified.host, verified.port)
+    pinned_ip: str = verified.resolved_ip
+    if pinned_ip == "":
+        resolved_ips: list[str] = []
+        try:
+            resolved_ips = nox.dns.resolve(verified.host, dns_timeout_ms)
+        except nox.dns.DnsError as err:
+            raise ConfigurationError("JWKS DNS resolution failed: " + str(err))
+        if len(resolved_ips) == 0:
+            raise ConfigurationError("JWKS DNS resolution returned no addresses")
+        # Fail closed if ANY returned A/AAAA record is non-public (prevents split-horizon / rebinding)
+        ip_idx: int = 0
+        while ip_idx < len(resolved_ips):
+            if not verify_resolved_ip(resolved_ips[ip_idx]):
+                raise ConfigurationError("JWKS resolved IP violates SSRF boundary: " + resolved_ips[ip_idx])
+            ip_idx = ip_idx + 1
+        pinned_ip = resolved_ips[0]
+
+    stream: nox.tls.TlsStream = nox.tls.connect(verified.host, verified.port, pinned_ip)
     raw_resp: str = ""
     try:
         req: str = "GET " + verified.path + " HTTP/1.1\r\nHost: " + verified.host + "\r\nConnection: close\r\nAccept: application/jwk-set+json, application/json\r\n\r\n"
@@ -654,5 +677,32 @@ def fetch_jwks_tls(target: TlsJwksTarget, max_bytes: int = 1048576) -> str:
         raise ConfigurationError("JWKS TLS endpoint did not return HTTP 200 (redirects disabled fail-closed)")
     body: str = raw_resp[sep_idx + 4:len(raw_resp)]
     if nox.strings.byte_len(body) > max_bytes:
-        raise ResourceLimitExceededError("JWKS body exceeded MAX_JWKS_RESPONSE_BYTES")
+        raise ResourceLimitExceededError("JWKS TLS response body exceeded configured byte limit")
     return body
+
+def fetch_jwks_https(url: str, allowed_host: str = "", timeout_ms: int = 5000, max_bytes: int = 1048576, max_redirects: int = 0) -> str:
+    if not is_safe_jwks_url(url, allowed_host):
+        raise ConfigurationError("Insecure or disallowed JWKS HTTPS URL: " + url)
+    if max_bytes <= 0 or max_bytes > MAX_JWKS_RESPONSE_BYTES:
+        raise ConfigurationError("Invalid JWKS max_bytes limit")
+    if timeout_ms <= 0:
+        raise ConfigurationError("Invalid JWKS timeout_ms")
+    if max_redirects < 0 or max_redirects > 3:
+        raise ConfigurationError("Invalid JWKS max_redirects (must be 0..3)")
+
+    req_headers: dict[str, str] = {"Accept": "application/jwk-set+json, application/json"}
+    resp: nox.http.HttpResponse = nox.http.HttpResponse(0, "", {})
+    try:
+        resp = nox.safehttp.request("GET", url, "", req_headers, timeout_ms, max_redirects, False, "", False)
+    except nox.safehttp.SafeHttpBlockedError as err:
+        raise ConfigurationError("JWKS HTTPS request blocked by SSRF policy: " + str(err))
+    except nox.safehttp.SafeHttpError as err:
+        raise ConfigurationError("JWKS HTTPS request failed: " + str(err))
+
+    if resp.status != 200:
+        raise ConfigurationError("JWKS HTTPS endpoint returned non-200 status: " + str(resp.status))
+    if resp.body == "":
+        raise ConfigurationError("JWKS HTTPS endpoint returned empty body")
+    if nox.strings.byte_len(resp.body) > max_bytes:
+        raise ResourceLimitExceededError("JWKS HTTPS response body exceeded configured byte limit")
+    return resp.body

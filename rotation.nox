@@ -1,5 +1,7 @@
 # Cipher — Key Rotation Contracts and Audit Receipts
 
+__all__: list[str] = ["RotationReceipt"]
+
 @dataclass
 class RotationReceipt:
     old_kid: str

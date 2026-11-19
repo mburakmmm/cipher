@@ -1,6 +1,29 @@
 # Cipher — Strongly-Typed Error Hierarchy
 # Strict fail-closed error contracts for cryptographic and claims validation.
 
+__all__: list[str] = [
+    "CipherError",
+    "MalformedTokenError",
+    "EncodingError",
+    "JsonFormatError",
+    "UnsupportedAlgorithmError",
+    "DisallowedAlgorithmError",
+    "InvalidSignatureError",
+    "InvalidKeyError",
+    "UnknownKeyError",
+    "AmbiguousKeyError",
+    "KeyUnavailableError",
+    "InvalidClaimsError",
+    "ExpiredTokenError",
+    "NotYetValidError",
+    "InvalidAudienceError",
+    "InvalidIssuerError",
+    "InvalidTypeError",
+    "ProviderFailureError",
+    "ConfigurationError",
+    "ResourceLimitExceededError",
+]
+
 class CipherError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)

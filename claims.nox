@@ -4,7 +4,14 @@
 import nox.strings
 import nox.time
 from cipher.errors import ExpiredTokenError, InvalidAudienceError, InvalidClaimsError, InvalidIssuerError, NotYetValidError
-from cipher.json_strict import get_array_item, get_array_len, get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json
+from cipher.json_strict import get_array_item, get_array_len, get_field_value, get_int_field, get_string_field, has_field, is_object, parse_strict_json, pos_at, pos_find, pos_kind, pos_len, pos_root, pos_str
+
+__all__: list[str] = [
+    "ClaimsProfile",
+    "Claims",
+    "parse_claims",
+    "validate_claims",
+]
 
 class ClaimsProfile:
     expected_issuer: str
@@ -77,6 +84,26 @@ class Claims:
 
 def _parse_audience_field(v: JsonValue) -> list[str]:
     out: list[str] = []
+    if v.tpos > 0 and is_object(v):
+        rp: int = pos_root(v)
+        aud_p: int = pos_find(v, rp, "aud")
+        if aud_p < 0:
+            return out
+        k: int = pos_kind(v, aud_p)
+        if k == 3:
+            out.append(pos_str(v, aud_p))
+            return out
+        if k == 4:
+            i: int = 0
+            n: int = pos_len(v, aud_p)
+            while i < n:
+                elem_p: int = pos_at(v, aud_p, i)
+                if pos_kind(v, elem_p) != 3:
+                    raise InvalidClaimsError("All audience array elements must be strings")
+                out.append(pos_str(v, elem_p))
+                i = i + 1
+            return out
+        raise InvalidClaimsError("The 'aud' claim must be either a string or an array of strings")
     if not has_field(v, "aud"):
         return out
     aud_val: JsonValue = get_field_value(v, "aud")
@@ -86,14 +113,14 @@ def _parse_audience_field(v: JsonValue) -> list[str]:
         return out
     # If aud is an array of strings
     if aud_val.kind == 4:
-        i: int = 0
-        n: int = get_array_len(aud_val)
-        while i < n:
-            item: JsonValue = get_array_item(aud_val, i)
+        i2: int = 0
+        n2: int = get_array_len(aud_val)
+        while i2 < n2:
+            item: JsonValue = get_array_item(aud_val, i2)
             if item.kind != 3:
                 raise InvalidClaimsError("All audience array elements must be strings")
             out.append(item.s)
-            i = i + 1
+            i2 = i2 + 1
         return out
     raise InvalidClaimsError("The 'aud' claim must be either a string or an array of strings")
 

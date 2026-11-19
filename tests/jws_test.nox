@@ -93,3 +93,39 @@ try:
 except JsonFormatError:
     dup_header_rejected = True
 nox.test.assert_true(dup_header_rejected, "Duplicate header key rejected with JsonFormatError")
+
+# 9. Pure-NOX HS384 and HS512 (RFC 2104 over nox.crypto.sha384 / sha512) (19.2)
+secret_384: str = "cipher-hs384-pure-nox-secret-key-at-least-48-bytes-long!"
+secret_512: str = "cipher-hs512-pure-nox-secret-key-at-least-64-bytes-long-for-sha512!"
+
+signer_hmac: JwsSigner = JwsSigner()
+verifier_hmac: JwsVerifier = JwsVerifier()
+
+jws_384: str = signer_hmac.sign("{\"sub\":\"u384\"}", "HS384", secret_384, kid="k384")
+v384: VerifiedJws = verifier_hmac.verify(jws_384, secret_384, VerificationProfile(["HS384"], expected_kid="k384"))
+nox.test.assert_eq_str(v384.payload, "{\"sub\":\"u384\"}", "Pure-NOX HS384 sign+verify succeeds")
+
+jws_512: str = signer_hmac.sign("{\"sub\":\"u512\"}", "HS512", secret_512, kid="k512")
+v512: VerifiedJws = verifier_hmac.verify(jws_512, secret_512, VerificationProfile(["HS512"], expected_kid="k512"))
+nox.test.assert_eq_str(v512.payload, "{\"sub\":\"u512\"}", "Pure-NOX HS512 sign+verify succeeds")
+
+hs384_confuse: bool = False
+try:
+    verifier_hmac.verify(jws_384, secret_384, VerificationProfile(["HS256", "HS512"]))
+except CipherError:
+    hs384_confuse = True
+nox.test.assert_true(hs384_confuse, "HS384 token rejected when verifier only allows HS256/HS512")
+
+hs384_short: bool = False
+try:
+    signer_hmac.sign("{}", "HS384", "too-short-secret-under-48-bytes-long-fail")
+except CipherError:
+    hs384_short = True
+nox.test.assert_true(hs384_short, "HS384 rejects <48-byte secret")
+
+hs512_short: bool = False
+try:
+    signer_hmac.sign("{}", "HS512", secret_384)
+except CipherError:
+    hs512_short = True
+nox.test.assert_true(hs512_short, "HS512 rejects <64-byte secret")

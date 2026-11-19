@@ -5,7 +5,7 @@
 [![CI](https://github.com/mburakmmm/cipher/actions/workflows/ci.yml/badge.svg)](https://github.com/mburakmmm/cipher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mburakmmm/cipher?color=blue)](https://github.com/mburakmmm/cipher/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![NOX](https://img.shields.io/badge/NOX-2.1.186-orange)](https://noxlang.com)
+[![NOX](https://img.shields.io/badge/NOX-2.2.38-orange)](https://noxlang.com)
 [![Security Policy](https://img.shields.io/badge/Security-RFC%208725%20BCP-red)](SECURITY.md)
 
 **Cryptographic Token & Key Management Mechanism Layer for the NOX Ecosystem**

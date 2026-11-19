@@ -1,0 +1,217 @@
+# Cipher — Purpose-Bound Authenticated-Encrypted Opaque Tokens (AEAD)
+# Uses nox.crypto.aead_seal_bytes / aead_open_bytes (ChaCha20-Poly1305, AES-256-GCM, XChaCha20-Poly1305)
+# with OS CSPRNG nonces, domain-separated AAD, strict Base64URL encoding, and distinct prefix ("cip_seal_v1").
+
+from nox.buffer import Buffer
+import nox.bytes
+from nox.crypto import CryptoError
+import nox.crypto
+import nox.strings
+import nox.time
+from cipher.encoding import bytes_to_hex, decode_base64url, decode_base64url_hex, encode_base64url, encode_base64url_from_hex, hex_to_bytes, is_valid_hex
+from cipher.errors import DisallowedAlgorithmError, EncodingError, ExpiredTokenError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, ResourceLimitExceededError, UnknownKeyError, UnsupportedAlgorithmError
+
+SEALED_TOKEN_PREFIX: str = "cip_seal_v1"
+DEFAULT_SEALED_ALG: str = "chacha20-poly1305"
+MAX_SEALED_TOKEN_BYTES: int = 131072
+SEALED_KEY_BYTES: int = 32
+AEAD_TAG_BYTES: int = 16
+
+@dataclass
+class SealedPayload:
+    payload: str
+    purpose: str
+    alg: str
+    kid: str
+    issued_at: int
+    ttl: int
+
+def _validate_sealed_alg(alg: str) -> int:
+    match alg:
+        case "chacha20-poly1305" | "aes-256-gcm":
+            return 12
+        case "xchacha20-poly1305":
+            return 24
+        case _:
+            raise UnsupportedAlgorithmError("Unsupported AEAD algorithm for SealedToken: " + alg)
+
+def _str_to_buffer(s: str) -> Buffer:
+    n: int = nox.strings.byte_len(s)
+    buf: Buffer = Buffer(n)
+    i: int = 0
+    while i < n:
+        buf.set(i, u8(nox.strings.byte_at(s, i)))
+        i = i + 1
+    return buf
+
+def _buffer_to_str(buf: Buffer) -> str:
+    n: int = buf.len()
+    out: list[int] = []
+    i: int = 0
+    while i < n:
+        out.append(int(buf.get(i)))
+        i = i + 1
+    return nox.bytes.str_from_list(out)
+
+def _buffer_to_hex(buf: Buffer) -> str:
+    return bytes_to_hex(_buffer_to_str(buf))
+
+def _hex_to_buffer(h: str) -> Buffer:
+    raw: str = hex_to_bytes(h)
+    return _str_to_buffer(raw)
+
+def _build_aad(alg: str, purpose: str, issued_at: int, ttl: int, kid: str, context_aad: str) -> Buffer:
+    aad_str: str = "CIPHER-SEALED-V1:" + alg + ":" + purpose + ":" + str(issued_at) + ":" + str(ttl) + ":" + kid
+    if context_aad != "":
+        aad_str = aad_str + ":" + encode_base64url(context_aad)
+    return _str_to_buffer(aad_str)
+
+def _validate_key_str(key: str) -> Buffer:
+    if nox.strings.byte_len(key) != SEALED_KEY_BYTES:
+        raise InvalidKeyError("SealedToken AEAD key must be exactly 32 bytes (256 bits)")
+    return _str_to_buffer(key)
+
+class SealedTokenIssuer:
+    alg: str
+
+    def __init__(self, alg: str = "chacha20-poly1305") -> None:
+        _validate_sealed_alg(alg)
+        self.alg = alg
+
+    def issue(self, payload: str, purpose: str, key: str, ttl_seconds: int,
+              kid: str = "default", context_aad: str = "", clock_time_sec: int = 0) -> str:
+        if purpose == "":
+            raise InvalidClaimsError("Purpose cannot be empty")
+        if ttl_seconds <= 0:
+            raise InvalidClaimsError("TTL must be positive")
+        if nox.strings.byte_len(payload) > 65536:
+            raise ResourceLimitExceededError("SealedToken payload exceeds maximum 64KB size")
+
+        nonce_len: int = _validate_sealed_alg(self.alg)
+        key_buf: Buffer = _validate_key_str(key)
+
+        now_sec: int = clock_time_sec
+        if now_sec <= 0:
+            now_sec = nox.time.now_ms() // 1000
+
+        nonce_hex: str = nox.crypto.secure_random_hex(nonce_len)
+        nonce_buf: Buffer = _hex_to_buffer(nonce_hex)
+        pt_buf: Buffer = _str_to_buffer(payload)
+        aad_buf: Buffer = _build_aad(self.alg, purpose, now_sec, ttl_seconds, kid, context_aad)
+
+        sealed_buf: Buffer = Buffer(0)
+        try:
+            sealed_buf = nox.crypto.aead_seal_bytes(key_buf, nonce_buf, pt_buf, aad_buf, algorithm=self.alg)
+        except CryptoError:
+            raise InvalidKeyError("SealedToken AEAD encryption failed")
+
+        alg_b64: str = encode_base64url(self.alg)
+        purpose_b64: str = encode_base64url(purpose)
+        kid_b64: str = encode_base64url(kid)
+        nonce_b64: str = encode_base64url_from_hex(nonce_hex)
+        sealed_b64: str = encode_base64url_from_hex(_buffer_to_hex(sealed_buf))
+
+        return (SEALED_TOKEN_PREFIX + "." + alg_b64 + "." + purpose_b64 + "." +
+                str(now_sec) + "." + str(ttl_seconds) + "." + kid_b64 + "." +
+                nonce_b64 + "." + sealed_b64)
+
+class SealedTokenVerifier:
+    expected_alg: str
+
+    def __init__(self, expected_alg: str = "chacha20-poly1305") -> None:
+        _validate_sealed_alg(expected_alg)
+        self.expected_alg = expected_alg
+
+    def open(self, token: str, expected_purpose: str, key: str,
+             clock_time_sec: int = 0, leeway_seconds: int = 60,
+             max_ttl_seconds: int = 0, expected_kid: str = "",
+             context_aad: str = "") -> SealedPayload:
+        if expected_purpose == "":
+            raise InvalidClaimsError("Expected purpose cannot be empty")
+        if nox.strings.byte_len(token) > MAX_SEALED_TOKEN_BYTES:
+            raise ResourceLimitExceededError("SealedToken exceeds maximum allowed byte size")
+
+        parts: list[str] = nox.strings.split(token, ".")
+        # Format: cip_seal_v1.alg_b64.purpose_b64.issued_at.ttl.kid_b64.nonce_b64.sealed_b64 (8 parts)
+        if len(parts) != 8:
+            raise MalformedTokenError("SealedToken must have exactly 8 dot-separated segments")
+        if parts[0] != SEALED_TOKEN_PREFIX:
+            raise MalformedTokenError("Invalid SealedToken prefix: expected " + SEALED_TOKEN_PREFIX)
+
+        alg: str = ""
+        purpose: str = ""
+        kid: str = ""
+        nonce_hex: str = ""
+        sealed_hex: str = ""
+        try:
+            alg = decode_base64url(parts[1])
+            purpose = decode_base64url(parts[2])
+            kid = decode_base64url(parts[5])
+            nonce_hex = decode_base64url_hex(parts[6])
+            sealed_hex = decode_base64url_hex(parts[7])
+        except EncodingError:
+            raise MalformedTokenError("SealedToken contains malformed Base64URL segment")
+
+        if alg != self.expected_alg:
+            raise DisallowedAlgorithmError("SealedToken algorithm mismatch: got '" + alg + "', expected '" + self.expected_alg + "'")
+        nonce_len: int = _validate_sealed_alg(alg)
+
+        if purpose != expected_purpose:
+            raise InvalidClaimsError("SealedToken purpose mismatch: got '" + purpose + "', expected '" + expected_purpose + "'")
+
+        issued_at: int = 0
+        ttl: int = 0
+        try:
+            issued_at = int(parts[3])
+            ttl = int(parts[4])
+        except ValueError:
+            raise MalformedTokenError("SealedToken contains non-integer timestamp or TTL")
+
+        if expected_kid != "" and kid != expected_kid:
+            raise UnknownKeyError("SealedToken kid mismatch: got '" + kid + "', expected '" + expected_kid + "'")
+
+        if nox.strings.byte_len(nonce_hex) != nonce_len * 2 or not is_valid_hex(nonce_hex):
+            raise MalformedTokenError("SealedToken nonce length does not match algorithm requirement")
+        if nox.strings.byte_len(sealed_hex) < AEAD_TAG_BYTES * 2 or not is_valid_hex(sealed_hex):
+            raise MalformedTokenError("SealedToken ciphertext missing AEAD authentication tag")
+
+        key_buf: Buffer = _validate_key_str(key)
+        nonce_buf: Buffer = _hex_to_buffer(nonce_hex)
+        sealed_buf: Buffer = _hex_to_buffer(sealed_hex)
+        aad_buf: Buffer = _build_aad(alg, purpose, issued_at, ttl, kid, context_aad)
+
+        pt_buf: Buffer = Buffer(0)
+        try:
+            pt_buf = nox.crypto.aead_open_bytes(key_buf, nonce_buf, sealed_buf, aad_buf, algorithm=alg)
+        except CryptoError:
+            raise InvalidSignatureError("SealedToken AEAD authentication failed")
+
+        now: int = clock_time_sec
+        if now <= 0:
+            now = nox.time.now_ms() // 1000
+
+        if issued_at > now + leeway_seconds:
+            raise InvalidClaimsError("SealedToken issued_at is in the future")
+        if ttl <= 0:
+            raise InvalidClaimsError("SealedToken TTL must be positive")
+        if max_ttl_seconds > 0 and ttl > max_ttl_seconds:
+            raise InvalidClaimsError("SealedToken TTL exceeds maximum allowed TTL")
+        if now > issued_at + ttl:
+            raise ExpiredTokenError("SealedToken has expired")
+
+        return SealedPayload(_buffer_to_str(pt_buf), purpose, alg, kid, issued_at, ttl)
+
+def issue_sealed_token(payload: str, purpose: str, key: str, ttl_seconds: int,
+                       alg: str = "chacha20-poly1305", kid: str = "default",
+                       context_aad: str = "", clock_time_sec: int = 0) -> str:
+    return SealedTokenIssuer(alg).issue(payload, purpose, key, ttl_seconds, kid=kid, context_aad=context_aad, clock_time_sec=clock_time_sec)
+
+def open_sealed_token(token: str, expected_purpose: str, key: str,
+                      expected_alg: str = "chacha20-poly1305", clock_time_sec: int = 0,
+                      leeway_seconds: int = 60, max_ttl_seconds: int = 0,
+                      expected_kid: str = "", context_aad: str = "") -> SealedPayload:
+    return SealedTokenVerifier(expected_alg).open(
+        token, expected_purpose, key, clock_time_sec=clock_time_sec,
+        leeway_seconds=leeway_seconds, max_ttl_seconds=max_ttl_seconds,
+        expected_kid=expected_kid, context_aad=context_aad
+    )

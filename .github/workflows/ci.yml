@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NOX_VERSION: v2.1.186
+  NOX_VERSION: v2.2.38
 
 jobs:
   test:

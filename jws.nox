@@ -13,10 +13,18 @@ from cipher.provider import CryptoProvider, DefaultCryptoProvider
 MAX_TOKEN_BYTES: int = 131072  # 128 KB total compact JWS limit
 
 def _is_hmac_alg(alg: str) -> bool:
-    return alg == "HS256" or alg == "HS384" or alg == "HS512"
+    match alg:
+        case "HS256" | "HS384" | "HS512":
+            return True
+        case _:
+            return False
 
 def _is_asym_alg(alg: str) -> bool:
-    return alg == "EdDSA" or alg == "RS256" or alg == "PS256" or alg == "ES256"
+    match alg:
+        case "EdDSA" | "RS256" | "PS256" | "ES256":
+            return True
+        case _:
+            return False
 
 def _validate_key_alg_binding(alg: str, key_material: str) -> None:
     trimmed: str = nox.strings.trim(key_material)

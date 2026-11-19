@@ -1,7 +1,7 @@
 import nox.test
 from errors import ConfigurationError, EncodingError, KeyUnavailableError, UnknownKeyError
 from jwk import JwkKey
-from jwks import IPv4Address, IPv6Address, JwksKeySource, TlsJwksTarget, fetch_jwks_tls, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, validate_tls_jwks_target, verify_resolved_ip
+from jwks import IPv4Address, IPv6Address, JwksKeySource, TlsJwksTarget, fetch_jwks_https, fetch_jwks_tls, is_restricted_ipv4_addr, is_restricted_ipv6_addr, is_safe_jwks_url, parse_ipv4, parse_ipv6, parse_jwks, validate_tls_jwks_target, verify_resolved_ip
 
 # 1. SSRF Protection Tests
 nox.test.assert_true(not is_safe_jwks_url("http://auth.example.com/.well-known/jwks.json"), "HTTP scheme must be rejected")
@@ -212,6 +212,39 @@ try:
 except ConfigurationError:
     tls_ssrf_blocked = True
 nox.test.assert_true(tls_ssrf_blocked, "fetch_jwks_tls re-validates resolved_ip and fails closed BEFORE dialing TLS")
+
+# 6. NAT64 & nox.safehttp fetch_jwks_https Fail-Closed SSRF Checks (19.0)
+nox.test.assert_true(not verify_resolved_ip("64:ff9b::127.0.0.1"), "NAT64 loopback rejected fail-closed")
+nox.test.assert_true(not verify_resolved_ip("64:ff9b::8.8.8.8"), "NAT64 well-known prefix rejected fail-closed")
+nox.test.assert_true(verify_resolved_ip("93.184.216.34"), "Public IPv4 passes verify_resolved_ip + nox.ip")
+
+https_http_blocked: bool = False
+try:
+    fetch_jwks_https("http://auth.example.com/.well-known/jwks.json")
+except ConfigurationError:
+    https_http_blocked = True
+nox.test.assert_true(https_http_blocked, "fetch_jwks_https rejects plain HTTP URLs")
+
+https_loopback_blocked: bool = False
+try:
+    fetch_jwks_https("https://127.0.0.1/.well-known/jwks.json")
+except ConfigurationError:
+    https_loopback_blocked = True
+nox.test.assert_true(https_loopback_blocked, "fetch_jwks_https rejects loopback literal")
+
+https_metadata_blocked: bool = False
+try:
+    fetch_jwks_https("https://169.254.169.254/latest/meta-data")
+except ConfigurationError:
+    https_metadata_blocked = True
+nox.test.assert_true(https_metadata_blocked, "fetch_jwks_https rejects cloud metadata IP")
+
+https_redir_blocked: bool = False
+try:
+    fetch_jwks_https("https://auth.example.com/.well-known/jwks.json", max_redirects=9)
+except ConfigurationError:
+    https_redir_blocked = True
+nox.test.assert_true(https_redir_blocked, "fetch_jwks_https rejects out-of-range max_redirects")
 
 print("jwks_test passed!")
 

@@ -1,0 +1,126 @@
+import nox.bytes
+import nox.mem
+import nox.strings
+import nox.test
+from cipher.errors import CipherError, DisallowedAlgorithmError, ExpiredTokenError, InvalidClaimsError, InvalidKeyError, InvalidSignatureError, MalformedTokenError, UnknownKeyError, UnsupportedAlgorithmError
+from cipher.sealed_token import DEFAULT_SEALED_ALG, SEALED_TOKEN_PREFIX, SealedPayload, SealedTokenIssuer, SealedTokenVerifier, issue_sealed_token, open_sealed_token
+from cipher.signed_token import issue_signed_token
+
+k32: str = "cipher-sealed-token-32byte-key!!"
+k32_wrong: str = "wrong-sealed-token-32byte-key!!!"
+
+# 1. Positive round-trip across ChaCha20-Poly1305, AES-256-GCM, XChaCha20-Poly1305
+tok_chacha: str = issue_sealed_token("{\"uid\":42,\"role\":\"admin\"}", "session", k32, 300, kid="sk-1", context_aad="tenant:acme", clock_time_sec=1700000000)
+nox.test.assert_true(tok_chacha.startswith(SEALED_TOKEN_PREFIX + "."), "SealedToken uses distinct cip_seal_v1 prefix")
+res_chacha: SealedPayload = open_sealed_token(tok_chacha, "session", k32, clock_time_sec=1700000100, expected_kid="sk-1", context_aad="tenant:acme")
+nox.test.assert_eq_str(res_chacha.payload, "{\"uid\":42,\"role\":\"admin\"}", "ChaCha20-Poly1305 payload decrypted")
+nox.test.assert_eq_str(res_chacha.purpose, "session", "Purpose preserved")
+nox.test.assert_eq_str(res_chacha.alg, DEFAULT_SEALED_ALG, "Alg preserved")
+nox.test.assert_eq_str(res_chacha.kid, "sk-1", "Kid preserved")
+
+bin_pt: str = nox.bytes.str_from_list([98, 105, 110, 0, 111, 107])
+tok_aes: str = issue_sealed_token(bin_pt, "csrf", k32, 120, alg="aes-256-gcm", clock_time_sec=1700000000)
+res_aes: SealedPayload = open_sealed_token(tok_aes, "csrf", k32, expected_alg="aes-256-gcm", clock_time_sec=1700000050)
+nox.test.assert_eq_int(nox.strings.byte_len(res_aes.payload), 6, "AES-256-GCM preserves exact 6-byte length across embedded NUL")
+dec_bytes: list[int] = nox.bytes.list_from_str(res_aes.payload)
+nox.test.assert_eq_int(len(dec_bytes), 6, "AES-256-GCM preserves 6 raw bytes")
+nox.test.assert_eq_int(dec_bytes[3], 0, "AES-256-GCM preserves embedded 0x00 byte")
+nox.test.assert_eq_int(dec_bytes[5], 107, "AES-256-GCM preserves trailing bytes after NUL")
+
+tok_xchacha: str = issue_sealed_token("xchacha-secret", "email-verify", k32, 600, alg="xchacha20-poly1305", clock_time_sec=1700000000)
+res_xchacha: SealedPayload = open_sealed_token(tok_xchacha, "email-verify", k32, expected_alg="xchacha20-poly1305", clock_time_sec=1700000100)
+nox.test.assert_eq_str(res_xchacha.payload, "xchacha-secret", "XChaCha20-Poly1305 decrypts cleanly")
+
+# 2. Negative tests: wrong key, context_aad mismatch, purpose mismatch, alg mismatch, expired, tampered, cross-format
+wrong_key_err: bool = False
+try:
+    open_sealed_token(tok_chacha, "session", k32_wrong, clock_time_sec=1700000100, context_aad="tenant:acme")
+except InvalidSignatureError:
+    wrong_key_err = True
+nox.test.assert_true(wrong_key_err, "Wrong AEAD key fails with InvalidSignatureError")
+
+aad_mismatch: bool = False
+try:
+    open_sealed_token(tok_chacha, "session", k32, clock_time_sec=1700000100, context_aad="tenant:other")
+except InvalidSignatureError:
+    aad_mismatch = True
+nox.test.assert_true(aad_mismatch, "Mismatched context_aad fails AEAD authentication")
+
+purpose_mismatch: bool = False
+try:
+    open_sealed_token(tok_chacha, "password-reset", k32, clock_time_sec=1700000100, context_aad="tenant:acme")
+except InvalidClaimsError:
+    purpose_mismatch = True
+nox.test.assert_true(purpose_mismatch, "Purpose mismatch rejected")
+
+alg_mismatch: bool = False
+try:
+    open_sealed_token(tok_aes, "csrf", k32, expected_alg="chacha20-poly1305", clock_time_sec=1700000050)
+except DisallowedAlgorithmError:
+    alg_mismatch = True
+nox.test.assert_true(alg_mismatch, "Verifier-controlled algorithm mismatch rejected")
+
+expired_err: bool = False
+try:
+    open_sealed_token(tok_chacha, "session", k32, clock_time_sec=1700000500, expected_kid="sk-1", context_aad="tenant:acme")
+except ExpiredTokenError:
+    expired_err = True
+nox.test.assert_true(expired_err, "Expired SealedToken rejected")
+
+kid_err: bool = False
+try:
+    open_sealed_token(tok_chacha, "session", k32, clock_time_sec=1700000100, expected_kid="sk-2", context_aad="tenant:acme")
+except UnknownKeyError:
+    kid_err = True
+nox.test.assert_true(kid_err, "Mismatched expected_kid rejected")
+
+# Tampered ciphertext segment
+parts: list[str] = tok_chacha.split(".")
+tampered_ct: str = parts[0] + "." + parts[1] + "." + parts[2] + "." + parts[3] + "." + parts[4] + "." + parts[5] + "." + parts[6] + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+tampered_err: bool = False
+try:
+    open_sealed_token(tampered_ct, "session", k32, clock_time_sec=1700000100, context_aad="tenant:acme")
+except InvalidSignatureError:
+    tampered_err = True
+nox.test.assert_true(tampered_err, "Tampered AEAD ciphertext rejected")
+
+# Cross-format rejection: SignedToken passed to SealedTokenVerifier
+signed_tok: str = issue_signed_token("hello", "session", k32, 300)
+cross_fmt_err: bool = False
+try:
+    open_sealed_token(signed_tok, "session", k32, clock_time_sec=1700000100)
+except MalformedTokenError:
+    cross_fmt_err = True
+nox.test.assert_true(cross_fmt_err, "SignedToken rejected by SealedTokenVerifier")
+
+# Weak/invalid key & unknown alg
+short_key_err: bool = False
+try:
+    issue_sealed_token("hi", "session", "too-short", 60)
+except InvalidKeyError:
+    short_key_err = True
+nox.test.assert_true(short_key_err, "Short AEAD key rejected")
+
+bad_alg_err: bool = False
+try:
+    SealedTokenIssuer("none")
+except UnsupportedAlgorithmError:
+    bad_alg_err = True
+nox.test.assert_true(bad_alg_err, "Unsupported AEAD algorithm rejected")
+
+# 3. ARC memory leak gate (20 seal+open rounds inside scoped function)
+def _run_sealed_leak_check() -> None:
+    i: int = 0
+    while i < 20:
+        t: str = issue_sealed_token("loop-payload-" + str(i), "bench", k32, 60, clock_time_sec=1700000000)
+        p: SealedPayload = open_sealed_token(t, "bench", k32, clock_time_sec=1700000010)
+        nox.test.assert_eq_str(p.payload, "loop-payload-" + str(i), "Round-trip inside leak loop")
+        i = i + 1
+
+_run_sealed_leak_check()
+before_live: int = nox.mem.stats().live
+_run_sealed_leak_check()
+after_live: int = nox.mem.stats().live
+nox.test.assert_true(after_live - before_live <= 4, "SealedToken AEAD seal/open has zero ARC memory leak")
+
+print("sealed_token_test passed!")

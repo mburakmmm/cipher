@@ -4,6 +4,26 @@ All notable changes to Cipher will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-19
+
+### Added
+- **Purpose-Bound AEAD `SealedToken` (`sealed_token.nox`, `cipher/sealed_token.nox`, `tests/sealed_token_test.nox`):**
+  - Added `SealedTokenIssuer` / `SealedTokenVerifier` / `issue_sealed_token` / `open_sealed_token` backed by `nox.crypto.aead_seal_bytes` and `nox.crypto.aead_open_bytes` (`chacha20-poly1305` default, `aes-256-gcm`, `xchacha20-poly1305`).
+  - Uses OS CSPRNG nonces, domain-separated AAD (`CIPHER-SEALED-V1`), optional `context_aad`, TTL/clock checks, and a distinct `cip_seal_v1` prefix to prevent cross-format token substitution.
+- **Pure-NOX `HS384` & `HS512` Support (`provider.nox`, `tests/jws_test.nox`):**
+  - Enabled zero-dependency pure-NOX RFC 2104 HMAC-SHA384 and HMAC-SHA512 in `DefaultCryptoProvider` using `nox.crypto.sha384` / `sha512` and `nox.crypto.constant_time_eq` (enforcing >=48-byte and >=64-byte secrets).
+- **SSRF-Safe Live HTTPS & DNS-Pinned TLS JWKS (`jwks.nox`, `cipher/jwks.nox`, `tests/jwks_test.nox`):**
+  - Upgraded `fetch_jwks_tls` to resolve via `nox.dns.resolve`, validate every returned IP via `verify_resolved_ip`, and pin the verified IP directly via `nox.tls.connect(host, port, pinned_ip)` (eliminating DNS rebinding TOCTOU windows).
+  - Added `fetch_jwks_https` backed by `nox.safehttp.request` (`allow_private=False`, `allow_downgrade=False`), and cross-checked `verify_resolved_ip` against `nox.ip.is_global_text` alongside Cipher's NAT64/RFC 6890 rules.
+- **Opt-In `__all__` API Contracts & Scalar `match` (`errors.nox`, `rotation.nox`, `claims.nox`, `jws.nox`, `provider.nox`):**
+  - Added compile-time `__all__` export enforcement on pure class/function modules and adopted scalar `match` for algorithm dispatch.
+
+### Changed
+- **Zero-Allocation `nox.json.pos_*` Tape Navigation (`json_strict.nox`, `claims.nox`):**
+  - Upgraded strict JSON field/list/audience accessors to navigate `nox.json` tape positions directly (`pos_root`, `pos_find`, `pos_kind`, `pos_str`, `pos_int`, `pos_bool`, `pos_len`, `pos_at`) while preserving RFC 8725 §3.10 duplicate-key rejection.
+- **NOX `2.2.38` Toolchain & Benchmark Baseline (`.github/workflows/`, `docs/benchmark-baseline.json`, `docs/compatibility.md`):**
+  - Bumped CI & Release Gate `NOX_VERSION` to `v2.2.38` and refreshed `docs/benchmark-baseline.json` (`sign_p50=828us`, `rot_p50=988us`, `sync_p50=1111us`, `scale_64k=22820us`).
+
 ## [1.1.0] - 2026-11-15
 
 ### Added

@@ -2,6 +2,7 @@
 # Strict abstraction over OS/stdlib/optional-native cryptographic primitives.
 # Prohibits custom cryptographic math implementations and silent algorithm downgrades.
 
+import nox.bytes
 import nox.crypto
 import nox.ed25519
 import nox.strings
@@ -61,12 +62,45 @@ class CryptoProvider:
     def secure_random_hex(self, n_bytes: int) -> str:
         raise ProviderFailureError("secure_random_hex not implemented on base provider")
 
+def _hmac_sha2_hex(use_512: bool, key: str, data: str) -> str:
+    # RFC 2104 HMAC with 128-byte block size for SHA-384 and SHA-512
+    k_bytes: str = key
+    if nox.strings.byte_len(k_bytes) > 128:
+        if use_512:
+            k_bytes = hex_to_bytes(nox.crypto.sha512(k_bytes))
+        else:
+            k_bytes = hex_to_bytes(nox.crypto.sha384(k_bytes))
+
+    k_len: int = nox.strings.byte_len(k_bytes)
+    ipad: list[int] = []
+    opad: list[int] = []
+    i: int = 0
+    while i < 128:
+        kb: int = 0
+        if i < k_len:
+            kb = nox.strings.byte_at(k_bytes, i)
+        ipad.append(kb ^ 54)
+        opad.append(kb ^ 92)
+        i = i + 1
+
+    i_pad_str: str = nox.bytes.str_from_list(ipad)
+    o_pad_str: str = nox.bytes.str_from_list(opad)
+    if use_512:
+        inner_raw: str = hex_to_bytes(nox.crypto.sha512(i_pad_str + data))
+        return nox.crypto.sha512(o_pad_str + inner_raw)
+    inner_raw384: str = hex_to_bytes(nox.crypto.sha384(i_pad_str + data))
+    return nox.crypto.sha384(o_pad_str + inner_raw384)
+
 class DefaultCryptoProvider(CryptoProvider):
     def provider_name(self) -> str:
         return "nox-stdlib-default"
 
     def supports_algorithm(self, alg: str) -> bool:
-        return alg == "HS256" or alg == "EdDSA"
+        match alg:
+            case "HS256" | "HS384" | "HS512" | "EdDSA":
+                return True
+            case _:
+                return False
 
     def sign_hmac_sha256(self, key: str, data: str) -> str:
         if nox.strings.byte_len(key) < MIN_HMAC_SECRET_BYTES:
@@ -82,6 +116,40 @@ class DefaultCryptoProvider(CryptoProvider):
         computed_hex: str = nox.crypto.hmac_sha256(key, data)
         expected_hex: str = bytes_to_hex(expected_sig)
         return nox.crypto.constant_time_eq(computed_hex, expected_hex)
+
+    def sign_hmac(self, alg: str, key: str, data: str) -> str:
+        match alg:
+            case "HS256":
+                return self.sign_hmac_sha256(key, data)
+            case "HS384":
+                if nox.strings.byte_len(key) < 48:
+                    raise InvalidKeyError("HS384 secret length must be at least 48 bytes (384 bits)")
+                return hex_to_bytes(_hmac_sha2_hex(False, key, data))
+            case "HS512":
+                if nox.strings.byte_len(key) < 64:
+                    raise InvalidKeyError("HS512 secret length must be at least 64 bytes (512 bits)")
+                return hex_to_bytes(_hmac_sha2_hex(True, key, data))
+            case _:
+                raise UnsupportedAlgorithmError(alg)
+
+    def verify_hmac(self, alg: str, key: str, data: str, expected_sig: str) -> bool:
+        match alg:
+            case "HS256":
+                return self.verify_hmac_sha256(key, data, expected_sig)
+            case "HS384":
+                if nox.strings.byte_len(key) < 48:
+                    raise InvalidKeyError("HS384 secret length must be at least 48 bytes (384 bits)")
+                if nox.strings.byte_len(expected_sig) != 48:
+                    return False
+                return nox.crypto.constant_time_eq(_hmac_sha2_hex(False, key, data), bytes_to_hex(expected_sig))
+            case "HS512":
+                if nox.strings.byte_len(key) < 64:
+                    raise InvalidKeyError("HS512 secret length must be at least 64 bytes (512 bits)")
+                if nox.strings.byte_len(expected_sig) != 64:
+                    return False
+                return nox.crypto.constant_time_eq(_hmac_sha2_hex(True, key, data), bytes_to_hex(expected_sig))
+            case _:
+                raise UnsupportedAlgorithmError(alg)
 
     def verify_asymmetric(self, alg: str, public_key_material: str, data: str, sig_raw: str) -> bool:
         if alg != "EdDSA":

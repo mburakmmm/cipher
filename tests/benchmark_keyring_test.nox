@@ -211,7 +211,7 @@ scale_64_us: int = _bench_key_scaling_median_us(64)
 # ==============================================================================
 bench_json: str = "{\n"
 bench_json = bench_json + "  \"suite\": \"cipher_keyring_benchmark\",\n"
-bench_json = bench_json + "  \"version\": \"1.1.0\",\n"
+bench_json = bench_json + "  \"version\": \"1.2.0\",\n"
 bench_json = bench_json + "  \"runs\": 5,\n"
 bench_json = bench_json + "  \"metrics\": {\n"
 bench_json = bench_json + "    \"seqlock_get_signing_key_5x1000_median_us\": " + str(sign_median_us) + ",\n"
@@ -253,8 +253,8 @@ base_doc: JsonValue = parse_strict_json(base_raw)
 base_ver: str = get_string_field(base_doc, "version")
 bm: JsonValue = get_field_value(base_doc, "metrics")
 
-cmp_md: str = "## Cipher KeyRing Multi-Run Median Benchmark Comparison (`v" + base_ver + "` vs `v1.1.0`, 5-Run Median, `monotonic_ns()`)\n\n"
-cmp_md = cmp_md + "| Benchmark Metric (5-Run Median) | Baseline (`v" + base_ver + "`) | Current (`v1.1.0`) | Delta |\n"
+cmp_md: str = "## Cipher KeyRing Multi-Run Median Benchmark Comparison (`v" + base_ver + "` vs `v1.2.0`, 5-Run Median, `monotonic_ns()`)\n\n"
+cmp_md = cmp_md + "| Benchmark Metric (5-Run Median) | Baseline (`v" + base_ver + "`) | Current (`v1.2.0`) | Delta |\n"
 cmp_md = cmp_md + "|---|---:|---:|---:|\n"
 cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_5x1000_median_us", get_int_field(bm, "seqlock_get_signing_key_5x1000_median_us"), sign_median_us, "us")
 cmp_md = cmp_md + _cmp_row_unit("seqlock_get_signing_key_p50_us", get_int_field(bm, "seqlock_get_signing_key_p50_us"), sign_p50_us, "us")

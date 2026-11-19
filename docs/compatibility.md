@@ -1,14 +1,14 @@
 # Platform and NOX Compatibility Report
 
-- **Date:** 2026-11-15
-- **Compiler:** `noxc 2.1.186`
+- **Date:** 2026-11-19
+- **Compiler:** `noxc 2.2.38`
 - **Platform:** macOS Darwin arm64 (Apple Silicon), Linux x86_64/arm64, Windows x86_64
 - **Toolchain backend:** LLVM (default hosted), QBE (secondary / freestanding supported)
 
 ## Verified NOX Commands
 
 ```bash
-noxc version                         # noxc 2.1.186
+noxc version                         # noxc 2.2.38
 noxc check <file>
 noxc check --strict-spawn-shared     # M:N shared-mutation lint
 noxc check --profile freestanding    # freestanding capability boundary check

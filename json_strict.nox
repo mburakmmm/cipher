@@ -46,6 +46,9 @@ def get_array_item(v: JsonValue, i: int) -> JsonValue:
 def has_field(v: JsonValue, key: str) -> bool:
     if not is_object(v):
         return False
+    if v.tpos > 0:
+        root_p: int = nox.json.pos_root(v)
+        return nox.json.pos_find(v, root_p, key) >= 0
     try:
         nox.json.get(v, key)
         return True
@@ -60,7 +63,77 @@ def get_field_value(v: JsonValue, key: str) -> JsonValue:
     except JsonError:
         raise JsonFormatError("Missing required JSON field: " + key)
 
+def pos_root(v: JsonValue) -> int:
+    try:
+        return nox.json.pos_root(v)
+    except JsonError:
+        raise JsonFormatError("JSON value has no tape positions")
+
+def pos_find(v: JsonValue, p: int, key: str) -> int:
+    try:
+        return nox.json.pos_find(v, p, key)
+    except JsonError:
+        raise JsonFormatError("JSON position is not an object")
+
+def pos_kind(v: JsonValue, p: int) -> int:
+    try:
+        return nox.json.pos_kind(v, p)
+    except JsonError:
+        raise JsonFormatError("Invalid JSON tape position")
+
+def pos_len(v: JsonValue, p: int) -> int:
+    try:
+        return nox.json.pos_len(v, p)
+    except JsonError:
+        raise JsonFormatError("JSON position is not a container")
+
+def pos_at(v: JsonValue, p: int, i: int) -> int:
+    try:
+        return nox.json.pos_at(v, p, i)
+    except JsonError:
+        raise JsonFormatError("Invalid JSON array/object index")
+
+def pos_key(v: JsonValue, p: int, i: int) -> str:
+    try:
+        return nox.json.pos_key(v, p, i)
+    except JsonError:
+        raise JsonFormatError("Invalid JSON object key index")
+
+def pos_key_is(v: JsonValue, p: int, i: int, key: str) -> bool:
+    try:
+        return nox.json.pos_key_is(v, p, i, key)
+    except JsonError:
+        raise JsonFormatError("Invalid JSON object key check")
+
+def pos_str(v: JsonValue, p: int) -> str:
+    try:
+        return nox.json.pos_str(v, p)
+    except JsonError:
+        raise JsonFormatError("JSON position is not a string")
+
+def pos_int(v: JsonValue, p: int) -> int:
+    try:
+        return nox.json.pos_int(v, p)
+    except JsonError:
+        raise JsonFormatError("JSON position is not an integer")
+
+def pos_bool(v: JsonValue, p: int) -> bool:
+    try:
+        return nox.json.pos_bool(v, p)
+    except JsonError:
+        raise JsonFormatError("JSON position is not a boolean")
+
 def get_string_field(v: JsonValue, key: str, default_val: str = "", required: bool = True) -> str:
+    if v.tpos > 0 and is_object(v):
+        rp: int = nox.json.pos_root(v)
+        fp: int = nox.json.pos_find(v, rp, key)
+        if fp < 0:
+            if required:
+                raise JsonFormatError("Missing required string field: " + key)
+            return default_val
+        if nox.json.pos_kind(v, fp) != 3:
+            raise JsonFormatError("Field '" + key + "' must be a string")
+        return nox.json.pos_str(v, fp)
     if not has_field(v, key):
         if required:
             raise JsonFormatError("Missing required string field: " + key)
@@ -71,6 +144,19 @@ def get_string_field(v: JsonValue, key: str, default_val: str = "", required: bo
     return nox.json.as_string(val)
 
 def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool = True) -> int:
+    if v.tpos > 0 and is_object(v):
+        rp: int = nox.json.pos_root(v)
+        fp: int = nox.json.pos_find(v, rp, key)
+        if fp < 0:
+            if required:
+                raise JsonFormatError("Missing required integer field: " + key)
+            return default_val
+        if nox.json.pos_kind(v, fp) != 2:
+            raise JsonFormatError("Field '" + key + "' must be a numeric integer")
+        try:
+            return nox.json.pos_int(v, fp)
+        except JsonError:
+            raise JsonFormatError("Field '" + key + "' has invalid or out-of-range integer representation")
     if not has_field(v, key):
         if required:
             raise JsonFormatError("Missing required integer field: " + key)
@@ -90,6 +176,16 @@ def get_int_field(v: JsonValue, key: str, default_val: int = 0, required: bool =
         raise JsonFormatError("Field '" + key + "' has invalid or out-of-range integer representation")
 
 def get_bool_field(v: JsonValue, key: str, default_val: bool = False, required: bool = True) -> bool:
+    if v.tpos > 0 and is_object(v):
+        rp: int = nox.json.pos_root(v)
+        fp: int = nox.json.pos_find(v, rp, key)
+        if fp < 0:
+            if required:
+                raise JsonFormatError("Missing required boolean field: " + key)
+            return default_val
+        if nox.json.pos_kind(v, fp) != 1:
+            raise JsonFormatError("Field '" + key + "' must be a boolean")
+        return nox.json.pos_bool(v, fp)
     if not has_field(v, key):
         if required:
             raise JsonFormatError("Missing required boolean field: " + key)
@@ -101,6 +197,25 @@ def get_bool_field(v: JsonValue, key: str, default_val: bool = False, required: 
 
 def get_string_list_field(v: JsonValue, key: str, required: bool = True) -> list[str]:
     empty: list[str] = []
+    if v.tpos > 0 and is_object(v):
+        rp: int = nox.json.pos_root(v)
+        fp: int = nox.json.pos_find(v, rp, key)
+        if fp < 0:
+            if required:
+                raise JsonFormatError("Missing required string array field: " + key)
+            return empty
+        if nox.json.pos_kind(v, fp) != 4:
+            raise JsonFormatError("Field '" + key + "' must be an array")
+        out_pos: list[str] = []
+        pi: int = 0
+        pn: int = nox.json.pos_len(v, fp)
+        while pi < pn:
+            elem_p: int = nox.json.pos_at(v, fp, pi)
+            if nox.json.pos_kind(v, elem_p) != 3:
+                raise JsonFormatError("Array elements in '" + key + "' must be strings")
+            out_pos.append(nox.json.pos_str(v, elem_p))
+            pi = pi + 1
+        return out_pos
     if not has_field(v, key):
         if required:
             raise JsonFormatError("Missing required string array field: " + key)

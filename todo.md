@@ -969,3 +969,34 @@ Bir madde yalnızca dosya oluşturulduğu veya kod yazıldığı için `[x]` yap
 - [x] `./scripts/test-isolated-consumer.sh` (Stage 1 Local Git + Stage 2 Remote Registry + Stage 3 Optional OpenSSL C Shim Consumer) %100 yeşil geçmeli.
 - [x] `nox.json` (`version: "1.1.0"`, `packages.md` uyumlu `source` etiketi), `README.md`, `docs/algorithms.md`, `docs/architecture.md`, `docs/threat-model.md`, `docs/key-management.md` ve `CHANGELOG.md` (`v1.1.0` notları) eksiksiz güncellenmeli.
 - [x] Git commit, `v1.1.0` tag push, GitHub Actions CI & Release Gate başarısı ve `noxc publish` doğrulaması tamamlanmalı.
+
+---
+
+# Phase 19 — `v1.2.0` NOX `2.2.38` Entegrasyonu: DNS-Pinned `nox.tls`/`nox.safehttp`/`nox.ip` JWKS, `nox.json.pos_*`, Saf NOX `HS384`/`HS512`, `SealedToken` AEAD & `__all__` API Sınırları
+
+**Amaç:** `nox-lang v2.2.38` ile gelen yeni standart kütüphane ve dil özelliklerini Cipher'a eksiksiz entegre etmek (`source: "nox"` ayrımı şimdilik bekletilerek `nox.json` `"source": "c"` korunur).
+
+## 19.0 — P0: `jwks.nox` Gerçek DNS-Pinned TLS (`connect_ip`), `nox.safehttp` Canlı HTTPS JWKS & `nox.ip` Çapraz Doğrulaması (`jwks.nox`, `cipher/jwks.nox`, `cipher.nox`, `tests/jwks_test.nox`, `tests/ip_fuzz_property_test.nox`)
+- [x] `jwks.nox` içinde `nox.ip`, `nox.dns`, `nox.safehttp` entegrasyonu:
+  - `verify_resolved_ip` ve `is_safe_jwks_ip` içinde `nox.ip` (`parse`, `is_global`, `unmap` — NAT64 `64:ff9b::/96` dahil) ile çapraz/katı SSRF denetimini tamamla; belirsiz biçimleri (`010.0.0.1`, `127.1`, `%zone`) reddet.
+  - `fetch_jwks_tls` içinde `resolved_ip == ""` ise `nox.dns.resolve(verified.host, timeout_ms)` ile çözümleyip tüm dönen IP'leri `verify_resolved_ip` ile kontrol et, ardından `nox.tls.connect(verified.host, verified.port, pinned_ip)` ile gerçek DNS-pinning uygula (sıfır DNS-rebinding TOCTOU penceresi).
+  - `fetch_jwks_https(url: str, allowed_host: str = "", timeout_ms: int = 5000, max_bytes: int = 1048576, max_redirects: int = 0) -> str` ekle: `is_safe_jwks_url` + `nox.safehttp.request(..., allow_private=False, allow_downgrade=False)` ile SSRF-korumalı canlı HTTPS JWKS çekimi (boyut/durum kodu/boş gövde kontrolü).
+- [x] `tests/jwks_test.nox` ve `tests/ip_fuzz_property_test.nox` içine NAT64 (`64:ff9b::127.0.0.1`, `64:ff9b::8.8.8.8`), `nox.ip` property oracle çapraz testi ve `fetch_jwks_https`/`fetch_jwks_tls` negatif testleri ekle.
+
+## 19.1 — P1: `json_strict.nox` & `claims.nox` `nox.json.pos_*` Sıfır-Tahsis Tape Gezinme (`json_strict.nox`, `claims.nox`, `tests/json_strict_test.nox`)
+- [x] `json_strict.nox` içine `nox.json.pos_root`, `pos_len`, `pos_at`, `pos_key_is`, `pos_find`, `pos_str`, `pos_int`, `pos_number`, `pos_bool` tabanlı konum-bazlı yardımcılar ve `parse_json_object_pos` / `check_duplicate_keys_pos` ekle (ara `JsonValue` tahsisini azaltırken üst düzey ve iç içe duplicate key reddini %100 koru).
+- [x] `claims.nox` (`_parse_audience_field` ve claim okuma sıcak yolu) içinde gereksiz ara tahsisleri azalt; `tests/json_strict_test.nox` ile tüm sınır ve duplicate-key testlerini doğrula.
+
+## 19.2 — P0: Saf NOX `HS384` / `HS512` & `SealedToken` AEAD (`provider.nox`, `jws.nox`, `jwt.nox`, `sealed_token.nox`, `cipher/sealed_token.nox`, `cipher.nox`, `tests/`)
+- [x] `provider.nox`: `nox.crypto.sha384` ve `nox.crypto.sha512` üzerine RFC 2104 saf NOX `hmac_sha384` / `hmac_sha512` + `nox.crypto.constant_time_eq` ekleyerek `DefaultCryptoProvider` içinde C shim olmadan **`HS384`** ve **`HS512`** imzalama/doğrulamayı etkinleştir (`tests/jws_test.nox` / `tests/asymmetric_jws_test.nox` RFC 7515/4231 vektörleri ile doğrula).
+- [x] `sealed_token.nox` & `cipher/sealed_token.nox`: `nox.crypto.aead_seal_bytes` / `aead_open_bytes` (`chacha20-poly1305` varsayılan, `aes-256-gcm`, `xchacha20-poly1305`) üzerine `SealedToken` (`issue`, `open`, `SealedPayload`, `cipher_sealed_v1` / `"st1."` önekli versiyonlu biçim, purpose-bound AAD domain separation, TTL/exp doğrulaması, 12/24-bayt CSPRNG nonce, gizli anahtar sızdırmayan hata semantiği) oluştur ve `cipher.nox` üzerinden dışa aktar.
+- [x] `tests/sealed_token_test.nox` ekle: pozitif round-trip (NUL ve binary baytlar dahil), purpose mismatch, expired token, tampered ciphertext/tag/AAD, wrong key, wrong algorithm, cross-format `SignedToken`/`JWT` reddi ve `nox.mem.stats()` sızıntı denetimi.
+
+## 19.3 — P1: `__all__` API Sınırları, Skaler `match` & `v2.2.38` CI/Benchmark Senkronizasyonu
+- [x] `cipher.nox` ve çekirdek modüllerde (`errors.nox`, `encoding.nox`, `keys.nox`, `rotation.nox`, `sealed_token.nox`) `nox 2.2.5` opt-in `__all__: list[str] = [...]` görünürlük sözleşmesini ekle; `jws.nox`/`provider.nox` algoritma seçiminde `nox 2.2.37` skaler `match` sadeleştirmesini uygula.
+- [x] `.github/workflows/ci.yml` ve `.github/workflows/release.yml` içinde `NOX_VERSION: v2.2.38` güncelle.
+- [x] `docs/benchmark-baseline.json`, `docs/compatibility.md`, `docs/algorithms.md`, `docs/architecture.md`, `docs/threat-model.md`, `README.md` ve `CHANGELOG.md` (`v1.2.0`) güncelle.
+
+## 19.4 — Phase 19 Çıkış Kapısı & `v1.2.0` Yayını
+- [x] `noxc test` (tüm testler %100 yeşil), `noxc check --strict-spawn-shared` (0 hata) ve `./scripts/test-isolated-consumer.sh` (Stage 1 + Stage 2 + Stage 3) doğrula.
+- [x] `nox.json` `version: "1.2.0"` (`source: "c"`), git commit, `v1.2.0` tag push, GitHub Actions CI & Release Gate başarısı ve `noxc publish github.com/mburakmmm/cipher --ref v1.2.0 --description "..." --tags "..."` tamamla.
